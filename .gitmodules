@@ -1,3 +1,4 @@
 [submodule "vendor/wecom-agent"]
 	path = vendor/wecom-agent
 	url = https://github.com/tzwkb/wecom-agent.git
+	branch = main

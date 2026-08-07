@@ -24,6 +24,22 @@ git clone <this-repo> && cd wecom-svr
 git submodule update --init      # 拉取 vendor/wecom-agent
 ```
 
+### 跟随上游更新
+
+submodule 跟踪上游 `main` 分支,但**不自动更新** —— pin 住 commit,显式升级:
+
+```bash
+scripts/update-agent.sh --check    # 只看上游有什么新 commit
+scripts/update-agent.sh            # 更新 + 跑测试(不提交)
+scripts/update-agent.sh --commit   # 更新 + 跑测试,通过则提交新 pin
+```
+
+上游动过一次目录结构(`wecom.py` → `legacy/self-built-app/wecom.py`),
+所以 `tests/test_vendor_contract.py` 锁住了本服务真正依赖的那部分契约:
+`wecom.py` 的位置、`HANDLERS` 里的 `contact`/`message`、
+`msgtype` → handler method 的映射、以及 `decrypt/macos/read_wecom.py` 的存在。
+上游再改结构时,更新脚本会当场测试失败并提示回滚,而不是等到线上发消息才发现。
+
 ## 安装与启动
 
 ```bash
