@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wecom-svr"
+version = "0.1.0"
+description = "企业微信消息发送服务 — FastAPI 封装,底层引用 wecom-agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+wecom-svr = "wecom_svr.__main__:main"
+wecom-svr-local = "wecom_svr.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["wecom_svr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

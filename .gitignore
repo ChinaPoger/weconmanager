@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# 本地配置与运行时数据(含凭证,勿提交)
+.env
+config.json
+.data/
+.token_cache.json
+
+.pytest_cache/
+.DS_Store
