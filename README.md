@@ -176,6 +176,24 @@ curl -X POST http://127.0.0.1:8090/api/v1/sheet/row/append \
 发送过程会激活窗口、占用剪贴板并模拟按键(执行完会还原剪贴板)。
 内部有全局 UI 锁,并发请求串行执行。
 
+> ⚠️ **`success: true` 只代表 AppleScript 执行成功,不代表消息已送达。**
+> 这条路径是模拟按键,没有任何回执:如果会话窗口打开了但输入框没拿到焦点,
+> 粘贴和回车会落空,接口依然返回 success。需要送达保证请用官方 API
+> (`/api/v1/message/send` 返回企业微信服务端的 `msgid`)。
+
+### 本地库的新鲜度上限(WAL)
+
+企业微信的 SQLite 开了 **WAL 模式**。客户端把新消息先写进 `Info.db-wal`,
+要等 checkpoint 才落进 `Info.db`;而解密工具只读 `Info.db`。所以:
+
+- `/api/v1/local/conversations` 与消息表**永远滞后到上一次 checkpoint**,
+  实测可达 1 小时以上(`Info.db` mtime 12:07,`Info.db-wal` 13:31)
+- 刚发/刚收的消息,重跑 `read_wecom.py` 也读不到
+- 会话与 RID 是稳定的,所以**发送不受影响**;受影响的只是「读消息」
+
+要实时收消息,用上游的 `recv_server.py`(回调模式,需要 `recv_token` /
+`recv_aeskey` / 公网 `public_url`),不要依赖本地库轮询。
+
 不启服务也可直接用 CLI:
 
 ```bash
