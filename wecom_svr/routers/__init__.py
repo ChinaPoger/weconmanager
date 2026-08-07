@@ -1,3 +1,3 @@
-from . import contact, local, message
+from . import contact, doc, local, message, sheet, smartsheet
 
-__all__ = ["contact", "local", "message"]
+__all__ = ["contact", "doc", "local", "message", "sheet", "smartsheet"]

@@ -10,6 +10,9 @@
 | `POST /api/v1/message/send` | **自建应用** —— 对方看到的是「应用」 | 调 wecom-agent 的 `wecom.py`(官方 API) |
 | `POST /api/v1/local/message/send` | **本人登录账号** —— 对方看到的是你 | 读解密数据库 + AppleScript 操控 macOS 客户端 |
 
+另有在线文档/表格/智能表接口(`/api/v1/doc|sheet|smartsheet/*`),
+封装上游 `online/` 包 —— 见[文档与表格](#文档与表格)。
+
 ## 依赖的 pkg:wecom-agent
 
 `vendor/wecom-agent` 是锁定 commit 的 git submodule。运行时按以下优先级解析:
@@ -103,6 +106,49 @@ curl ... -H 'Authorization: Bearer <token>'
 - `POST /api/v1/local/conversation/open` —— 只打开会话不发送
 - `POST /api/v1/contact/search` —— 查通讯录
 
+## 文档与表格
+
+封装上游 `online/` 包(文档 / 表格 / 智能表),共 3 组 21 个端点:
+
+| 前缀 | 内容 |
+| --- | --- |
+| `/api/v1/doc/*` | `create` `write` `smartpage` `capabilities` `local/search` `local/read` |
+| `/api/v1/sheet/*` | `create` `info` `subsheet/add` `subsheet/delete` `row/append` `range/update` |
+| `/api/v1/smartsheet/*` | `create` `sheets` `sheet/{add,update,delete}` `fields/{get,add,update,delete}` `records/{add,update,delete}` |
+
+**前置条件**:这些接口不走官方 HTTP API,而是驱动外部 `wecom-cli` 二进制,
+需要先安装并 `auth login`。没装时所有在线端点返回 `503` 并说明原因;
+用 `WECOM_SVR_WECOM_CLI_PATH` 可指定非 PATH 上的二进制。先探测能力:
+
+```bash
+curl -s http://127.0.0.1:8090/api/v1/doc/capabilities | jq .
+```
+
+两条贯穿全部端点的约定(沿用上游语义):
+
+- 目标文档用 `docid` **或** `url` 指定,必须二选一,否则 `400`
+- **写操作必须显式 `"confirmed": true`**,否则 `403` 且不会真的调用 `wecom-cli`
+
+```bash
+# 只读:不需要 confirmed
+curl -X POST http://127.0.0.1:8090/api/v1/sheet/info \
+  -H 'Content-Type: application/json' -d '{"docid":"abc"}'
+
+# 写:必须确认
+curl -X POST http://127.0.0.1:8090/api/v1/sheet/row/append \
+  -H 'Content-Type: application/json' \
+  -d '{"docid":"abc","sheet_id":"s1","values":[42,"hello"],"confirmed":true}'
+```
+
+单元格值会按上游 `cell_data` 规则编码:数字 → `NUMBER`,其余 → `TEXT`;
+也可显式传 `{"type":"link"|"formula"|"number"|"text", ...}`。
+
+`local/search` 与 `local/read` 读本机缓存/已下载的文档,**不需要 wecom-cli**,
+但内容可能滞后于线上版本(响应里的 `freshness` 字段会说明)。
+
+> ⚠️ 写端点的 `confirmed` 只是沿用上游的误操作闸门,**不是权限控制** ——
+> 任何调用方都能把它设成 true。真正的边界是 `api_token` 加只监听 127.0.0.1。
+
 ### 错误结构
 
 沿用原 `api_server.py` 的语义,而非 FastAPI 默认的 422:
@@ -110,7 +156,15 @@ curl ... -H 'Authorization: Bearer <token>'
 - `/api/v1/local/*` → `{"success": false, "error": "..."}`
 - 其它 → `{"errcode": -1, "errmsg": "..."}`
 
-状态码:参数错误/业务失败 `400`,鉴权失败 `401`,本地数据库缺失或未同步 `503`。
+状态码:
+
+| 码 | 含义 |
+| --- | --- |
+| `400` | 参数错误 / 业务失败(如会话没找到) |
+| `401` | 鉴权失败 |
+| `403` | 在线写操作未带 `confirmed: true` |
+| `502` | 下游 `wecom-cli` 执行失败或超时(本服务本身正常) |
+| `503` | 环境没准备好:本地库未解密/未同步、`wecom-cli` 没装、agent home 解析不了 |
 
 ## 本人身份发送的前提(仅 macOS)
 

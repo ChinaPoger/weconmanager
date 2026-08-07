@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     data_dir: Path = REPO_ROOT / ".data"
     wecom_timeout: int = 30
 
+    # online/ 文档表格能力依赖的外部 wecom-cli 二进制
+    wecom_cli_path: str = "wecom-cli"
+    online_timeout: int = 60
+
     @property
     def upload_dir(self) -> Path:
         return self.data_dir / "uploads"

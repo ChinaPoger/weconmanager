@@ -17,8 +17,14 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .local_send import LocalDataError, LocalSendError
+from .online_bridge import (
+    OnlineBadRequest,
+    OnlineCliError,
+    OnlineConfirmationRequired,
+    OnlineUnavailable,
+)
 from .paths import AgentHomeError
-from .routers import contact, local, message
+from .routers import contact, doc, local, message, sheet, smartsheet
 from .schemas import HealthResponse
 from .settings import get_agent_home, get_settings
 
@@ -73,6 +79,9 @@ def create_app() -> FastAPI:
     app.include_router(message.router)
     app.include_router(local.router)
     app.include_router(contact.router)
+    app.include_router(doc.router)
+    app.include_router(sheet.router)
+    app.include_router(smartsheet.router)
 
     # ── 错误处理: 保持与原 api_server.py 一致的 body 结构 ────────────
 
@@ -101,6 +110,26 @@ def create_app() -> FastAPI:
     @app.exception_handler(AgentHomeError)
     async def _on_agent_home_error(request: Request, exc: AgentHomeError):
         return JSONResponse(status_code=503, content=_error_body(request.url.path, str(exc)))
+
+    # ── online(文档/表格)错误 ────────────────────────────────────────
+    # 分开映射,好让调用方区分「环境没装好」和「你没确认」和「调用失败」
+
+    @app.exception_handler(OnlineUnavailable)
+    async def _on_online_unavailable(request: Request, exc: OnlineUnavailable):
+        return JSONResponse(status_code=503, content=_error_body(request.url.path, str(exc)))
+
+    @app.exception_handler(OnlineConfirmationRequired)
+    async def _on_online_needs_confirm(request: Request, exc: OnlineConfirmationRequired):
+        return JSONResponse(status_code=403, content=_error_body(request.url.path, str(exc)))
+
+    @app.exception_handler(OnlineBadRequest)
+    async def _on_online_bad_request(request: Request, exc: OnlineBadRequest):
+        return JSONResponse(status_code=400, content=_error_body(request.url.path, str(exc)))
+
+    @app.exception_handler(OnlineCliError)
+    async def _on_online_cli_error(request: Request, exc: OnlineCliError):
+        # 502: 本服务没问题,是下游 wecom-cli 失败
+        return JSONResponse(status_code=502, content=_error_body(request.url.path, str(exc)))
 
     # ── 健康检查 ──────────────────────────────────────────────────────
 
