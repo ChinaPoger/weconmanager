@@ -12,7 +12,7 @@ concurrency:
 
 env:
   # 覆盖率下限:只许涨不许跌。补了测试就把这个数往上抬。
-  COV_MIN: "40"
+  COV_MIN: "60"
 
 jobs:
   lint:
@@ -94,3 +94,32 @@ jobs:
           name: coverage-xml
           path: coverage.xml
           if-no-files-found: error
+
+      # ── 覆盖率徽章 ────────────────────────────────────────────────────
+      # 只在 main 上、且只由 ubuntu/3.12 那一格更新:徽章是仓库级别的单一值,
+      # 五个矩阵格子都写就会互相覆盖成谁最后跑完算谁。
+      # PR 不写 —— fork 来的 PR 拿不到 secret,而且 PR 的数字不该盖掉 main 的。
+      - name: Read coverage total
+        id: cov
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: |
+          pct=$(uv run --no-sync coverage report --format=total)
+          echo "pct=$pct" >> "$GITHUB_OUTPUT"
+          # 配色跟着 COV_MIN 走:压线是黄的,离下限越远越绿
+          if   [ "$pct" -ge 80 ]; then echo "color=brightgreen" >> "$GITHUB_OUTPUT"
+          elif [ "$pct" -ge 60 ]; then echo "color=green"       >> "$GITHUB_OUTPUT"
+          elif [ "$pct" -ge "${{ env.COV_MIN }}" ]; then echo "color=yellow" >> "$GITHUB_OUTPUT"
+          else echo "color=red" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update coverage badge
+        if: steps.cov.outputs.pct != ''
+        uses: schneegans/dynamic-badges-action@v1.7.0
+        with:
+          auth: ${{ secrets.GIST_TOKEN }}
+          gistID: ${{ vars.COV_GIST_ID }}
+          # 必须和 README 徽章 URL 里的文件名一致,对不上徽章就永远停在初始值
+          filename: coverage.json
+          label: coverage
+          message: ${{ steps.cov.outputs.pct }}%
+          color: ${{ steps.cov.outputs.color }}

@@ -1,9 +1,9 @@
 # wecom-svr
 
 [![CI](https://github.com/rwifeng/wecom-svr/actions/workflows/ci.yml/badge.svg)](https://github.com/rwifeng/wecom-svr/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Frwifeng%2F3b34e6b1df2227d192e646fbf8949b01%2Fraw%2Fcoverage.json)](https://github.com/rwifeng/wecom-svr/actions/workflows/ci.yml)
 
-企业微信消息发送服务(FastAPI)。底层引用 [tzwkb/wecom-agent](https://github.com/tzwkb/wecom-agent) 作为 pkg,
-本仓库只做服务层封装:HTTP 接口、参数校验、鉴权、错误语义。
+企业微信消息发送服务(FastAPI)。本仓库只做服务层封装:HTTP 接口、参数校验、鉴权、错误语义。
 
 两套发消息互补:
 
