@@ -11,7 +11,6 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR_HOME = REPO_ROOT / "vendor" / "wecom-agent"
@@ -36,12 +35,12 @@ class AgentHome:
     decrypt_dir: Path
 
     @property
-    def config_json(self) -> Optional[Path]:
+    def config_json(self) -> Path | None:
         p = self.root / "config.json"
         return p if p.is_file() else None
 
 
-def _resolve_root(explicit: Optional[Path] = None) -> Path:
+def _resolve_root(explicit: Path | None = None) -> Path:
     if explicit:
         root = Path(explicit).expanduser().resolve()
         if not root.is_dir():
@@ -61,7 +60,7 @@ def _resolve_root(explicit: Optional[Path] = None) -> Path:
     )
 
 
-def resolve_agent_home(explicit: Optional[Path] = None) -> AgentHome:
+def resolve_agent_home(explicit: Path | None = None) -> AgentHome:
     """解析 agent home,并定位 wecom.py 与 decrypt/ 目录。"""
     root = _resolve_root(explicit)
 

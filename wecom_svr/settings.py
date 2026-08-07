@@ -7,7 +7,6 @@ import json
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,7 +33,7 @@ class Settings(BaseSettings):
     # 留空则不鉴权(仅限本地使用,勿暴露公网)
     api_token: str = ""
 
-    agent_home: Optional[Path] = Field(
+    agent_home: Path | None = Field(
         default=None,
         validation_alias=AliasChoices("WECOM_AGENT_HOME", "WECOM_SVR_AGENT_HOME"),
     )
@@ -49,6 +48,56 @@ class Settings(BaseSettings):
     # online/ 文档表格能力依赖的外部 wecom-cli 二进制
     wecom_cli_path: str = "wecom-cli"
     online_timeout: int = 60
+
+    # ── 群消息同步到 mars ─────────────────────────────────────────────
+    # mars 的 hook 是公开路由(无鉴权),所以 base_url 留空 = 关闭,避免误推。
+    mars_base_url: str = ""
+    mars_timeout: int = 10
+    # 后台常驻同步;关掉也能用 POST /api/v1/mars/sync/run 手动跑
+    mars_sync_enabled: bool = False
+    # 轮询间隔。源库 mtime 没变就只是一次 stat,压到秒级也不费什么
+    mars_sync_interval: float = 3.0
+    mars_sync_batch: int = 200
+    # 白名单:群名或会话 RID,逗号分隔。**留空 = 一条都不同步**
+    mars_sync_groups: str = ""
+    # 显式开启后忽略白名单,同步本地所有群。默认关闭,避免误把全部历史消息推到 Mars。
+    mars_sync_all_groups: bool = False
+    # 首次同步往回补多少秒历史(0 = 只从当前最新一条往后)
+    mars_sync_backfill: int = 0
+    # 群号前缀。mars 的 qq_groups.qq 是全局唯一键,和真实 QQ 群号共用一张表,
+    # 纯数字 RID 有撞号风险,必须带前缀隔离
+    mars_group_prefix: str = "wework-"
+    # 群**名**前缀 —— 沿用 mars 自己的企微群约定,不是随便挑的:
+    #   models.Group.GroupIMCategory(): 名字含 "work-" → 认成 Wework 群
+    #   groupmsg.LoadMsgs():   left(name,5) != 'work-' → 未响应告警不管这类群
+    # hook 建群时 group_type 会落到默认的 'customer',不带这个前缀的话,内部群
+    # 会被 deimos 的未响应告警引擎盯上并电话通知 TS 值班。置空可关掉。
+    mars_group_name_prefix: str = "work-"
+    # mars 侧用 robot 号区分消息来源,并据此决定要不要转发到 mars_alert / 大数据
+    mars_robot: str = "wecom-svr"
+    mars_client_type: str = "Wework"
+
+    # ── 图片落地(对象存储)────────────────────────────────────────────
+    # 群图片原本只在本机企微缓存里,别人打不开。传到 kodo 换个公网 URL 才看得见。
+    # ⚠️ 目标 bucket 公开可读:传上去等于放公网,只是没人知道地址。默认不开。
+    kodo_ak: str = ""
+    kodo_sk: str = ""
+    kodo_bucket: str = ""
+    kodo_domain: str = ""
+    kodo_prefix: str = "wecom-group-media"
+    kodo_timeout: int = 20
+
+    @property
+    def kodo_enabled(self) -> bool:
+        return bool(self.kodo_ak and self.kodo_sk and self.kodo_bucket and self.kodo_domain)
+
+    @property
+    def mars_group_selectors(self) -> list[str]:
+        return [s.strip() for s in self.mars_sync_groups.split(",") if s.strip()]
+
+    @property
+    def mars_state_file(self) -> Path:
+        return self.data_dir / "mars_sync_state.json"
 
     @property
     def upload_dir(self) -> Path:
@@ -78,11 +127,12 @@ def _merge_agent_config(settings: Settings, home: AgentHome) -> Settings:
     if not isinstance(cfg, dict):
         return settings
 
-    explicit = settings.model_fields_set
+    # `.env.example` 会保留空的凭证项;空字符串不应覆盖 agent config.json。
+    # 只有环境变量/.env 真正提供了非空值时才优先使用。
     updates = {
         field: str(cfg[field])
         for field in _INHERITED_FROM_CONFIG
-        if field not in explicit and cfg.get(field)
+        if not getattr(settings, field, None) and cfg.get(field)
     }
     return settings.model_copy(update=updates) if updates else settings
 

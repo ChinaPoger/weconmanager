@@ -4,22 +4,24 @@
   - 全部是同步 def,由 FastAPI 放线程池执行
   - local_send 内部有全局 UI 锁,并发请求会串行化
 """
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 
-from .. import local_send
+from .. import local_group, local_send
 from ..images import materialized_image
 from ..schemas import (
     ConversationsRequest,
     ConversationsResponse,
+    LocalCreateGroupRequest,
     LocalImageRequest,
+    LocalRenameGroupRequest,
     LocalSendRequest,
     LocalSendResponse,
     OpenConversationRequest,
 )
 from ..security import require_token
+from ..uilock import current as ui_current
 
 router = APIRouter(prefix="/api/v1/local", tags=["local"])
 
@@ -63,13 +65,16 @@ def send_local_image(req: LocalImageRequest, _: None = Depends(require_token)):
     response_model=ConversationsResponse,
 )
 def list_local_conversations(
-    req: Optional[ConversationsRequest] = None,
+    req: ConversationsRequest | None = None,
     _: None = Depends(require_token),
 ) -> ConversationsResponse:
     """body 可省略,等价于 {"keyword": ""}(返回最近会话)。"""
     keyword = req.keyword if req else ""
-    conversations = local_send.search_conversations(keyword)
-    return ConversationsResponse(success=True, conversations=conversations)
+    # search_conversations 直接吐 sqlite 行(dict),交给 pydantic 校验成 Conversation
+    return ConversationsResponse.model_validate({
+        "success": True,
+        "conversations": local_send.search_conversations(keyword),
+    })
 
 
 @router.post(
@@ -79,4 +84,46 @@ def list_local_conversations(
 )
 def open_local_conversation(req: OpenConversationRequest, _: None = Depends(require_token)):
     result = local_send.open_conversation_by_rid(req.conv_rid)
+    return _result_response(result)
+
+
+@router.get("/busy", summary="客户端界面是否正被占用")
+def local_busy(_: None = Depends(require_token)) -> dict:
+    """先问再发,省得撞上 409。
+
+    这些操作要独占客户端界面(抢焦点/剪贴板/键盘),拉一次群可能占用几十秒。
+    """
+    busy = ui_current()
+    if busy is None:
+        return {"success": True, "busy": False, "operation": None, "seconds": 0}
+    return {"success": True, "busy": True, "operation": busy.operation, "seconds": busy.seconds}
+
+
+@router.post(
+    "/group/create",
+    summary="以本人身份拉群(操控客户端)",
+    response_model=LocalSendResponse,
+)
+def create_local_group(req: LocalCreateGroupRequest, _: None = Depends(require_token)):
+    """能拉外部联系人和微信用户 —— 官方 appchat 做不到这点。
+
+    传了 `name` 就「先建群、再改名」两步走(面板里没有命名输入框);自己自动是群主。
+    每个成员在选中前都会核对客户端搜出来的姓名与部门,搜出多条会 400 并列出候选。
+    """
+    result = local_group.create_group(req.members, name=req.name)
+    return _result_response(result)
+
+
+@router.post(
+    "/group/rename",
+    summary="以本人身份改群名(操控客户端)",
+    response_model=LocalSendResponse,
+)
+def rename_local_group(req: LocalRenameGroupRequest, _: None = Depends(require_token)):
+    """官方 `appchat/update` 只认自己建的 chatid,别的群只能这么改。
+
+    改完会回库核验:名字没落到目标群上就报错(并指出落到了哪个 RID),
+    不会因为「脚本没报错」就当成功。
+    """
+    result = local_group.rename_group(req.conv_rid, req.name)
     return _result_response(result)

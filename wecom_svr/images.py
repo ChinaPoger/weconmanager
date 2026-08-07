@@ -3,8 +3,8 @@ import base64
 import binascii
 import os
 import tempfile
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator
 
 from .schemas import LocalImageRequest
 from .settings import get_settings

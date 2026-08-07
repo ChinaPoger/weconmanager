@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 覆盖率下限:只许涨不许跌。补了测试就把这个数往上抬。
+  COV_MIN: "40"
+
+jobs:
+  lint:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # mypy 要能看到 vendor 里动态加载的模块,行为才和本地一致
+          submodules: recursive
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install deps
+        run: uv sync --extra dev
+
+      - name: ruff
+        run: uv run --no-sync ruff check --output-format=github wecom_svr tests
+
+      - name: mypy
+        # 前面挂了也要跑完,一次 PR 把两类问题都看全
+        if: always()
+        run: uv run --no-sync mypy
+
+  test:
+    name: pytest (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # 服务本身只在 macOS 上真跑(以本人身份发消息要 osascript),
+          # 所以主版本额外压一遍 macOS,防止只在 Linux 上绿。
+          - os: macos-latest
+            python-version: "3.12"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # vendor/wecom-agent 是契约测试的被测对象,必须拉下来,
+          # 否则 test_vendor_contract / test_online 会整体 skip。
+          submodules: recursive
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install deps
+        run: uv sync --extra dev --python ${{ matrix.python-version }}
+
+      - name: Run tests
+        run: >
+          uv run --no-sync pytest -v
+          --cov-report=xml
+          --cov-report=term-missing
+          --cov-fail-under=${{ env.COV_MIN }}
+
+      - name: Coverage summary
+        if: always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: |
+          {
+            echo "## 覆盖率 (py${{ matrix.python-version }})"
+            echo
+            uv run --no-sync coverage report --format=markdown
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage.xml
+        if: always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error

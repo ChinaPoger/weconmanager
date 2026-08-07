@@ -9,6 +9,7 @@
     其它             → {"errcode": -1, "errmsg": "..."}
 """
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -16,7 +17,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .group import GroupError
 from .local_send import LocalDataError, LocalSendError
+from .mars_sync import MarsNotConfigured, MarsSyncError
+from .mars_sync import loop as mars_loop
 from .online_bridge import (
     OnlineBadRequest,
     OnlineCliError,
@@ -24,9 +28,10 @@ from .online_bridge import (
     OnlineUnavailable,
 )
 from .paths import AgentHomeError
-from .routers import contact, doc, local, message, sheet, smartsheet
+from .routers import contact, doc, group, local, mars, message, sheet, smartsheet
 from .schemas import HealthResponse
 from .settings import get_agent_home, get_settings
+from .uilock import ClientBusy
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +40,9 @@ DESCRIPTION = """
 
 - **/api/v1/message/send** — 以「自建应用」身份发消息(官方 API)
 - **/api/v1/local/message/send** — 以「本人登录账号」身份发消息(操控 macOS 客户端)
+- **/api/v1/group/create** — 拉群(官方 appchat),成员可直接写中文名和「我」
 - **/api/v1/contact/search** — 查通讯录
+- **/api/v1/mars/sync/** — 把本地群消息同步到 mars 的群消息接口
 
 鉴权可选: 配了 `api_token` 后,请求需带 `Authorization: Bearer <token>`。
 """
@@ -51,6 +58,32 @@ def _error_body(path: str, message: str) -> dict:
     return {"errcode": -1, "errmsg": message}
 
 
+# 可预期异常 → HTTP 状态码。Starlette 按异常的 MRO 找处理器,所以父子类
+# 同时登记没问题(ClientBusy 比 LocalSendError 更具体,命中的是自己那条)。
+#
+#   400 你得改请求或配置    403 你还没确认      409 客户端界面被占着,原样重试
+#   502 下游失败            503 本机环境没就绪
+_ERROR_STATUS: dict[type[Exception], int] = {
+    LocalDataError: 503,
+    AgentHomeError: 503,
+    OnlineUnavailable: 503,
+    ClientBusy: 409,
+    OnlineConfirmationRequired: 403,
+    MarsSyncError: 502,
+    OnlineCliError: 502,
+    LocalSendError: 400,
+    GroupError: 400,
+    MarsNotConfigured: 400,
+    OnlineBadRequest: 400,
+}
+
+
+def _status_handler(code: int):
+    async def handler(request: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(status_code=code, content=_error_body(request.url.path, str(exc)))
+    return handler
+
+
 def _first_validation_message(exc: RequestValidationError) -> str:
     for err in exc.errors():
         msg = str(err.get("msg", ""))
@@ -61,6 +94,21 @@ def _first_validation_message(exc: RequestValidationError) -> str:
     return "invalid request body"
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """按配置拉起 mars 群消息同步的常驻循环。
+
+    循环内部自己吞异常(本地库没解密、企微没登录都是常态),所以这里不做预检:
+    服务不该因为「现在同步不了」而起不来。
+    """
+    if get_settings().mars_sync_enabled:
+        mars_loop.start()
+    try:
+        yield
+    finally:
+        await mars_loop.stop()
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
 
@@ -68,6 +116,7 @@ def create_app() -> FastAPI:
         title="WeCom 消息发送服务",
         description=DESCRIPTION,
         version="0.1.0",
+        lifespan=_lifespan,
     )
     app.add_middleware(
         CORSMiddleware,
@@ -79,9 +128,11 @@ def create_app() -> FastAPI:
     app.include_router(message.router)
     app.include_router(local.router)
     app.include_router(contact.router)
+    app.include_router(group.router)
     app.include_router(doc.router)
     app.include_router(sheet.router)
     app.include_router(smartsheet.router)
+    app.include_router(mars.router)
 
     # ── 错误处理: 保持与原 api_server.py 一致的 body 结构 ────────────
 
@@ -99,37 +150,8 @@ def create_app() -> FastAPI:
         content = detail if isinstance(detail, dict) else _error_body(request.url.path, str(detail))
         return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
 
-    @app.exception_handler(LocalDataError)
-    async def _on_local_data_error(request: Request, exc: LocalDataError):
-        return JSONResponse(status_code=503, content=_error_body(request.url.path, str(exc)))
-
-    @app.exception_handler(LocalSendError)
-    async def _on_local_send_error(request: Request, exc: LocalSendError):
-        return JSONResponse(status_code=400, content=_error_body(request.url.path, str(exc)))
-
-    @app.exception_handler(AgentHomeError)
-    async def _on_agent_home_error(request: Request, exc: AgentHomeError):
-        return JSONResponse(status_code=503, content=_error_body(request.url.path, str(exc)))
-
-    # ── online(文档/表格)错误 ────────────────────────────────────────
-    # 分开映射,好让调用方区分「环境没装好」和「你没确认」和「调用失败」
-
-    @app.exception_handler(OnlineUnavailable)
-    async def _on_online_unavailable(request: Request, exc: OnlineUnavailable):
-        return JSONResponse(status_code=503, content=_error_body(request.url.path, str(exc)))
-
-    @app.exception_handler(OnlineConfirmationRequired)
-    async def _on_online_needs_confirm(request: Request, exc: OnlineConfirmationRequired):
-        return JSONResponse(status_code=403, content=_error_body(request.url.path, str(exc)))
-
-    @app.exception_handler(OnlineBadRequest)
-    async def _on_online_bad_request(request: Request, exc: OnlineBadRequest):
-        return JSONResponse(status_code=400, content=_error_body(request.url.path, str(exc)))
-
-    @app.exception_handler(OnlineCliError)
-    async def _on_online_cli_error(request: Request, exc: OnlineCliError):
-        # 502: 本服务没问题,是下游 wecom-cli 失败
-        return JSONResponse(status_code=502, content=_error_body(request.url.path, str(exc)))
+    for exc_type, code in _ERROR_STATUS.items():
+        app.add_exception_handler(exc_type, _status_handler(code))
 
     # ── 健康检查 ──────────────────────────────────────────────────────
 

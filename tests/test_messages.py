@@ -1,0 +1,129 @@
+"""消息渲染 —— 类型修正与引用回复。
+
+上游 export_wxwork 整体打桩:这些用例测的是**我们对上游的修正**,
+不该因为上游改了自己的类型表就跟着变绿或变红。
+"""
+from typing import ClassVar
+
+import pytest
+
+from wecom_svr import messages
+
+
+class _FakeExport:
+    """模拟上游:14 标成语音、16 标成文件(即上游那套错的映射)。"""
+
+    TYPE: ClassVar[dict] = {0: "文本", 14: "语音", 15: "文件", 16: "文件", 29: "图片"}
+    MEDIA: ClassVar[dict] = {14: "[语音]", 15: "[文件]", 16: "[文件]", 29: "[图片]"}
+
+    def type_name(self, ct):
+        return self.TYPE.get(ct, f"type{ct}")
+
+    def render(self, ct, content):
+        if ct in self.MEDIA:
+            return self.MEDIA[ct]
+        if isinstance(content, bytes):
+            return content.decode("utf-8", "replace")
+        return content or ""
+
+
+@pytest.fixture(autouse=True)
+def fake_vendor(monkeypatch):
+    class V:
+        export = _FakeExport()
+
+    monkeypatch.setattr(messages, "_vendor", lambda: V())
+
+
+# ─── 类型修正 ──────────────────────────────────────────────────────────
+
+def test_type_14_is_an_image_not_a_voice_message():
+    """实测: type=14 抽 4000 条是 3443 png + 271 jpg,上游标「语音」是错的。"""
+    assert messages._type_name(14) == "图片"
+    assert messages._render(14, b"whatever", "图片") == "[图片]"
+
+
+def test_type_16_is_a_voice_message_not_a_file():
+    """实测: type=16 全库 11 条,只出现 .silk(微信语音编码)。"""
+    assert messages._type_name(16) == "语音"
+    assert messages._render(16, b"whatever", "语音") == "[语音]"
+
+
+def test_untouched_types_still_come_from_upstream():
+    """只覆盖确证标错的两个码,其余一律跟随上游,别自己发明一套。"""
+    assert messages._type_name(15) == "文件"
+    assert messages._type_name(29) == "图片"
+    assert messages._type_name(0) == "文本"
+    assert messages._render(0, "你好", "文本") == "你好"
+    assert messages._render(29, b"x", "图片") == "[图片]"
+
+
+def test_unknown_type_falls_through_to_upstream():
+    assert messages._type_name(9999) == "type9999"
+
+
+# ─── 引用回复 ──────────────────────────────────────────────────────────
+
+def _pb(field: int, payload: bytes) -> bytes:
+    """拼一个 length-delimited 的 protobuf 字段。"""
+    def varint(v):
+        out = bytearray()
+        while True:
+            b = v & 0x7F
+            v >>= 7
+            out.append(b | (0x80 if v else 0))
+            if not v:
+                return bytes(out)
+    return varint(field << 3 | 2) + varint(len(payload)) + payload
+
+
+LINK_PREVIEW = _pb(3045, b"meta") + _pb(1042, b"GitHub Issue #147")
+
+
+def _summary(extracontent) -> str:
+    """extracontent → 引用摘要。两步是因为载荷要留给引用图用,只扫一次。"""
+    return messages._quote_summary(messages._quote_payload(extracontent))
+
+
+def test_quote_of_an_image_becomes_a_placeholder():
+    body = "CAIQ4cfK0wYY386UtYeAgAMg852rqAY=\n企业微信截图_4b36e11f.png".encode()
+    assert _summary(_pb(1002, body)) == "[图片]"
+
+
+def test_quote_of_text_keeps_the_text():
+    assert _summary(_pb(1002, "明天下午三点开会".encode())) == "明天下午三点开会"
+
+
+def test_link_preview_is_not_a_quote():
+    """踩过的坑: 不认字段号只抽可读文本,会把每条带链接的日报都误标成引用。
+
+    实测该群 76 条里被误标了 27 条 —— 日报里贴 GitHub issue 链接就中招。
+    """
+    assert _summary(LINK_PREVIEW) == ""
+
+
+def test_quote_field_is_read_even_when_metadata_comes_first():
+    ec = _pb(3045, b"meta") + _pb(1002, "被引用的话".encode()) + _pb(3065, b"x")
+    assert _summary(ec) == "被引用的话"
+
+
+def test_base64_handles_are_not_mistaken_for_content():
+    """`CAIQ...=` 是客户端内部句柄,不是人写的东西,漏掉过滤就会推一堆乱码。"""
+    assert _summary(_pb(1002, b"CAIQ4cfK0wYY386UtYeAgAMg852rqAY=")) == ""
+
+
+def test_quote_is_truncated():
+    assert len(_summary(_pb(1002, ("很长" * 200).encode()))) == 60
+
+
+def test_empty_or_broken_extracontent_is_not_fatal(monkeypatch):
+    assert _summary(None) == ""
+    assert _summary(b"") == ""
+    assert _summary(b"\xff\xff\xff\xff") == ""   # 畸形字节不能抛
+
+    class Boom:
+        export = type("E", (), {"render": staticmethod(lambda ct, c: 1 / 0)})()
+
+    monkeypatch.setattr(messages, "_vendor", lambda: Boom())
+    # 引用摘要不值得让整条消息失败
+    assert _summary(_pb(1002, b"junk")) == ""
