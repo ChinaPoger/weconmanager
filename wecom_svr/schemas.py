@@ -1,7 +1,9 @@
 """请求/响应模型。"""
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .group import MAX_NAME_LEN
 
 
 class SendMessageRequest(BaseModel):
@@ -14,7 +16,7 @@ class SendMessageRequest(BaseModel):
     touser: str = Field(..., min_length=1, description="接收人 userid,多人用 | 分隔")
     msgtype: Literal["text", "markdown", "news"] = "text"
     content: str = ""
-    articles: Optional[list[dict[str, Any]]] = None
+    articles: list[dict[str, Any]] | None = None
 
     @model_validator(mode="after")
     def _check_payload(self):
@@ -39,7 +41,7 @@ class LocalSendRequest(BaseModel):
     })
 
     to: str = Field("", description="会话/群名称(模糊搜索),与 conv_rid 二选一")
-    conv_rid: Optional[int] = Field(None, description="会话 RID(数据库 ID),精准定位")
+    conv_rid: int | None = Field(None, description="会话 RID(数据库 ID),精准定位")
     content: str = Field(..., min_length=1)
 
     @model_validator(mode="after")
@@ -59,7 +61,7 @@ class LocalImageRequest(BaseModel):
     conv_rid: int = Field(..., description="会话 RID,发图片必填")
     image_path: str = Field("", description="服务端本地图片路径")
     image_base64: str = Field("", description="图片 base64,支持 data: 前缀")
-    filename: Optional[str] = Field(None, description="配合 image_base64,用于推断后缀")
+    filename: str | None = Field(None, description="配合 image_base64,用于推断后缀")
 
     @model_validator(mode="after")
     def _check_source(self):
@@ -76,6 +78,38 @@ class OpenConversationRequest(BaseModel):
     conv_rid: int = Field(..., description="要打开的会话 RID")
 
 
+class LocalCreateGroupRequest(BaseModel):
+    """以「本人登录账号」身份拉群(操控客户端)。"""
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {"members": ["陈涛", "陈挺"], "name": "临时讨论组"}
+    })
+
+    members: list[str] = Field(
+        ...,
+        min_length=2,
+        description="除自己以外的成员,按客户端通讯录搜索(同事/外部联系人/微信都行);"
+                    "自己自动是群主,不用写进来",
+    )
+    name: str = Field(
+        "", max_length=MAX_NAME_LEN, description="群名。留空则用客户端按成员自动生成的名字"
+    )
+
+
+class LocalRenameGroupRequest(BaseModel):
+    """给一个已有的群改名(操控客户端)。
+
+    官方 `appchat/update` 只认自己建的 chatid,改不了这类群,所以只能走客户端。
+    """
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {"conv_rid": 3395103030, "name": "客户群-新名字"}
+    })
+
+    conv_rid: int = Field(..., description="要改名的群会话 RID(见 /local/conversations)")
+    name: str = Field(..., min_length=1, max_length=MAX_NAME_LEN, description="新群名")
+
+
 class ContactSearchRequest(BaseModel):
     keyword: str = Field(..., min_length=1)
     department_id: int = 1
@@ -85,9 +119,9 @@ class ContactSearchRequest(BaseModel):
 
 class Conversation(BaseModel):
     name: str = ""
-    rid: Optional[int] = None
-    lid: Optional[int] = None
-    type: Optional[int] = None
+    rid: int | None = None
+    lid: int | None = None
+    type: int | None = None
     fw_id: int = 0
 
 
@@ -102,20 +136,20 @@ class LocalSendResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     success: bool
-    error: Optional[str] = None
-    conv_name: Optional[str] = None
-    conv_rid: Optional[int] = None
-    conv_lid: Optional[int] = None
-    conv_type: Optional[int] = None
-    conv_fw_id: Optional[int] = None
-    open_method: Optional[str] = None
+    error: str | None = None
+    conv_name: str | None = None
+    conv_rid: int | None = None
+    conv_lid: int | None = None
+    conv_type: int | None = None
+    conv_fw_id: int | None = None
+    open_method: str | None = None
 
 
 class HealthResponse(BaseModel):
     status: str
     service: str = "wecom-message-api"
-    agent_home: Optional[str] = None
-    wecom_cli: Optional[str] = None
+    agent_home: str | None = None
+    wecom_cli: str | None = None
     auth_enabled: bool = False
     credentials_configured: bool = False
-    detail: Optional[str] = None
+    detail: str | None = None

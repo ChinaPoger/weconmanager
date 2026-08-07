@@ -32,7 +32,7 @@ def test_upstream_layout_wins_when_both_present(tmp_path):
 
 def test_missing_cli_is_reported(tmp_path):
     (tmp_path / "decrypt").mkdir()
-    with pytest.raises(AgentHomeError, match="未找到 wecom.py"):
+    with pytest.raises(AgentHomeError, match=r"未找到 wecom\.py"):
         resolve_agent_home(tmp_path)
 
 

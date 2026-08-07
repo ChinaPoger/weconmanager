@@ -12,9 +12,10 @@ import functools
 import logging
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Callable, Optional
+from typing import Any
 
 from .settings import get_agent_home, get_settings
 
@@ -47,7 +48,7 @@ class OnlineModules:
     docs: ModuleType
     sheets: ModuleType
     smartsheets: ModuleType
-    local_docs: Optional[ModuleType]
+    local_docs: ModuleType | None
 
 
 @functools.lru_cache(maxsize=1)
@@ -141,7 +142,7 @@ def capabilities() -> dict:
             raise OnlineUnavailable(
                 f"找不到 wecom-cli({get_settings().wecom_cli_path})"
             ) from None
-        except Exception as e:  # noqa: BLE001 — 探测接口不该因单项失败而整体报错
+        except Exception as e:
             return f"error: {e}"
 
     from online import selfcheck

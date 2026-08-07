@@ -14,28 +14,17 @@ import os
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
-from typing import Optional
 from urllib.parse import urlencode
 
-from .paths import find_db
-from .settings import get_agent_home
+from .localdb import NOT_SYNCED as _NOT_SYNCED
 
-_UI_LOCK = threading.Lock()
-
-_NOT_SYNCED = (
-    "解密 OK,但核心表缺失 → 数据未同步(可能是新登录)。"
-    "先打开企业微信浏览消息,等同步后重试。"
-)
-
-
-class LocalSendError(RuntimeError):
-    """本地发送相关的可预期错误(向客户端回报文案,不是 500)。"""
-
-
-class LocalDataError(LocalSendError):
-    """本地数据库缺失或未同步。"""
+# 错误类型在 localdb 定义,这里转出供 main/cli/tests 沿用。
+# `X as X` 是显式 re-export 的标准写法,比手写一份 __all__ 清单更不容易漂。
+from .localdb import LocalDataError as LocalDataError
+from .localdb import LocalSendError as LocalSendError
+from .localdb import connect
+from .uilock import ui_session
 
 
 def ensure_macos() -> None:
@@ -45,23 +34,12 @@ def ensure_macos() -> None:
 
 # ─── 数据库 ────────────────────────────────────────────────────────────
 
-def _connect(name: str) -> sqlite3.Connection:
-    decrypt_dir = get_agent_home().decrypt_dir
-    db = find_db(decrypt_dir, name)
-    if not db:
-        raise LocalDataError(
-            f"未找到解密后的 {name}(查找目录 {decrypt_dir})。"
-            "请先运行 wecom-agent 的 decrypt/macos/read_wecom.py"
-        )
-    return sqlite3.connect(db)
-
-
 def _get_info_conn() -> sqlite3.Connection:
-    return _connect("Info.db")
+    return connect("Info.db")
 
 
 def _get_session_conn() -> sqlite3.Connection:
-    return _connect("Session.db")
+    return connect("Session.db")
 
 
 def list_conversations(search: str = "") -> list[dict]:
@@ -78,7 +56,7 @@ def list_conversations(search: str = "") -> list[dict]:
             rows = conn.execute("SELECT * FROM CONVERSATION ORDER BY sort_time DESC LIMIT 100")
         results = []
         for r in rows:
-            d = dict(zip(cols, r))
+            d = dict(zip(cols, r, strict=True))
             results.append({
                 "name": d.get("name", ""),
                 "rid": d.get("RID"),
@@ -95,7 +73,7 @@ def list_conversations(search: str = "") -> list[dict]:
         conn.close()
 
 
-def get_conversation_by_rid(rid: int) -> Optional[dict]:
+def get_conversation_by_rid(rid: int) -> dict | None:
     """按 RID 精确查找对话。"""
     conn = _get_info_conn()
     try:
@@ -109,7 +87,7 @@ def get_conversation_by_rid(rid: int) -> Optional[dict]:
         conn.close()
 
     if r:
-        d = dict(zip(cols, r))
+        d = dict(zip(cols, r, strict=True))
         return {
             "name": d.get("name", ""), "rid": d.get("RID"),
             "lid": d.get("LID"), "type": d.get("conversationtype"),
@@ -130,7 +108,7 @@ def get_conversation_by_name(name: str) -> list[dict]:
         raise
     finally:
         conn.close()
-    return [dict(zip(cols, r)) for r in rows]
+    return [dict(zip(cols, r, strict=True)) for r in rows]
 
 
 def _count_name_collisions(name: str) -> int:
@@ -147,7 +125,7 @@ def _count_name_collisions(name: str) -> int:
         return 0
 
 
-def resolve_conversation_name(identifier: str, rid: Optional[int] = None) -> Optional[dict]:
+def resolve_conversation_name(identifier: str, rid: int | None = None) -> dict | None:
     """解析对话 → {"name", "rid", "lid", "type", "fw_id", "skip"}。
 
     skip 表示搜索结果中需跳过的同名用户数(防止选到机器人)。
@@ -206,18 +184,26 @@ def _normalize_file_path(path: str) -> str:
 # ─── AppleScript ────────────────────────────────────────────────────────
 
 def _run_applescript(script: str, timeout: int = 15) -> tuple[bool, str]:
+    """跑一段 AppleScript,返回 (成功, 输出或错误文案)。
+
+    失败时 stdout 和 stderr 都要看: `-s o` 让 AppleScript 把报错写到 **stdout**,
+    只回读 stderr 的话每个报错都变成一句空消息(「粘贴/发送失败: 」后面什么都没有)。
+    """
     try:
         r = subprocess.run(
             ["osascript", "-s", "o", "-"],
             input=script, capture_output=True, text=True, timeout=timeout,
         )
-        if r.returncode != 0:
-            return False, r.stderr.strip()
-        return True, r.stdout.strip()
     except subprocess.TimeoutExpired:
-        return False, "AppleScript 超时"
+        return False, f"AppleScript 超时({timeout}s)"
     except FileNotFoundError:
         return False, "osascript 不可用(非 macOS?)"
+
+    out = (r.stdout or "").strip()
+    err = (r.stderr or "").strip()
+    if r.returncode != 0:
+        return False, err or out or f"osascript 退出码 {r.returncode}"
+    return True, out
 
 
 def _set_clipboard_image(path: str) -> tuple[bool, str]:
@@ -329,7 +315,7 @@ def open_conversation_by_rid(rid: int) -> dict:
     if not conv:
         return {"success": False, "error": f"未找到 RID={rid} 的对话"}
 
-    with _UI_LOCK:
+    with ui_session("打开会话"):
         ok, msg = _open_conversation_by_scheme(conv)
     return {
         "success": ok,
@@ -459,7 +445,7 @@ def _send_one(contact_name: str, content: str, skip_results: int = 0) -> tuple[b
 
 # ─── 公开 API ──────────────────────────────────────────────────────────
 
-def send_message(to: str = "", content: str = "", conv_rid: Optional[int] = None) -> dict:
+def send_message(to: str = "", content: str = "", conv_rid: int | None = None) -> dict:
     """以登录用户身份发送消息。
 
     Args:
@@ -497,7 +483,7 @@ def send_message(to: str = "", content: str = "", conv_rid: Optional[int] = None
     name = conv["name"]
     skip = conv.get("skip", 0)
     open_method = "url_scheme" if conv_rid else "search"
-    with _UI_LOCK:
+    with ui_session("发消息"):
         if conv_rid:
             ok, msg = _send_by_scheme(conv, content)
         else:
@@ -516,7 +502,7 @@ def send_message(to: str = "", content: str = "", conv_rid: Optional[int] = None
     }
 
 
-def send_image(image_path: str = "", conv_rid: Optional[int] = None) -> dict:
+def send_image(image_path: str = "", conv_rid: int | None = None) -> dict:
     """以登录用户身份按 RID 发送本地图片。"""
     ensure_macos()
     if conv_rid is None:
@@ -535,7 +521,7 @@ def send_image(image_path: str = "", conv_rid: Optional[int] = None) -> dict:
     if not conv or not conv.get("name"):
         return {"success": False, "error": f"未找到 RID={conv_rid} 的对话"}
 
-    with _UI_LOCK:
+    with ui_session("发图片"):
         ok, msg = _send_image_by_scheme(conv, image_path)
 
     return {

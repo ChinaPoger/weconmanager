@@ -13,4 +13,8 @@ config.json
 .token_cache.json
 
 .pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 .DS_Store

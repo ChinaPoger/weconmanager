@@ -4,7 +4,7 @@
   - 目标文档用 docid 或 url 指定,**必须二选一**
   - 写操作要显式 confirmed=true(上游 require_confirmation 的闸门)
 """
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -18,8 +18,8 @@ class Confirmable(BaseModel):
 class DocTarget(BaseModel):
     """docid / url 二选一。"""
 
-    docid: Optional[str] = None
-    url: Optional[str] = None
+    docid: str | None = None
+    url: str | None = None
 
     @model_validator(mode="after")
     def _exactly_one(self):
@@ -58,7 +58,7 @@ class AddSubsheetRequest(ConfirmableDocTarget):
     title: str = ""
     row_count: int = 100
     column_count: int = 20
-    index: Optional[int] = None
+    index: int | None = None
 
 
 class DeleteSubsheetRequest(ConfirmableDocTarget):
@@ -87,7 +87,7 @@ class CreateSmartsheetRequest(Confirmable):
 
 
 class SmartsheetAddSheetRequest(ConfirmableDocTarget):
-    title: Optional[str] = None
+    title: str | None = None
 
 
 class SmartsheetUpdateSheetRequest(ConfirmableDocTarget):
@@ -120,7 +120,7 @@ class SmartsheetAddRecordsRequest(ConfirmableDocTarget):
 
 
 class SmartsheetUpdateRecordsRequest(SmartsheetAddRecordsRequest):
-    key_type: Optional[str] = None
+    key_type: str | None = None
 
 
 class SmartsheetDeleteRecordsRequest(ConfirmableDocTarget):
@@ -132,7 +132,7 @@ class SmartsheetDeleteRecordsRequest(ConfirmableDocTarget):
 
 class LocalDocSearchRequest(BaseModel):
     keyword: str = Field(..., min_length=1)
-    roots: Optional[list[str]] = Field(None, description="搜索根目录,默认企业微信缓存+下载/文档/桌面")
+    roots: list[str] | None = Field(None, description="搜索根目录,默认企业微信缓存+下载/文档/桌面")
     max_results: int = 5
     limit: int = 8000
 
