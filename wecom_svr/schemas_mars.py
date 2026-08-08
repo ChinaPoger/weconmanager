@@ -1,4 +1,4 @@
-"""群消息同步接口的请求模型。"""
+"""mars 相关接口(群消息同步 / 任务拉取)的请求模型。"""
 
 from pydantic import BaseModel, Field
 
@@ -17,4 +17,12 @@ class WatermarkRequest(BaseModel):
     lid: int | None = Field(None, ge=0, description="同秒内的次级序,配合 send_time")
     backfill_seconds: int | None = Field(
         None, ge=0, le=30 * 24 * 3600, description="往回补多少秒的历史(重推,下游幂等)"
+    )
+
+
+class TaskRunRequest(BaseModel):
+    """手动跑一轮任务拉取。"""
+
+    wait: float = Field(
+        0.0, ge=0, le=50, description="长轮询等多少秒。手动验证时留 0:队列空就立刻返回"
     )

@@ -21,6 +21,7 @@ from .group import GroupError
 from .local_send import LocalDataError, LocalSendError
 from .mars_sync import MarsNotConfigured, MarsSyncError
 from .mars_sync import loop as mars_loop
+from .mars_tasks import loop as mars_task_loop
 from .online_bridge import (
     OnlineBadRequest,
     OnlineCliError,
@@ -28,7 +29,7 @@ from .online_bridge import (
     OnlineUnavailable,
 )
 from .paths import AgentHomeError
-from .routers import contact, doc, group, local, mars, message, sheet, smartsheet
+from .routers import contact, doc, group, local, mars, mars_tasks, message, sheet, smartsheet
 from .schemas import HealthResponse
 from .settings import get_agent_home, get_settings
 from .uilock import ClientBusy
@@ -43,6 +44,7 @@ DESCRIPTION = """
 - **/api/v1/group/create** — 拉群(官方 appchat),成员可直接写中文名和「我」
 - **/api/v1/contact/search** — 查通讯录
 - **/api/v1/mars/sync/** — 把本地群消息同步到 mars 的群消息接口
+- **/api/v1/mars/tasks/** — 反过来:从 mars 拉任务并执行(mars 让本机发消息)
 
 鉴权可选: 配了 `api_token` 后,请求需带 `Authorization: Bearer <token>`。
 """
@@ -96,17 +98,21 @@ def _first_validation_message(exc: RequestValidationError) -> str:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """按配置拉起 mars 群消息同步的常驻循环。
+    """按配置拉起两个常驻循环:群消息同步(推)、任务拉取(拉)。
 
     循环内部自己吞异常(本地库没解密、企微没登录都是常态),所以这里不做预检:
     服务不该因为「现在同步不了」而起不来。
     """
-    if get_settings().mars_sync_enabled:
+    settings = get_settings()
+    if settings.mars_sync_enabled:
         mars_loop.start()
+    if settings.mars_tasks_enabled:
+        mars_task_loop.start()
     try:
         yield
     finally:
         await mars_loop.stop()
+        await mars_task_loop.stop()
 
 
 def create_app() -> FastAPI:
@@ -133,6 +139,7 @@ def create_app() -> FastAPI:
     app.include_router(sheet.router)
     app.include_router(smartsheet.router)
     app.include_router(mars.router)
+    app.include_router(mars_tasks.router)
 
     # ── 错误处理: 保持与原 api_server.py 一致的 body 结构 ────────────
 

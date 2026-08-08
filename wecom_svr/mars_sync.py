@@ -24,12 +24,12 @@ import json
 import logging
 import os
 import time
-from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
 
 import httpx
 
 from . import media, messages
+from .bgloop import BackgroundLoop
 from .messages import IMAGE_PLACEHOLDER, Cursor
 from .settings import Settings, get_settings
 
@@ -196,27 +196,21 @@ def to_hook(msg: dict, settings: Settings) -> dict:
 
 # ─── 推送 ───────────────────────────────────────────────────────────────
 
-def hook_url(settings: Settings) -> str:
+def mars_base(settings: Settings, exc: type = MarsNotConfigured) -> str:
+    """mars 的根地址。推消息和拉任务两条通道共用,所以「没配」的说法也只有一份。
+
+    `exc` 让调用方换成自己那一档的异常类型,报错才指得清是哪条通道没配。
+    """
     base = settings.mars_base_url.strip().rstrip("/")
     if not base:
-        raise MarsNotConfigured(
+        raise exc(
             "未配置 mars 地址。设置 WECOM_SVR_MARS_BASE_URL(例: https://ts.qiniu.io)后重试"
         )
-    return base + HOOK_PATH
+    return base
 
 
-@asynccontextmanager
-async def _client(settings: Settings):
-    """拿一个 HTTP 客户端推送用。
-
-    后台循环持有一个常驻的: 每轮新建等于每 interval 秒重握一次 TCP+TLS,
-    默认 3s 间隔下 keep-alive 基本白设。一次性调用(/run、测试)就地建一个。
-    """
-    if loop.client is not None:
-        yield loop.client
-        return
-    async with httpx.AsyncClient(timeout=settings.mars_timeout) as client:
-        yield client
+def hook_url(settings: Settings) -> str:
+    return mars_base(settings) + HOOK_PATH
 
 
 async def push_one(client: httpx.AsyncClient, hook: dict, settings: Settings) -> None:
@@ -328,7 +322,7 @@ async def sync_once(
         hooks = await asyncio.to_thread(
             lambda: [to_hook(m, settings) for m in batch]
         )
-        async with _client(settings) as client:
+        async with loop.http_client(settings.mars_timeout) as client:
             for msg, hook in zip(batch, hooks, strict=True):
                 try:
                     await push_one(client, hook, settings)
@@ -365,37 +359,14 @@ async def sync_once(
 
 # ─── 后台循环 ───────────────────────────────────────────────────────────
 
-class SyncLoop:
+class SyncLoop(BackgroundLoop):
     """常驻同步任务。间隔小的时候基本等价于实时推送。"""
 
+    name = "mars-sync"
+
     def __init__(self) -> None:
-        self._task: asyncio.Task | None = None
+        super().__init__()
         self.last_result: SyncResult | None = None
-        self.last_error: str = ""
-        # 常驻连接池,循环跑起来才建 —— 见 _client
-        self.client: httpx.AsyncClient | None = None
-
-    @property
-    def running(self) -> bool:
-        return self._task is not None and not self._task.done()
-
-    def start(self) -> None:
-        if self.running:
-            return
-        self._task = asyncio.create_task(self._run(), name="mars-sync")
-
-    async def stop(self) -> None:
-        if not self._task:
-            return
-        self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
-        self._task = None
-        if self.client is not None:
-            await self.client.aclose()
-            self.client = None
 
     async def _run(self) -> None:
         settings = get_settings()
