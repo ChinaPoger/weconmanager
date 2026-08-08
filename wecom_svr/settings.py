@@ -77,6 +77,28 @@ class Settings(BaseSettings):
     mars_robot: str = "wecom-svr"
     mars_client_type: str = "Wework"
 
+    # ── 从 mars 拉任务(mars → 本机的反向通道)────────────────────────
+    # 设计见 docs/mars-task-queue.md。token 留空 = 整个功能关闭。
+    mars_tasks_token: str = ""
+    mars_tasks_enabled: bool = False
+    # 认领用的 worker 名。留空取本机 hostname —— 两台 Mac 用同一个名字会各拿
+    # 走一半任务(租约保证不重复执行,但顺序不保证),所以默认必须是机器相关的
+    mars_tasks_worker: str = ""
+    # 长轮询秒数。上限 50:前面 openresty 的 proxy_read_timeout 默认 60s
+    mars_tasks_wait: float = 25.0
+    # 一次领几条。默认 1 是有原因的:执行是串行的,一次领 5 条会让队尾那条在还没
+    # 轮到它时租约就到期 —— 然后被 mars 放回队列、被下一轮的自己再领一次,
+    # 于是同一条任务在本机排了两遍队。领一条做一条就没有这个类别的问题。
+    mars_tasks_max: int = 1
+    # 租约秒数,要盖住最慢的操作(拉群要逐个搜成员,可能几十秒)
+    mars_tasks_lease: int = 120
+    # 出错后歇多久再拉。正常轮次不 sleep —— 长轮询自己就是节流
+    mars_tasks_idle: float = 3.0
+    # ⚠️ 动作白名单。默认只允许「以应用身份发消息」。
+    # local.* 是**以你本人的身份说话**,让一个远端队列能驱动它,权限边界比
+    # 「应用发通知」大一个量级,必须显式写进来。"*" = 全开。
+    mars_tasks_actions: str = "message.send"
+
     # ── 图片落地(对象存储)────────────────────────────────────────────
     # 群图片原本只在本机企微缓存里,别人打不开。传到 kodo 换个公网 URL 才看得见。
     # ⚠️ 目标 bucket 公开可读:传上去等于放公网,只是没人知道地址。默认不开。
@@ -98,6 +120,10 @@ class Settings(BaseSettings):
     @property
     def mars_state_file(self) -> Path:
         return self.data_dir / "mars_sync_state.json"
+
+    @property
+    def mars_tasks_state_file(self) -> Path:
+        return self.data_dir / "mars_tasks_state.json"
 
     @property
     def upload_dir(self) -> Path:

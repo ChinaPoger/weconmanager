@@ -15,8 +15,12 @@
 另有在线文档/表格/智能表接口(`/api/v1/doc|sheet|smartsheet/*`),
 封装上游 `online/` 包 —— 见[文档与表格](#文档与表格)。
 
-反向还有一条:把本地群聊消息准实时同步给 mars 的群消息接口
-(`/api/v1/mars/sync/*`)—— 见[群消息同步到 mars](#群消息同步到-mars)。
+另外两条是和 mars 的双向通道:
+
+- 把本地群聊消息准实时**推**给 mars(`/api/v1/mars/sync/*`)——
+  见[群消息同步到 mars](#群消息同步到-mars)
+- 反过来从 mars **拉**任务并执行(`/api/v1/mars/tasks/*`)——
+  见[从 mars 拉任务](#从-mars-拉任务反向通道)
 
 ## 依赖的 pkg:wecom-agent
 
@@ -355,6 +359,50 @@ curl http://127.0.0.1:8090/api/v1/mars/sync/status
 | `403` | 在线写操作未带 `confirmed: true` |
 | `502` | 下游 `wecom-cli` / mars 执行失败或超时(本服务本身正常) |
 | `503` | 环境没准备好:本地库未解密/未同步、`wecom-cli` 没装、agent home 解析不了 |
+
+## 从 mars 拉任务(反向通道)
+
+上面那节是本机把群消息**推**给 mars;这节是反过来 —— mars 想让这台 Mac 发一条
+消息时怎么办。
+
+这台 Mac 在 NAT 后面、IP 会变、还会合盖休眠,mars 拨不进来;而它拨出去是通的。
+所以做成**任务队列 + 长轮询**:mars 把"要发什么"落库(`wecom_tasks`),本机来取、
+报告开工、执行、回报。完整设计(为什么不是 WebSocket、状态机、fencing 令牌、
+崩溃恢复)见 [docs/mars-task-queue.md](docs/mars-task-queue.md)。
+mars 侧代码在 `qbox/mars` 的 `feat/wecom-task-queue` 分支。
+
+```bash
+# 1. 配置(.env),token 要和 mars.json 的 wecom_task_token 一致。留空 = 关闭
+#    WECOM_SVR_MARS_BASE_URL=https://ts.qiniu.io
+#    WECOM_SVR_MARS_TASKS_TOKEN=...
+
+# 2. 手动跑一轮验证(wait=0:队列空就立刻返回)
+curl -X POST http://127.0.0.1:8090/api/v1/mars/tasks/run -d '{"wait":0}' \
+  -H 'Content-Type: application/json'
+
+# 3. 常驻
+curl -X POST http://127.0.0.1:8090/api/v1/mars/tasks/start
+curl http://127.0.0.1:8090/api/v1/mars/tasks/status
+```
+
+配了 `WECOM_SVR_MARS_TASKS_ENABLED=true` 则随服务启动自动常驻。
+
+| 端点 | 用途 |
+| --- | --- |
+| `GET /api/v1/mars/tasks/status` | 累计条数、inflight、白名单、上次错误 |
+| `POST /api/v1/mars/tasks/run` | 立即拉一轮并执行,`{"wait": 0}` 不等 |
+| `POST /api/v1/mars/tasks/start` \| `/stop` | 起停后台循环 |
+
+### 两条不能退化的约束
+
+- **`local.*` 默认不在白名单。** `WECOM_SVR_MARS_TASKS_ACTIONS` 默认只有
+  `message.send`(应用身份)。`local.*` 是**以你本人的身份说话**,让一个远端队列
+  能驱动它,权限边界比"应用发通知"大一个量级,要开必须显式写进配置。
+- **宁可漏发,不重发。** 跟群消息同步的取舍正好相反 —— 那边 mars 有 checksum
+  唯一索引兜底,重推是安全的;这边发出去就收不回来。所以真正动手前会先调
+  mars 的 `/start` 把任务推进 `executing`,失联时 mars 判"结果未知"而**不重投**;
+  本地 inflight 记录也是原子落盘的(临时文件 + fsync + rename),半截文件会让
+  这条保证失效。
 
 ## 本人身份发送的前提(仅 macOS)
 
