@@ -14,7 +14,7 @@ from wecom_svr import mars_tasks
 from wecom_svr.main import create_app
 from wecom_svr.mars_tasks import MarsTasksNotConfigured, Outcome, State, Task
 from wecom_svr.settings import Settings, get_agent_home, get_settings
-from wecom_svr.uilock import ClientBusy
+from wecom_svr.uilock import ui_session
 
 TOKEN = "t0ken"
 
@@ -256,19 +256,24 @@ def test_local_failure_body_is_a_failure(settings, mars, monkeypatch):
     assert mars.last_ack["error"] == "没找到会话"
 
 
-def test_client_busy_asks_mars_to_retry(settings, mars, monkeypatch):
-    """界面被占着不是任务本身的问题 —— 回 pending,别消耗重试次数。"""
+def test_client_busy_is_reported_before_start(settings, mars):
+    """界面被占着 → 必须在 /start **之前**就退回队列。
+
+    这是协议里唯一安全的 retry:任务还是 leased,一条消息都没发过。
+    等进了 executing 再喊忙,mars 就分不清「没发」和「发了一半」了。
+    """
     settings = settings.model_copy(update={"mars_tasks_actions": "local.message.send"})
-
-    def busy(**kw):
-        raise ClientBusy("客户端正被另一个操作占用")
-
-    monkeypatch.setattr(mars_tasks.local_send, "send_message", busy)
     mars.give(1, "local.message.send", {"to": "张三", "content": "hi"})
-    run(mars_tasks.run_once(settings, wait=0))
 
+    with ui_session("别的操作占着界面"):
+        result = run(mars_tasks.run_once(settings, wait=0))
+
+    assert mars.starts == []                 # 关键:从没进过 executing
     assert mars.last_ack["ok"] is False
     assert mars.last_ack["retry"] is True
+    # 这一轮"因为忙而退回"要能被数出来 —— 后台循环靠它决定歇一下,
+    # 否则任务立刻可再领 + 本轮不阻塞在长轮询上 = 以网络速度空转
+    assert result.busy == 1
 
 
 def test_one_failure_does_not_stop_the_batch(settings, mars, app_send):
@@ -363,25 +368,31 @@ def test_crash_mid_send_is_settled_as_sent_not_retried(settings, mars, app_send)
     assert mars_tasks.load_state(settings).inflight is None
 
 
-def test_crash_before_starting_is_safe_to_retry(settings, mars, app_send):
-    """phase=leased 的 inflight = 还没动手就崩了,什么都没发生 → 让它回队列。
+def test_nothing_is_persisted_before_the_outcome_exists(settings, mars, monkeypatch):
+    """动手当中本机不记任何东西 —— 崩了由 mars 的 reaper 判「结果未知」。
 
-    跟上面那条的区别就是 phase。分不清这两种,要么白丢任务,要么发两遍。
+    本机再记一遍「我做到哪了」是冗余的:mars 那边 executing + 租约超时已经是
+    同一个结论。少记一次,就少一个能写坏、能被并发读岔的状态。
     """
-    mars_tasks.save_state(State(inflight={
-        "id": 8, "action": "message.send", "phase": "leased", "token": "mac-test:tok8",
-    }), settings)
+    settings = settings.model_copy(update={"mars_tasks_actions": "local.message.send"})
+    seen = {}
+
+    def send(**kw):
+        seen["inflight"] = mars_tasks.load_state(settings).inflight
+        return {"success": True}
+
+    monkeypatch.setattr(mars_tasks.local_send, "send_message", send)
+    mars.give(1, "local.message.send", {"to": "张三", "content": "hi"})
     run(mars_tasks.run_once(settings, wait=0))
 
-    assert app_send == []
-    assert mars.last_ack["ok"] is False
-    assert mars.last_ack["retry"] is True    # 关键:这条可以安全重投
-    assert mars.last_ack["lease_token"] == "mac-test:tok8"
+    assert seen["inflight"] is None          # 执行途中本机什么都没落盘
+    assert mars.starts == [(1, {"lease_token": "mac-test:tok1"})]   # 但 mars 知道它在执行
+    assert mars.last_ack["ok"] is True
 
 
 def test_state_file_is_written_atomically(settings):
     """崩在写状态文件中间会留下半截 JSON,而读不动就等于丢了 inflight 记录。"""
-    state = State(done=3, inflight={"id": 1, "phase": "started"})
+    state = State(done=3, inflight={"id": 1, "outcome": {"ok": True}})
     mars_tasks.save_state(state, settings)
 
     # 落盘期间不留残骸,读回来也不掉字段

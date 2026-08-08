@@ -27,6 +27,7 @@ import socket
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
+from typing import NamedTuple
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -47,7 +48,7 @@ from .schemas import (
     SendMessageRequest,
 )
 from .settings import Settings, get_settings
-from .uilock import ClientBusy
+from .uilock import ClientBusy, ui_reserve
 
 log = logging.getLogger(__name__)
 
@@ -145,13 +146,25 @@ async def _rename_local_group(req: LocalRenameGroupRequest) -> dict:
     return await asyncio.to_thread(local_group.rename_group, req.conv_rid, req.name)
 
 
-# action → (payload 的 schema, 执行函数)。schema 和 HTTP 路由用的是同一批。
-ACTIONS: dict[str, tuple[type[BaseModel], object]] = {
-    "message.send": (SendMessageRequest, _send_app_message),
-    "local.message.send": (LocalSendRequest, _send_local_message),
-    "local.image.send": (LocalImageRequest, _send_local_image),
-    "local.group.create": (LocalCreateGroupRequest, _create_local_group),
-    "local.group.rename": (LocalRenameGroupRequest, _rename_local_group),
+class Action(NamedTuple):
+    """一个 action 的全部三件事。schema 和 HTTP 路由用的是同一批。"""
+
+    schema: type[BaseModel]
+    run: object
+    # needs_ui 要不要独占客户端界面。为真的在 /start **之前**先占锁(见 _run_task)——
+    # 界面忙必须在 leased 阶段暴露,那时还能安全退回队列。
+    #
+    # 放在这里而不是另立一张按 action 名并行的表:并行表没有任何东西保证两边同步,
+    # 而写成元组的一项,新增 action 时不回答这个问题**根本编译不过**。
+    needs_ui: bool
+
+
+ACTIONS: dict[str, Action] = {
+    "message.send": Action(SendMessageRequest, _send_app_message, False),  # 官方 API,不碰界面
+    "local.message.send": Action(LocalSendRequest, _send_local_message, True),
+    "local.image.send": Action(LocalImageRequest, _send_local_image, True),
+    "local.group.create": Action(LocalCreateGroupRequest, _create_local_group, True),
+    "local.group.rename": Action(LocalRenameGroupRequest, _rename_local_group, True),
 }
 
 
@@ -177,7 +190,7 @@ def _verdict(action: str, result: dict) -> Outcome:
     return Outcome(True, result=result)
 
 
-def precheck(task: Task, settings: Settings) -> Outcome | tuple[BaseModel, object]:
+def precheck(task: Task, settings: Settings) -> Outcome | tuple[BaseModel, Action]:
     """动手之前能判死的都在这里判。没有任何副作用。
 
     单独一步是因为这些任务根本不该进 executing 状态:它们一条消息都不会发,
@@ -196,21 +209,23 @@ def precheck(task: Task, settings: Settings) -> Outcome | tuple[BaseModel, objec
                   f"当前允许: {', '.join(sorted(allowed_actions(settings))) or '(空)'}",
         )
 
-    schema, handler = entry
     try:
-        req = schema.model_validate(task.payload)
+        req = entry.schema.model_validate(task.payload)
     except ValidationError as e:
         return Outcome(False, error=f"payload 校验失败: {e.errors()[0].get('msg', e)}"[:500])
-    return req, handler
+    return req, entry
 
 
-async def run_handler(task: Task, req: BaseModel, handler: object) -> Outcome:
+async def run_handler(task: Task, req: BaseModel, entry: Action) -> Outcome:
     """真正动手的那一步。到这里为止的失败都还没产生副作用,从这里开始就有了。"""
     try:
-        result = await handler(req)  # type: ignore[operator]
+        result = await entry.run(req)  # type: ignore[operator]
     except ClientBusy as e:
-        # 不是任务本身的问题:回 pending 重来,并让 mars 回补 attempts
-        return Outcome(False, retry=True, error=str(e))
+        # 到这里已经是 executing 了,**不能** retry:界面忙本该在 /start 之前由
+        # ui_reserve 拦下(见 _run_task)。走到这条分支说明有别的东西绕过了预占,
+        # 而此时无法证明消息没发出去,只能按发过处理。
+        log.error("任务 %s 在 executing 阶段才报客户端忙,预占失效了: %s", task.id, e)
+        return Outcome(False, error=f"客户端忙且已进入执行阶段,按已发送处理: {e}"[:500])
     except (LocalSendError, LocalDataError, AgentHomeError, GroupError, ValueError, OSError) as e:
         # 「这台机器现在做不了」(没登录、库没解密、参数不对)。重投到同一台机器
         # 上大概率还是同样的错,所以不 retry,把原文带回 mars 让人看见。
@@ -371,6 +386,7 @@ class RunResult:
     failed: int = 0
     settled: int = 0        # 补结的 inflight 条数
     dropped: int = 0        # 令牌过期被丢掉的条数
+    busy: int = 0           # 因界面被占着而原样退回队列的条数
     error: str = ""
 
     def to_dict(self) -> dict:
@@ -397,15 +413,14 @@ def _outcome_from_saved(saved: dict) -> Outcome:
 
 
 async def _settle_inflight(client: httpx.AsyncClient, state: State, settings: Settings) -> None:
-    """把上一轮崩溃留下的 inflight 结清。inflight 的 phase 决定怎么结:
+    """把上一轮留下的 inflight 结清 —— 只有一种情况:**结果已经有了,ack 没上去**。
 
-      有 outcome  → 做完了只是 ack 没上去,原样补报。
-      phase=started 无 outcome → **崩在执行途中**,不知道消息发出去没有。
-                    按已发送结案(ok=false, retry=false),绝不重投。
-      phase=leased → 还没动手就崩了,什么都没发生 → retry=true,让它回队列。
+    崩在执行途中的那种不落在这里,交给 mars 的 reaper:executing + 租约超时 →
+    failed「结果未知」。本机再记一遍是冗余的,所以动手之前不落盘(见 run_once)。
+    代价只是失败原因晚一个租约周期出现在 GET /tasks 上,结论完全一样。
 
-    分这两种 phase 就是「宁可漏发」和「别白丢任务」之间那条线:只有真的可能
-    已经产生副作用的才认赔。
+    没有 outcome 还能走到这里的,只剩旧版本留下的状态文件。那时无法证明副作用
+    没发生,一律认赔 —— 宁可漏发。
     """
     flight = state.inflight
     if not flight:
@@ -414,17 +429,14 @@ async def _settle_inflight(client: httpx.AsyncClient, state: State, settings: Se
     saved = flight.get("outcome")
     if isinstance(saved, dict):
         outcome = _outcome_from_saved(saved)
-    elif flight.get("phase") == "started":
-        outcome = Outcome(
-            False,
-            error=f"worker 在执行 {flight.get('action')} 途中退出,"
-                  "无法确认消息是否已发出;按已发送处理,不重投",
-        )
     else:
+        # 只可能是旧版本(动手前落盘那版)留下的状态文件。吼一声 —— 否则这条任务
+        # 会静默地被结成 failed,排障时分不清是真崩了还是撞上了老格式
+        log.warning("inflight 没有 outcome(旧版状态文件),按已发送结案: %s", flight)
         outcome = Outcome(
             False,
-            retry=True,
-            error=f"worker 在动手前退出({flight.get('action')}),什么都没发生,可以重来",
+            error=f"worker 退出时 {flight.get('action')} 结果未知(无 outcome 记录),"
+                  "按已发送处理,不重投",
         )
 
     try:
@@ -444,13 +456,61 @@ async def _settle_inflight(client: httpx.AsyncClient, state: State, settings: Se
     await _persist(state, settings)
 
 
+# run_once 的互斥闸。见 run_once 的 docstring:并发跑会重复发送。
+_RUN_LOCK = asyncio.Lock()
+
+
+async def _run_task(
+    client: httpx.AsyncClient,
+    task: Task,
+    checked: tuple[BaseModel, Action],
+    settings: Settings,
+    result: RunResult,
+) -> Outcome | None:
+    """占住界面 → `/start` → 执行。返回 None = 租约失效,这条不归本机了。
+
+    **占界面在 `/start` 之前**是这套设计的支点:界面忙必须在 leased 阶段暴露 ——
+    那时一条消息都没发过,退回队列是安全的,而这是协议里唯一安全的 retry。
+    等进了 executing 再喊忙,mars 就分不清「没发」和「发了一半」,只能按发过处理。
+    """
+    _, entry = checked
+    with contextlib.ExitStack() as ui:
+        if entry.needs_ui:
+            try:
+                ui.enter_context(ui_reserve(f"任务 {task.id} {task.action}"))
+            except ClientBusy as e:
+                result.busy += 1
+                return Outcome(False, retry=True, error=str(e))
+
+        try:
+            await start(client, task, settings)
+        except StaleLease as e:
+            # 这条已经属于另一次租约了,绝不能再执行
+            log.warning("任务 %s 的租约已失效,跳过: %s", task.id, e)
+            result.dropped += 1
+            return None
+
+        # 进了 executing 才开始有副作用。这之后本机不再记「做到哪了」——
+        # 崩了由 mars 的 reaper 判「结果未知」,本机再记一遍是冗余的。
+        return await run_handler(task, *checked)
+
+
 async def run_once(settings: Settings | None = None, wait: float | None = None) -> RunResult:
     """结清上一轮 → 拉一批 → 逐条执行并回报。
 
     任何一步跟 mars 通信失败都就地停下:任务还在 mars 那边(pending 或租约中),
     下一轮重来。
+
+    **全程互斥**:两个 run_once 并发跑会重复发送 —— 后进来的那个 load_state 读到
+    前一个刚落盘的 inflight,把它当成崩溃残留补报掉,任务被放回队列又被领一次,
+    而前一个还在发。锁是这条路上唯一拦得住它的东西(令牌拦不住:两边用的是同一个)。
     """
     settings = settings or get_settings()
+    async with _RUN_LOCK:
+        return await _run_once_locked(settings, wait)
+
+
+async def _run_once_locked(settings: Settings, wait: float | None) -> RunResult:
     result = RunResult()
     state = load_state(settings)
     seconds = pull_wait(settings, wait)
@@ -468,33 +528,19 @@ async def run_once(settings: Settings | None = None, wait: float | None = None) 
             # 1. 判死:过期/不认识/不在白名单/payload 不合法。这些一条消息都不会发,
             #    没必要让 mars 把它们记成「结果未知」,所以在 /start 之前判
             checked = precheck(task, settings)
-            state.inflight = {
-                "id": task.id, "token": task.lease_token, "action": task.action,
-                "phase": "leased", "started": time.time(),
-            }
 
             if isinstance(checked, Outcome):
                 outcome = checked        # 判死了,不用动手,也不必进 executing
             else:
-                # 2. 要真动手了:先落盘,再告诉 mars 进入 executing,然后才执行。
-                #    顺序不能换 —— 落盘在前才能在崩溃后知道有这么一条待结案的;
-                #    /start 在前 mars 才分得清「领了没做」和「做了一半失联」
-                await _persist(state, settings)
-                try:
-                    await start(client, task, settings)
-                except StaleLease as e:
-                    # 这条已经属于另一次租约了,绝不能再执行
-                    log.warning("任务 %s 的租约已失效,跳过: %s", task.id, e)
-                    state.inflight = None
-                    await _persist(state, settings)
-                    result.dropped += 1
-                    continue
+                outcome = await _run_task(client, task, checked, settings, result)
+                if outcome is None:
+                    continue             # 租约失效,这条已经不归本机了
 
-                state.inflight = {**state.inflight, "phase": "started"}
-                await _persist(state, settings)
-                outcome = await run_handler(task, *checked)
-
-            state.inflight = {**state.inflight, "outcome": outcome.to_ack()}
+            # 4. 有结论了才落盘。这个文件的唯一用途:结果已经有了,ack 还没上去
+            state.inflight = {
+                "id": task.id, "token": task.lease_token, "action": task.action,
+                "outcome": outcome.to_ack(),
+            }
             await _persist(state, settings)
 
             try:
@@ -545,11 +591,14 @@ class TaskLoop(BackgroundLoop):
         log.info("mars 任务拉取已启动,worker=%s 长轮询 %.0fs", worker_name(settings), seconds)
         self.client = httpx.AsyncClient(timeout=seconds + settings.mars_timeout)
         while True:
-            failed = False
+            # 出错、或有任务因界面忙退回 —— 两种都要歇。正常轮次不歇:pull 自己
+            # 会阻塞住 wait 秒。只看**本轮**的结论,不读 self.last_result ——
+            # 那个字段是给 /status 展示用的,异常轮次里它还是上一轮的对象。
+            idle_now = True
             try:
-                self.last_result = await run_once(settings)
-                self.last_error = self.last_result.error
-                failed = bool(self.last_error)
+                self.last_result = result = await run_once(settings)
+                self.last_error = result.error
+                idle_now = bool(result.error or result.busy)
             except asyncio.CancelledError:
                 raise
             except MarsSyncError as e:
@@ -557,14 +606,11 @@ class TaskLoop(BackgroundLoop):
                 if self.last_error != str(e):
                     log.warning("mars 任务拉取暂停: %s", e)
                 self.last_error = str(e)
-                failed = True
             except Exception as e:
                 if self.last_error != str(e):
                     log.exception("mars 任务拉取异常: %s", e)
                 self.last_error = str(e)
-                failed = True
-            # 只有出错才歇 —— 正常情况下 pull 自己会阻塞住 wait 秒
-            if failed:
+            if idle_now:
                 await asyncio.sleep(idle)
 
 

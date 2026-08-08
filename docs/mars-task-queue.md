@@ -18,9 +18,11 @@
 
 第 4 条不是一句口号 —— 它决定了下面一半的设计(见 §4.2 的 `executing` 状态)。
 
-## 1. 为什么不是 WebSocket
+## 1. 被否掉的方案
 
-记下来,免得半年后有人重新提这个问题。
+记下来,免得半年后有人重新提这些问题。
+
+### 1.1 WebSocket / SSE
 
 | | WebSocket / SSE | 任务队列 + 长轮询 |
 | --- | --- | --- |
@@ -33,9 +35,18 @@
 WebSocket 唯一真正的优势是"mars 主动说话"的延迟,而长轮询在有活时是立刻返回的,
 这点优势并不存在。它换来的是一堆有状态的东西。
 
-另一条被否掉的是**内网隧道**(frp / tailscale,让 mars 直接 HTTP 调 Mac):
-mars 侧几乎零改动,是最干净的,但这台 Mac 进内网只有跳板机一条路,而跳板机
-**禁止端口转发**。除非愿意在某个生产节点上常驻 frps 并开端口,否则走不通。
+### 1.2 内网隧道
+
+frp / tailscale,让 mars 直接 HTTP 调 Mac:mars 侧几乎零改动,是最干净的,但这台
+Mac 进内网只有跳板机一条路,而跳板机**禁止端口转发**。除非愿意在某个生产节点上
+常驻 frps 并开端口,否则走不通。
+
+### 1.3 换个存储
+
+这张表放在 mars 的 MySQL 里,跟 `wecomtask.Enqueue` 要服务的业务代码同库。这不是
+默认值,是条件:**入队要能跟业务写在同一个事务里提交**(§4.5 末尾的 outbox 用法)。
+换成任何别的库都会变成跨库双写 —— 崩在两次写中间,要么丢任务,要么留下一条没有
+业务对应的幽灵任务。想动存储之前先回答这个问题。
 
 ## 2. mars 里已经有的两个东西
 
@@ -58,20 +69,26 @@ mars 侧几乎零改动,是最干净的,但这台 Mac 进内网只有跳板机�
 ## 3. 总体形状
 
 ```
-mars 业务代码 ──wecomtask.Enqueue()──┐
-                                     ├──► wecom_tasks (MySQL)
-外部调用 ──POST /tasks───────────────┘      ▲    │
-                                            │    │ ① claim(拿到 lease_token)
-                              ③ ack ────────┤    ▼
-                              ② start ──────┤  ┌─────────────────────┐
-                                            └──┤  Mac: wecom-svr     │──► 企微客户端
-                                  长轮询 ◄─────┤  mars_tasks 循环    │──► 官方 API
-                                    (25s)      └─────────────────────┘
+mars 业务代码 --wecomtask.Enqueue()--+
+                                     |
+外部调用 --POST /tasks---------------+
+                                     |
+                                     v
+                          +------------------------+
+                          |  wecom_tasks  (MySQL)  |
+                          +------------------------+
+                                ^           |
+        (2) start --------------+           | (1) claim
+        (3) ack ----------------+           v  -> lease_token
+                          +------------------------+
+                          |  Mac: wecom-svr        | --> 企微客户端
+          长轮询 (25s) <--|  mars_tasks 循环       | --> 官方 API
+                          +------------------------+
 ```
 
 一句话:**mars 只负责把"要发什么"落库,Mac 自己来取、报告开工、执行、回报。**
 
-那个 ② `start` 看着多余,其实是整套设计的支点 —— 见 §4.2。
+那个 (2) `start` 看着多余,其实是整套设计的支点 —— 见 §4.2。
 
 ## 4. mars 侧
 
@@ -83,10 +100,11 @@ type WecomTask struct {
     CreatedAt time.Time
     UpdatedAt time.Time
 
-    Worker    string  `gorm:"column:worker;size:64;not null;index"`   // 哪台机器来做
+    // worker 和 created_by 同时是 dedup_key 的命名空间 —— 见下面第 4 条
+    Worker    string  `gorm:"column:worker;size:64;not null;index;unique_index:uix_wecom_dedup"`
     Action    string  `gorm:"column:action;size:64;not null"`         // 见 §4.5
     Payload   string  `gorm:"column:payload;type:text"`               // JSON,原样透传
-    DedupKey  *string `gorm:"column:dedup_key;size:128;unique_index"`  // 可空;同 key 只入队一次
+    DedupKey  *string `gorm:"column:dedup_key;size:128;unique_index:uix_wecom_dedup"`  // 可空
 
     Status      int    `gorm:"column:status;not null;index"`
     Attempts    int    `gorm:"column:attempts;not null"`
@@ -98,35 +116,42 @@ type WecomTask struct {
 
     Result    string `gorm:"column:result;type:text"`
     Error     string `gorm:"column:error;type:text"`
-    CreatedBy string `gorm:"column:created_by;size:64"`
+    CreatedBy string `gorm:"column:created_by;size:64;unique_index:uix_wecom_dedup"`
 }
 ```
 
-三个非写不可的细节:
+四个非写不可的细节:
 
-- **被索引的 string 必须写 `size:`。** 这个 GORM 版本(`5174cc5c`,2016)对没有
-  `size` 的 string 生成 `longtext`,然后无前缀建索引会失败 —— 表建出来了但关键
-  索引没有,而 AutoMigrate 不会报到你脸上。
+- **被索引的 string 必须写 `size:`。** GORM **v1 全系列**对没有 `size` 的 string
+  生成 `longtext`,然后无前缀建索引会失败 —— 表建出来了但关键索引没有,而
+  AutoMigrate 不会报到你脸上。不是仓库这个 2016 版本特有的:最后一版 v1(v1.9.16,
+  2020)那段逻辑逐字节相同,所以**在 v1 里升级不解决这个问题**。只有 v2
+  (`gorm.io/gorm`)会给"带索引且没写 size"的字段自动用 `varchar(191)`,但那是换库
+  不是升版本(48 个文件 + 要把 `go 1.16` 抬到 1.18)。现在这个坑的后果已经被
+  §7 第 4 步的启动校验堵死了 —— 索引缺了整条路 503,不会再静默带病上线。
 - **标签是 `primary_key` 不是 `primaryKey`。** 后者在这个版本里根本不被识别
   (本例因为字段名恰好是 `ID` 会被约定兜底,但标签是无效的)。
 - **`DedupKey` 必须是 `*string`。** MySQL 唯一索引允许多个 `NULL`,但不允许多个
   `''`。用值类型的话,第二条不带 dedup_key 的任务就会撞唯一索引失败。
+- **`dedup_key` 的唯一键是复合的 `(worker, created_by, dedup_key)`,不是全局唯一。**
+  全局唯一时两个不相干的调用方碰巧用了同一个 key,后来那条会被当成"已入队"静默
+  吞掉。命名空间要跟进唯一键,不能指望调用方自觉加前缀。**副作用:`created_by`
+  从"给人看的"变成了身份的一部分** —— 同一个调用方要一直用同一个值。
 
 ### 4.2 状态机 —— `executing` 是重点
 
 ```
-        enqueue
-           │
-           ▼
-    0 pending ──claim──► 1 leased ──start──► 5 executing ──ack ok──► 2 done
-        ▲                   │   │                  │
-        │                   │   └──ack retry───────┼──► 回 0 pending(attempts 回补)
-        │                   │                      │
-        │   租约超时且 ──────┘                      └──ack 失败 ─► 3 failed
-        └── attempts<max                            │
-                                租约超时 ───────────┘─► 3 failed「结果未知,不重投」
+      enqueue
+      |
+      v
+    0 pending --claim--> 1 leased --start--> 5 executing --ack ok--> 2 done
+      ^                       |                    |
+      |                       +-- ack retry --+    +-- ack 失败 ----> 3 failed
+      |                                       |    +-- 租约超时 ----> 3 failed(结果未知,不重投)
+      |   租约超时 且 attempts < max          |
+      +---------------------------------------+
 
-                            超过 expire_at(仅 0/1)─► 4 expired
+    超过 expire_at(仅 pending / leased)--> 4 expired
 ```
 
 `1 leased` 和 `5 executing` 的区别就是**这套设计能不能兑现"宁可漏发"**:
@@ -137,6 +162,15 @@ type WecomTask struct {
 
 **少了这个状态,Mac 侧再怎么记都拦不住重发** —— 本机记着"我发过了",但 mars 那边
 租约一到期就把任务放回队列,下一轮本机自己又领回来了。这是评审里最值钱的一条。
+
+这条规则由**两处**共同守着,缺一处就是漏的:
+
+- reaper:`executing` + 租约超时 → failed(§4.4 第 1 步);
+- `Ack`:`retry=true` **只接受 `status=leased`**,从 `executing` 想放回队列一律回
+  `ErrRetryFromExecuting`(409)。
+
+只守住 reaper 是不够的:那样"executing 不重投"就只剩一条**约定** —— 靠"Mac 只在
+动手前喊忙"兜着,而 schema 拦不住任何人违反它。
 
 `2 done` / `3 failed` / `4 expired` 是终态。除租约超时外,**"要不要重试"全由执行方
 在 ack 里说** —— 只有它知道错误的性质("客户端界面正忙"该重试,"不认识这个 action"
@@ -208,6 +242,11 @@ UPDATE ... SET status=4 WHERE status IN (0,1) AND expire_at IS NOT NULL AND expi
 
 放在 pull 里而不是另起 cron:这条路本来就每 25s 被敲一次,不需要第二个调度器。
 
+代价要说清楚:**没人 pull 的时候回收根本不跑。** Mac 关机期间,已经到期的任务会
+一直挂在 `pending`/`executing` 上,`GET /tasks` 看到的是过时的。这不影响正确性 ——
+`Claim` 自己带了 `expire_at > now` 的条件,过期任务醒来也领不走,不会补发;但监控
+和排障看到的状态是滞后的,别把它当实时视图。真要实时,加个独立 reaper(§10.1)。
+
 时间由应用侧传入(`Reap(now)` / `Claim(..., now)`)而不是用 `UTC_TIMESTAMP()`。
 代价是依赖 4 个节点的 NTP 同步(毫秒级偏差 vs 120s 租约,不构成问题),
 换来的是测试可以随意穿越时间 —— `wecomtask_test.go` 里那些"一小时后再来"
@@ -219,10 +258,10 @@ UPDATE ... SET status=4 WHERE status IN (0,1) AND expire_at IS NOT NULL AND expi
 
 | 接口 | 用途 |
 | --- | --- |
-| `POST /tasks` | 入队。带 `dedup_key` 且已存在则返回原任务 + `duplicated:true` |
+| `POST /tasks` | 入队。同 `dedup_key` **且内容相同**则返回原任务 + `duplicated:true`;内容不同是撞 key,回 **409** |
 | `POST /tasks/pull` | 认领。`{"worker","max","wait","lease"}`;`wait` 秒内没活返回空数组 **200** |
 | `POST /tasks/:id/start` | 开工。`{"lease_token"}`;令牌过期回 **409** |
-| `POST /tasks/:id/ack` | 回报。`{"ok","retry","error","result","lease_token"}`;令牌过期回 **409** |
+| `POST /tasks/:id/ack` | 回报。`{"ok","retry","error","result","lease_token"}`;令牌过期、或想把 `executing` 的任务 `retry` 回队列,都回 **409** |
 | `GET  /tasks` | 给人看的列表,按 worker/status 过滤 |
 
 空队列必须是 200 而不是 400 —— 这条路一天要被敲几万次,用错误码表达"没活"
@@ -267,42 +306,6 @@ worker 只需要跟 `time.time()` 比大小,给字符串等于逼它做时区解
 
 `payload` 就是对应接口的 body,原样透传。mars 不重新建模这些字段 —— 建了就会漂。
 
-### 4.7 建表
-
-`InitWecomTaskTable()` 跟着 `httpbot.InitHTTPBotTable()` 在 `app.go` 里调,
-AutoMigrate + 补两个复合索引。但要清楚它的边界:**AutoMigrate 只补缺表/缺列/缺索引,
-不改列类型、不删同名的错索引**,而且 4 节点同时启动是 check-then-DDL 的竞态
-(顶多一个节点报错,不会写坏数据)。首次上线或改结构时,优先执行一次性 DDL:
-
-```sql
-CREATE TABLE wecom_tasks (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  worker VARCHAR(64) NOT NULL,
-  action VARCHAR(64) NOT NULL,
-  payload TEXT NOT NULL,
-  dedup_key VARCHAR(128) NULL,
-  status TINYINT NOT NULL DEFAULT 0,
-  attempts INT NOT NULL DEFAULT 0,
-  max_attempts INT NOT NULL DEFAULT 3,
-  lease_owner VARCHAR(96) NULL,
-  lease_until DATETIME NULL,
-  started_at DATETIME NULL,
-  expire_at DATETIME NULL,
-  result TEXT NULL,
-  error TEXT NULL,
-  created_by VARCHAR(64) NOT NULL DEFAULT '',
-  created_at DATETIME NOT NULL,
-  updated_at DATETIME NOT NULL,
-  PRIMARY KEY (id),
-  UNIQUE KEY uix_wecom_tasks_dedup_key (dedup_key),
-  KEY idx_wecom_claim (worker, status, id),
-  KEY idx_wecom_reap (status, lease_until),
-  KEY idx_wecom_expire (status, expire_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
-
-建完 `SHOW CREATE TABLE wecom_tasks` 核一遍索引真的在。
-
 ## 5. Mac 侧(wecom-svr)
 
 ### 5.1 循环
@@ -311,10 +314,24 @@ CREATE TABLE wecom_tasks (
 文件、`/start` `/stop` `/status` 三件套、循环内吞异常不死。
 
 ```
-pull(wait=25) ──空──► 立刻再 pull
-      │
-      └─有活─► 逐条: precheck → 落 inflight → /start → 执行 → 写结果 → /ack → 清 inflight
+pull(wait=25) --空--> 立刻再 pull
+      |
+      +--有活--> 逐条: precheck -> 占 UI -> /start -> 执行 -> 落结果 -> /ack -> 清 inflight
 ```
+
+`run_once` **全程互斥**(模块级 `asyncio.Lock`),后台循环开着时手动 `/run` 直接回
+409。两个 `run_once` 并发会重复发送,而令牌拦不住 —— 两边用的是同一个。
+
+**占 UI 在 `/start` 之前**是这条流水线的支点:界面忙必须在 `leased` 阶段暴露,那时
+一条消息都没发过,`retry=true` 是安全的。等进了 `executing` 再喊忙,mars 就只能按
+发过处理。实现是 `uilock.ui_reserve()`,占住之后调用链里嵌套的 `ui_session` 全部
+放行(用 `ContextVar` 而不是重入锁:重入按线程算,而真正操作界面的代码跑在
+`asyncio.to_thread` 的工作线程上,不是同一个线程)。
+
+"要不要占界面"是 `ACTIONS` 表里每条 action 的第三项(`Action.needs_ui`),不是
+另立一张并行的表 —— 并行表没有任何东西保证两边同步,而写成元组的一项,新增
+action 时不回答这个问题根本构造不出来。漏标的后果不对称:少标一个会把"客户端忙"
+拖到 `executing` 才暴露,而那时已经不能安全重投。
 
 **串行执行**,不并发:`local.*` 要独占客户端界面(抢焦点、剪贴板、键盘),
 `uilock` 本来就会把并发变成 409。
@@ -337,22 +354,23 @@ pull(wait=25) ──空──► 立刻再 pull
 payload 用**和 HTTP 路由同一套 pydantic schema** 校验(`SendMessageRequest`、
 `LocalSendRequest`…)。同一套校验只有一份,队列这条路不会悄悄比 HTTP 那条松。
 
-### 5.3 崩溃恢复:inflight 的三种 phase
+### 5.3 崩溃恢复:只落一次盘
 
-执行前把 inflight 落盘,执行完写上 `outcome`,ack 成功后清掉。重启时按 phase 结案:
+**拿到结果才落盘。** 这个文件的用途只有一个:**结果已经有了,ack 还没上去** ——
+重启时原样补报,不重新执行。
 
-| inflight 状态 | 含义 | 怎么结 |
-| --- | --- | --- |
-| 有 `outcome` | 做完了,只是 ack 没上去 | 原样补报 |
-| `phase=started`,无 outcome | **崩在执行途中,不知道发出去没有** | `ok=false, retry=false`,写明"按已发送处理" |
-| `phase=leased`,无 outcome | 还没动手就崩了,什么都没发生 | `ok=false, retry=true`,让它回队列 |
+动手途中本机**什么都不记**。以前这里记两次(`phase=leased` / `phase=started`),
+为的是重启时分辨"还没动手"和"崩在半路";但 mars 的 reaper 早就知道答案了:
+`executing` + 租约超时 → failed「结果未知」,`leased` + 租约超时 → 回 pending 安全
+重投(§4.4 第 1、3 步)。本机再记一遍是冗余的,而**每一次多余的落盘都是一份能写坏、
+能被并发读岔的状态**。
 
-分这两种 phase 就是"宁可漏发"和"别白丢任务"之间那条线:**只有真的可能已经产生
-副作用的才认赔**。而 mars 侧的 `executing` 状态保证了认赔之后它不会被重投回来。
+代价只有一个:崩在执行途中的失败原因要等租约到期由 reaper 写,在 `GET /tasks` 上
+晚一个租约周期出现。结论完全一样。
 
 落盘必须是**原子**的:临时文件 + `fsync` + `os.replace` + 目录 `fsync`。直接
 `write_text` 是"先清空再写",崩在中间会留下半截 JSON,而读不动就返回空状态 ——
-inflight 没了,那条任务会被重新执行一遍。这个文件存在的唯一目的就是熬过崩溃。
+那条任务的结果就白丢了,要等 reaper 兜底。这个文件存在的唯一目的就是熬过崩溃。
 
 拿到 409(令牌失效)时:**丢掉这条任务**,既不重发也不反复重试。它已经属于另一次
 租约了,再插手只会两边都错。
@@ -361,6 +379,15 @@ inflight 没了,那条任务会被重新执行一遍。这个文件存在的唯�
 
 `ClientBusy` 不算失败:ack `ok=false, retry=true`,mars 把它放回 pending 且
 **回补 attempts**(claim 时 +1 过)。这不是任务本身的问题,不该消耗重试次数。
+
+**它只可能发生在 `/start` 之前**(§5.1 的 `ui_reserve`)。这不是巧合,是这条路能
+存在的前提:`retry=true` 是协议里唯一一条"放回队列"的指令,而只有在 `leased` 阶段
+才能证明什么都没发生。真在 `executing` 阶段抢不到锁,说明预占被绕过了 —— 那时
+按已发送处理(`retry=false`),并记一条 error 级日志。
+
+退回队列的任务**立刻就能再领**,而这一轮因为拉到了东西不会阻塞在长轮询上 ——
+不管的话就是以网络速度空转。所以后台循环看 `RunResult.busy`:这一轮有任务因忙退回
+就歇 `MARS_TASKS_IDLE` 秒。剩下的"队首挡着后面"还没治,见 §10.3。
 
 ### 5.5 配置
 
@@ -374,7 +401,7 @@ inflight 没了,那条任务会被重新执行一遍。这个文件存在的唯�
 | `WECOM_SVR_MARS_TASKS_WAIT` | 25 | 长轮询秒数(上限 50) |
 | `WECOM_SVR_MARS_TASKS_MAX` | 1 | 一次认领几条。见 §5.1 为什么是 1 |
 | `WECOM_SVR_MARS_TASKS_LEASE` | 120 | 租约秒数,要盖住最慢的操作(拉群几十秒) |
-| `WECOM_SVR_MARS_TASKS_IDLE` | 3 | 出错后歇多久再拉;正常轮次不 sleep |
+| `WECOM_SVR_MARS_TASKS_IDLE` | 3 | 出错、或有任务因界面忙退回后歇多久;正常轮次不 sleep |
 
 HTTP 超时由代码算(`wait + mars_timeout`),不给单独的旋钮 —— 配错了表现是
 "每 25s 一次超时报错",很难查。
@@ -383,7 +410,7 @@ HTTP 超时由代码算(`wait + mars_timeout`),不给单独的旋钮 —— 配�
 
 | 情况 | 结果 |
 | --- | --- |
-| Mac 关机 | 任务积压在 pending;过了 `expire_at` 自动判 expired,**不会半夜补发一堆** |
+| Mac 关机 | 任务积压在 pending,**不会半夜补发一堆**(`Claim` 自带 `expire_at > now`)。但状态要等下次有人 pull 才被 reaper 改成 expired,期间 `GET /tasks` 显示的是滞后的,见 §4.4 |
 | mars 挂了 / 网断 | worker 拉不到,循环记 `last_error` 继续重试,不退出 |
 | 崩在 `/start` 之前 | 什么都没发生 → 回队列重做 |
 | 崩在执行途中 | 判 failed「结果未知」,**不重投**;mars 侧 `executing` 保证它不会被 reaper 放回来 |
@@ -391,21 +418,81 @@ HTTP 超时由代码算(`wait + mars_timeout`),不给单独的旋钮 —— 配�
 | 本机卡过租约后醒来 | start/ack 拿 409,丢掉这条任务(它已属于另一次租约) |
 | 企微没登录 / 本地库没解密 | ack 失败 `retry=false`,error 原样带回 mars,`GET /tasks` 里看得见 |
 | 同一 worker 名跑了两个实例 | 令牌保证不会互相结案,但顺序不保证,且两个进程会抢同一个状态文件。别这么干 |
+| 后台循环开着时又手动 `/run` | `run_once` 全程互斥,且循环在跑时 `/run` 直接回 409 |
 | 任务堆积 | `GET /tasks?status=0` 能看见;没有自动丢弃,靠 `expire_at` |
 
-## 7. 上线顺序
+## 7. 上线步骤
 
-1. mars 侧合并 → mars.json 配 `wecom_task_token` → 建表(优先用 §4.7 的 DDL),
-   `SHOW CREATE TABLE` 核对索引。
-2. Mac 侧配 token,白名单只留 `message.send`,`POST /api/v1/mars/tasks/run` 手动跑一轮验证。
-3. 确认无误后开 `MARS_TASKS_ENABLED=true` 常驻。
-4. 需要"以本人身份"发时,再把对应 action 加进白名单。
+1. **mars 侧合并,`mars.json` 配 `wecom_task_token`。** 没配这个 token,整条路直接 503。
+
+2. **建表。** `InitWecomTaskTable()` 跟着 `httpbot.InitHTTPBotTable()` 在 `app.go` 里
+   自动跑,但别指望它:**AutoMigrate 只补缺表/缺列/缺索引,不改列类型、不删同名的
+   错索引**,而且 4 节点同时启动是 check-then-DDL 的竞态(顶多一个节点报错,不会
+   写坏数据)。首次上线执行一次性 DDL:
+
+   ```sql
+   CREATE TABLE wecom_tasks (
+     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     worker VARCHAR(64) NOT NULL,
+     action VARCHAR(64) NOT NULL,
+     payload TEXT NOT NULL,
+     dedup_key VARCHAR(128) NULL,
+     status TINYINT NOT NULL DEFAULT 0,
+     attempts INT NOT NULL DEFAULT 0,
+     max_attempts INT NOT NULL DEFAULT 3,
+     lease_owner VARCHAR(96) NULL,
+     lease_until DATETIME NULL,
+     started_at DATETIME NULL,
+     expire_at DATETIME NULL,
+     result TEXT NULL,
+     error TEXT NULL,
+     created_by VARCHAR(64) NOT NULL DEFAULT '',
+     created_at DATETIME NOT NULL,
+     updated_at DATETIME NOT NULL,
+     PRIMARY KEY (id),
+     UNIQUE KEY uix_wecom_dedup (worker, dedup_key, created_by),
+     KEY idx_wecom_claim (worker, status, id),
+     KEY idx_wecom_reap (status, lease_until),
+     KEY idx_wecom_expire (status, expire_at)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+   ```
+
+3. **老表升级:必须手工换掉 dedup 的唯一键。** 老表上是单列的
+   `uix_wecom_tasks_dedup_key (dedup_key)`,AutoMigrate 不会删它 —— 留着,唯一性就
+   还是全局的,§4.1 第 4 条那个 dedup 保证一条都没兑现。
+
+   ```sql
+   -- 先确认没有跨命名空间的重复 key（有的话得先人工决定留哪条）
+   SELECT worker, created_by, dedup_key, COUNT(*) c
+     FROM wecom_tasks WHERE dedup_key IS NOT NULL
+    GROUP BY worker, created_by, dedup_key HAVING c > 1;
+
+   ALTER TABLE wecom_tasks
+     DROP INDEX uix_wecom_tasks_dedup_key,
+     ADD UNIQUE KEY uix_wecom_dedup (worker, dedup_key, created_by);
+   ```
+
+4. **核对。** `SHOW CREATE TABLE wecom_tasks`,确认三个 `idx_wecom_*` 都在,且唯一键
+   **只剩** `uix_wecom_dedup` 一个。
+
+   启动时 `InitWecomTaskTable` 也会自己校验一遍,**没过就把整条路关掉**(所有
+   `/api/internal/wecom/*` 回 503)。缺索引的后果不是报错而是悄悄退化,所以宁可
+   整条路不可用,也不要带病服务。性能索引缺了只吼日志,不停用。
+
+5. **Mac 侧配 token**,白名单只留 `message.send`,`POST /api/v1/mars/tasks/run`
+   手动跑一轮验证。**此时后台循环必须是停的**
+   (`GET /api/v1/mars/tasks/status` 看 `running`)—— 循环开着时 `/run` 会直接回 409。
+
+6. 确认无误后开 `MARS_TASKS_ENABLED=true` 常驻。之后就别再手动 `/run` 了。
+
+7. 需要"以本人身份"发时,再把对应 action 加进白名单(§5.2)。
 
 回滚:Mac 侧清掉 token 即可(任务留在库里,不执行);mars 侧路由摘掉,表留着。
 
 ## 8. 明确不做
 
-- 不做 WebSocket / SSE(§1)。
+- 不做 WebSocket / SSE(§1.1)。
+- 不把这张表挪出 mars 的 MySQL(§1.3)。
 - 不做多 worker 抢同一队列。要多台机器就用不同 worker 名。
 - 不做优先级、不做延时投递。要定时就在 mars 侧 cron 里到点 enqueue。
 - 不做同节点 channel 唤醒:入队多半落在别的节点上,那层缓存换不来什么。
@@ -418,6 +505,37 @@ HTTP 超时由代码算(`wait + mars_timeout`),不给单独的旋钮 —— 配�
 1. `SELECT VERSION(), @@binlog_format, @@tx_isolation;` —— 上面的锁与复制结论
    建立在 InnoDB + ROW/MIXED 之上。
 2. xs4797 / yzh1410 的 openresty 实际 `proxy_read_timeout`(文档里的 60s 是假设)。
-3. 崩溃点故障注入:在 inflight 写前/写中、`/start` 前后、发送后 outcome 写中、
-   ack 提交后响应丢失这几个点分别 `SIGKILL`,确认最终**最多发一次**。
+3. 崩溃点故障注入:在 `/start` 前后、执行途中、outcome 落盘写中、ack 提交后响应
+   丢失这几个点分别 `SIGKILL`,确认最终**最多发一次**。注意执行途中崩溃现在没有
+   本地记录,靠 mars 的 reaper 兜(§5.3),所以这一条要等租约到期才看得到结果。
 4. 表长到十万/百万行后 claim 的 `EXPLAIN`,确认走的是 `idx_wecom_claim`。
+5. 故意删掉 `uix_wecom_dedup` 重启一次,确认这条路整个回 503 而不是带病提供服务
+   (§7 第 4 步的校验)。
+
+## 10. 已知缺陷
+
+三条都**不影响正确性**,也都是单 worker、低吞吐下基本踩不到的。留在这里当已知边界。
+
+### 10.1 回收依赖 worker 来 pull
+
+见 §4.4 末尾。影响的是 `GET /tasks` 的实时性,不是对错 —— `Claim` 自带
+`expire_at > now`,过期任务醒来也领不走。要修就在 mars 侧起个独立 reaper,
+pull 里那次留着当补充。
+
+### 10.2 租约从 claim 开始计时,且 `/start` 不续期
+
+`Start` 只改 `status`/`started_at`,不动 `lease_until`。所以 120s 的租约里,
+claim→start 的往返和执行时间是共用的;真做一个几十秒的拉群操作,余量比看上去少。
+
+单 worker 串行时踩不到:执行期间没人 pull,也就没人跑 reaper 去判它超时。要更稳
+就在 `/start` 里重设一个独立的执行 deadline,或者加个带令牌的续租接口。
+
+### 10.3 `ClientBusy` 的退避只做了一半
+
+Mac 侧"这一轮有任务因忙退回就歇 `MARS_TASKS_IDLE` 秒"已经止住了空转(§5.4),
+但**队首那条仍然挡着后面**:界面被占的那几十秒里,连根本不碰界面的 `message.send`
+也跟着等。要治得在 mars 侧加 `available_at`,`Claim` 的条件里带上
+`available_at <= now`。
+
+没做是因为这是单 worker、`max=1`、低吞吐,饿死窗口就是界面被占的那几十秒。
+等真看到 `message.send` 被拖了再加字段。
