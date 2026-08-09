@@ -529,6 +529,9 @@ async def _run_once_locked(settings: Settings, wait: float | None) -> RunResult:
             #    没必要让 mars 把它们记成「结果未知」,所以在 /start 之前判
             checked = precheck(task, settings)
 
+            # 显式声明可空: 判死那条路给的是 Outcome,执行那条路还可能给 None
+            # (租约失效)。少了这行,mypy 按第一次赋值把它定成 Outcome,下面那句就报错。
+            outcome: Outcome | None
             if isinstance(checked, Outcome):
                 outcome = checked        # 判死了,不用动手,也不必进 executing
             else:
