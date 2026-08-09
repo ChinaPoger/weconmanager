@@ -99,6 +99,16 @@ class Settings(BaseSettings):
     # 「应用发通知」大一个量级,必须显式写进来。"*" = 全开。
     mars_tasks_actions: str = "message.send"
 
+    # ── 界面坐标(仅本人身份操控 macOS 客户端时用得上)──────────────────
+    # 只有两个位置没有 AX 元素,只能按主窗口原点取偏移去点(见 ui_offsets.py)。
+    # 写成 "x,y" 可覆盖;**配了就只用它**,自动校准会因此关闭 —— 人给的指令
+    # 不该被程序的猜测盖过去。
+    ui_plus_offset: str = ""
+    ui_title_offset: str = ""
+    # 自动校准:记住的点没点中时,在附近按候选试,试中了记到 ui_offsets.json。
+    # 关掉 = 只点那一个点,点不中直接报错。
+    ui_calibrate: bool = True
+
     # ── 图片落地(对象存储)────────────────────────────────────────────
     # 群图片原本只在本机企微缓存里,别人打不开。传到 kodo 换个公网 URL 才看得见。
     # ⚠️ 目标 bucket 公开可读:传上去等于放公网,只是没人知道地址。默认不开。
@@ -124,6 +134,10 @@ class Settings(BaseSettings):
     @property
     def mars_tasks_state_file(self) -> Path:
         return self.data_dir / "mars_tasks_state.json"
+
+    @property
+    def ui_offsets_file(self) -> Path:
+        return self.data_dir / "ui_offsets.json"
 
     @property
     def upload_dir(self) -> Path:

@@ -75,6 +75,8 @@ wecom-svr --port 8090 --reload
 | `WECOM_SVR_API_TOKEN` | 空 | 留空则**不鉴权**(仅本地,勿暴露公网) |
 | `WECOM_CORPID` / `WECOM_SECRET` / `WECOM_AGENTID` | 空 | 自建应用凭证,留空回落到 `config.json` |
 | `WECOM_SVR_MARS_*` | 见下 | 群消息同步到 mars,默认全关 |
+| `WECOM_SVR_UI_PLUS_OFFSET` / `WECOM_SVR_UI_TITLE_OFFSET` | 空 | 手工钉死那两个只能靠坐标点的位置(`"x,y"`),配了就关掉自动校准 |
+| `WECOM_SVR_UI_CALIBRATE` | `true` | 点不中时在附近试候选偏移,试中了记进 `.data/ui_offsets.json` |
 
 ## 接口
 
@@ -114,8 +116,11 @@ curl ... -H 'Authorization: Bearer <token>'
 - `POST /api/v1/local/image/send` —— 本人身份发图片(需 `conv_rid`)
 - `POST /api/v1/local/conversations` —— 查本地会话(body 可省略)
 - `POST /api/v1/local/conversation/open` —— 只打开会话不发送
+- `GET  /api/v1/local/busy` —— 客户端界面正被哪个操作占着(UI 锁的状态)
 - `POST /api/v1/local/group/create` —— 本人身份拉群(操控客户端,能拉外部/微信)
+- `POST /api/v1/local/group/rename` —— 本人身份改群名(官方 API 改不了的群只能走这条)
 - `POST /api/v1/group/create` —— 应用身份拉群(官方 appchat,**仅限本企业成员**)
+- `POST /api/v1/group/members/search` —— 按名字搜通讯录候选(建群前用来挑人)
 - `POST /api/v1/group/members/resolve` —— 干跑:只看名字解析成谁,不建群
 - `POST /api/v1/group/{get,update,send}` —— 查群 / 改群名换群主加人踢人 / 往群里发消息
 - `POST /api/v1/contact/search` —— 查通讯录
@@ -185,6 +190,20 @@ curl -X POST http://127.0.0.1:8090/api/v1/local/group/create \
 - **客户端是和人共用的**,请求发出到点击之间会话完全可能被你自己切走。所以改名前
   会先用哨兵值占住剪贴板再全选复制:剪贴板没变 = 没有输入框拿到焦点,直接中止 ——
   否则 `Cmd+V` + 回车会把群名当成一条消息发进别人的聊天里。
+
+只有两个位置没有 AX 元素、只能按主窗口原点取偏移去点:会话列表顶部的 `+`,和会话
+标题。量出来的常量迟早会被客户端改版打掉,所以它们都**不是「点了就算」**——点完
+必须看到成功信号(面板真的开了 / 输入框真的拿到了焦点),看不到就按候选偏移在附近
+再试,试中了记进 `.data/ui_offsets.json`,下次第一发就命中(`ui_offsets.py`)。
+
+试探的边界是刻意划死的,因为「乱点」本身就是风险:
+
+- 候选是**十字**不是网格 —— 布局变化就是这个形状(侧栏宽了整列横移,标题栏高了
+  整行竖移),而每多一个候选就多一次真实点击。
+- `title` 的候选只在标题带里横向挪一点点:再往右就是通话/更多那几个**有副作用**的
+  按钮。宁可校准不到、让人配一次 `WECOM_SVR_UI_TITLE_OFFSET`,也不能瞎点出一通视频通话。
+- 标题的试探只做「选中 + 复制」,不打字不回车 —— 一次没点中的试探什么都改不了。
+- 点开的要是**别的**面板(不是选人面板),立刻停,不继续在一个陌生面板上试。
 
 剩下的边界:
 
@@ -447,6 +466,11 @@ curl http://127.0.0.1:8090/api/v1/mars/tasks/status
 wecom-svr-local --search "notify"
 wecom-svr-local --rid 3395103030 "测试"
 wecom-svr-local --rid 3395103030 --image /tmp/a.png
+wecom-svr-local --rid 3395103030 --open-only
+
+# 拉群 / 改群名:和 /api/v1/local/group/* 是同一套代码,只是不用先起服务
+wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组"
+wecom-svr-local --rid 3395103030 --rename "客户群-新名字"
 ```
 
 ## 测试与覆盖率

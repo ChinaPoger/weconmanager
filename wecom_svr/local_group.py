@@ -13,15 +13,16 @@ userid,外部/微信联系人塞不进去;而「创建客户群」官方压根�
     合成点击也打不进 CEF 自绘控件,回车是唯一可靠的选中方式)
   - 右侧标题里的「N contact(s) selected」能读出来,每步都能回读校验
 
-唯一的坐标依赖是打开面板的那个 "+" 按钮(它不在 AX 树里),按主窗口原点
-取相对偏移;点完会校验面板是否真的出现,没出现就明确报错而不是继续瞎点。
+坐标依赖只剩两个不在 AX 树里的位置("+" 按钮和会话标题),按主窗口原点取相对
+偏移。它们都不是「点了就算」:点完必须看到成功信号(面板真的开了 / 输入框真的
+拿到了焦点),看不到就换一个候选偏移再试,试中了记下来 —— 见 ui_offsets.py。
 """
 import logging
 import re
 import subprocess
 import time
 
-from . import local_send, messages
+from . import local_send, messages, ui_offsets
 from .group import MAX_NAME_LEN
 from .local_send import _get_clipboard, _run_applescript, _set_clipboard, ensure_macos
 from .localdb import LocalSendError
@@ -32,17 +33,14 @@ from .uilock import ui_session
 
 log = logging.getLogger(__name__)
 
-# "+" 相对主窗口左上角的偏移(点)。它锚在会话列表顶部,窗口缩放不影响。
-PLUS_OFFSET = (295, 29)
-# 会话标题相对主窗口左上角的偏移。取标题最左端稍靠里一点,这样群名长短都命中
-# (会话列表宽度是固定的,标题起始位置不随内容变)。点它会把标题变成可编辑输入框。
-TITLE_OFFSET = (355, 33)
-
 # 群名长度上限沿用 group.MAX_NAME_LEN(官方 API 与客户端 UI 是同一个 50),
 # 这里还兼作「复制回来的文本像不像群名」的判据
 
 MAX_MEMBERS = 200
 SHEET_TIMEOUT = 8.0
+# 试探性候选的等待上限。第一个候选(记住的那个)给足 SHEET_TIMEOUT,后面的只是
+# 在猜,再给 8s 会把一次「界面改版」拖成一分钟的静默等待。
+PROBE_TIMEOUT = 2.5
 SEARCH_SETTLE = 1.6
 # 搜索命中多条时,最多读几行明细用于报错列候选(见 _search 里的性能说明)
 DETAIL_ROWS = 8
@@ -154,33 +152,83 @@ def _activate() -> None:
 
 # ─── 面板 ──────────────────────────────────────────────────────────────
 
+_SHEET_NONE, _SHEET_PICKER, _SHEET_OTHER = 0, 1, 2
+
+
+def _sheet_state() -> int:
+    """主窗口上有没有面板,以及它是不是「发起群聊」那个。
+
+    只数 sheet 不够: 校准要靠这个信号判断「刚才那一下点对了没有」,而客户端上
+    **任何**弹窗都会让计数变成 1 —— 认错了就会拿一个不相干的面板去选人。
+    所以多问一句搜索框在不在,分得清 0=没面板 / 1=选人面板 / 2=别的面板。
+    """
+    out = _osa(_MAIN_WINDOW + '''
+  if (count of sheets of mainWin) is 0 then return "0"
+  set sh to sheet 1 of mainWin
+  try
+    get text field 1 of group 1 of (splitter group 1 of sh)
+    return "1"
+  on error
+    return "2"
+  end try
+''')
+    code = out.strip().strip('"')
+    return int(code) if code.isdigit() else _SHEET_NONE
+
+
 def _sheet_open() -> bool:
-    out = _osa(_MAIN_WINDOW + '\n  return (count of sheets of mainWin) as string')
-    count = out.strip().strip('"')
-    return count.isdigit() and int(count) > 0
+    return _sheet_state() != _SHEET_NONE
 
 
-def _open_picker() -> None:
-    """点会话列表顶部的 "+" 打开「发起群聊」面板,并确认它真的开了。"""
-    if _sheet_open():
-        raise LocalGroupError("客户端上已经有一个弹出面板开着,请先关掉再试")
-
-    dx, dy = PLUS_OFFSET
+def _click_window_offset(dx: int, dy: int) -> None:
+    """在「主窗口原点 + 偏移」处点一下(合成点击,原生控件收得到)。"""
     _osa(_MAIN_WINDOW + f'''
   set p to position of mainWin
   click at {{(item 1 of p) + {dx}, (item 2 of p) + {dy}}}
 ''')
 
-    deadline = time.time() + SHEET_TIMEOUT
+
+def _wait_picker(timeout: float) -> int:
+    deadline = time.time() + timeout
+    state = _SHEET_NONE
     while time.time() < deadline:
         time.sleep(0.4)
-        if _sheet_open():
+        state = _sheet_state()
+        if state != _SHEET_NONE:
+            return state
+    return state
+
+
+def _open_picker() -> None:
+    """点会话列表顶部的 "+" 打开「发起群聊」面板,并确认它真的开了。
+
+    点不中就按候选偏移再试(见 ui_offsets.py):"+" 不在 AX 树里,偏移是量出来的,
+    而这里的成功信号又干净又便宜 —— 面板开没开一问就知道,正适合拿来自动校准。
+    试中了记下来,下次第一发就命中。
+    """
+    if _sheet_open():
+        raise LocalGroupError("客户端上已经有一个弹出面板开着,请先关掉再试")
+
+    tried: list[tuple[int, int]] = []
+    for i, (dx, dy) in enumerate(ui_offsets.candidates("plus")):
+        tried.append((dx, dy))
+        _click_window_offset(dx, dy)
+        state = _wait_picker(SHEET_TIMEOUT if i == 0 else PROBE_TIMEOUT)
+        if state == _SHEET_PICKER:
+            ui_offsets.remember("plus", (dx, dy))
             return
+        if state == _SHEET_OTHER:
+            # 点开了别的东西。继续试下一个候选只会在一个陌生面板上乱点,
+            # 而且那个面板还挡着 "+" —— 停下来让人看一眼。
+            raise LocalGroupError(
+                f"点 {dx, dy} 打开的不是「发起群聊」面板,已中止。"
+                "请手动关掉客户端上多出来的那个面板再试。"
+            )
     raise LocalGroupError(
-        f"点了「+」但「发起群聊」面板没出现(窗口偏移 {PLUS_OFFSET})。"
+        f"点了「+」但「发起群聊」面板没出现(试过的窗口偏移: {tried})。"
         "常见原因: 终端没拿到「辅助功能」授权;有别的企业微信窗口盖住了主窗口左上角"
         "(已经先做过 AXRaise,仍被盖住的话把那个弹出的会话窗口关掉);"
-        "或者客户端版本改了界面布局。"
+        f"或者客户端版本改了界面布局 —— {ui_offsets.describe('plus')}。"
     )
 
 
@@ -463,25 +511,29 @@ def create_group(members: list[str], name: str = "") -> dict:
 _SENTINEL = "\x00wecom-svr-clipboard-probe\x00"
 
 
-def _title_point() -> tuple[int, int]:
+def _window_point(dx: int, dy: int) -> tuple[int, int]:
+    """把「相对主窗口左上角的偏移」换算成屏幕坐标。"""
     out = _osa(_MAIN_WINDOW + f'''
   set p to position of mainWin
-  return ((item 1 of p) + {TITLE_OFFSET[0]} as string) & "," & ((item 2 of p) + {TITLE_OFFSET[1]} as string)
+  return ((item 1 of p) + {dx} as string) & "," & ((item 2 of p) + {dy} as string)
 ''')
     x, _, y = out.strip().strip('"').partition(",")
     return int(x), int(y)
 
 
-def _open_edit_box_and_read_current() -> str:
-    """点标题打开改名输入框,并把里面的当前群名读回来。
+def _probe_title(dx: int, dy: int) -> str:
+    """点一次标题候选位置,把输入框里的当前群名读回来;不对劲就抛错。
 
     读回来这一步是**安全闸门**,不是锦上添花: 客户端是和人共用的,请求发出到点击
     之间会话完全可能被切走。用哨兵值占住剪贴板再全选复制 —— 剪贴板没变就说明压根
     没有可编辑区域拿到焦点,这时候要是硬往下走,Cmd+V + 回车会把群名当成一条消息
     发进别人的聊天里。
+
+    这道闸同时也是校准的成功信号: 只做「选中 + 复制」,不打字、不回车,所以一次
+    没点中的试探什么都改不了。
     """
     _set_clipboard(_SENTINEL)
-    _real_click(*_title_point())
+    _real_click(*_window_point(dx, dy))
     _osa('''
   keystroke "a" using command down
   delay 0.2
@@ -492,14 +544,35 @@ def _open_edit_box_and_read_current() -> str:
     got = _get_clipboard()
 
     if got == _SENTINEL:
-        raise LocalGroupError("点了会话标题但没有输入框拿到焦点,已中止(没有改动任何东西)")
+        raise LocalGroupError(f"点 {dx, dy} 后没有输入框拿到焦点")
     text = got.strip()
     if not text or "\n" in text or len(text) > MAX_NAME_LEN * 2:
-        raise LocalGroupError(
-            "复制回来的内容不像群名(可能选中的是聊天记录),已中止。"
-            "别的窗口抢焦点时会这样,重试一次即可。"
-        )
+        raise LocalGroupError(f"点 {dx, dy} 复制回来的内容不像群名(可能选中的是聊天记录)")
     return text
+
+
+def _open_edit_box_and_read_current() -> str:
+    """点标题打开改名输入框,并把里面的当前群名读回来。
+
+    点不中就换候选偏移再试(见 ui_offsets.py)。候选只在标题带里横向挪一点点:
+    再往右就是通话/更多那几个**有副作用**的按钮,那不是能拿来试探的地方。
+    """
+    reasons: list[str] = []
+    for dx, dy in ui_offsets.candidates("title"):
+        try:
+            text = _probe_title(dx, dy)
+        except LocalGroupError as e:
+            reasons.append(str(e))
+            continue
+        ui_offsets.remember("title", (dx, dy))
+        return text
+
+    raise LocalGroupError(
+        "点了会话标题但没能进入改名输入框,已中止(没有改动任何东西): "
+        + ";".join(reasons)
+        + f"。别的窗口抢焦点时会这样,重试一次即可;一直这样就是布局变了 —— "
+        f"{ui_offsets.describe('title')}"
+    )
 
 
 def _group_names() -> dict[int, str]:
