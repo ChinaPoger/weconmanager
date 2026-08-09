@@ -4,10 +4,12 @@
 解析、唯一性校验、计数回读、失败时关面板这些逻辑都是真跑的,只有 AppleScript
 本身被替换成一个假客户端。
 """
+import re
+
 import pytest
 from fastapi.testclient import TestClient
 
-from wecom_svr import local_group
+from wecom_svr import local_group, ui_offsets
 from wecom_svr.main import create_app
 from wecom_svr.settings import get_agent_home, get_settings
 
@@ -84,13 +86,16 @@ DIRECTORY = {
 
 
 @pytest.fixture(autouse=True)
-def _fast_and_macos(monkeypatch):
+def _fast_and_macos(monkeypatch, tmp_path):
     monkeypatch.delenv("WECOM_SVR_API_TOKEN", raising=False)
+    # 校准学到的偏移会落盘 —— 指到 tmp_path,别把仓库里的 .data 写脏
+    monkeypatch.setenv("WECOM_SVR_DATA_DIR", str(tmp_path))
     get_settings.cache_clear()
     get_agent_home.cache_clear()
     monkeypatch.setattr(local_group, "ensure_macos", lambda: None)
     monkeypatch.setattr(local_group.time, "sleep", lambda _s: None)
     monkeypatch.setattr(local_group, "SHEET_TIMEOUT", 0.1)
+    monkeypatch.setattr(local_group, "PROBE_TIMEOUT", 0.1)
     yield
     get_settings.cache_clear()
     get_agent_home.cache_clear()
@@ -181,6 +186,102 @@ def test_missing_panel_after_plus_is_a_clear_error(monkeypatch):
         local_group.create_group(["陈涛", "陈挺"])
 
 
+# ─── 坐标自动校准 ──────────────────────────────────────────────────────
+#
+# "+" 和会话标题是仅有的两个没有 AX 元素、只能按坐标点的位置。量出来的常量迟早
+# 会被客户端改版打掉,所以点不中要能自己在附近找回来 —— 这几条守的就是那件事。
+
+class OnlyAtOffset(FakeClient):
+    """只有点在某个横向偏移上才会开面板,用来验校准真的在挪位置。"""
+
+    def __init__(self, directory, want_dx: int):
+        super().__init__(directory)
+        self.want_dx = want_dx
+        self.clicks: list[int] = []
+
+    def __call__(self, script, timeout=15):
+        if "click at {" in script:
+            self.clicks.append(int(re.search(r"item 1 of p\) \+ (-?\d+)", script).group(1)))
+            if self.clicks[-1] == self.want_dx:
+                self.sheet_open = True
+                self.plus_clicked = True
+            return True, ""
+        return super().__call__(script, timeout)
+
+
+def test_plus_offset_is_calibrated_and_remembered(monkeypatch):
+    base_x, base_y = ui_offsets.DEFAULTS["plus"]
+    client = OnlyAtOffset(DIRECTORY, want_dx=base_x - 20)
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+
+    r = local_group.create_group(["陈涛", "陈挺"])
+    assert r["success"] is True
+    assert client.clicks == [base_x, base_x - 20]      # 先试原位,再往左挪
+    assert ui_offsets.primary("plus") == (base_x - 20, base_y)
+
+    # 记住了就该一发命中 —— 否则每次建群都要白点一轮
+    again = OnlyAtOffset(DIRECTORY, want_dx=base_x - 20)
+    monkeypatch.setattr(local_group, "_run_applescript", again)
+    assert local_group.create_group(["陈涛", "陈挺"])["success"] is True
+    assert again.clicks == [base_x - 20]
+
+
+def test_a_pinned_offset_disables_probing(monkeypatch):
+    """人显式配了偏移就只点那一个 —— 配置是指令,试探是猜测,猜测别盖过指令。"""
+    monkeypatch.setenv("WECOM_SVR_UI_PLUS_OFFSET", "301,31")
+    get_settings.cache_clear()
+
+    client = OnlyAtOffset(DIRECTORY, want_dx=-9999)   # 怎么点都开不了
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+    with pytest.raises(local_group.LocalGroupError, match="面板没出现"):
+        local_group.create_group(["陈涛", "陈挺"])
+    assert client.clicks == [301]
+
+
+def test_an_unfamiliar_sheet_stops_the_probing(monkeypatch):
+    """点开的不是选人面板就立刻停 —— 继续试探等于在一个陌生面板上乱点。"""
+
+    class OpensSomethingElse(FakeClient):
+        def __call__(self, script, timeout=15):
+            if "click at {" in script:
+                self.sheet_open = True
+                return True, ""
+            if "splitter group 1 of sh)" in script:     # 面板状态探测
+                return True, "2" if self.sheet_open else "0"
+            return super().__call__(script, timeout)
+
+    monkeypatch.setattr(local_group, "_run_applescript", OpensSomethingElse(DIRECTORY))
+    with pytest.raises(local_group.LocalGroupError, match="不是「发起群聊」面板"):
+        local_group.create_group(["陈涛", "陈挺"])
+
+
+def test_title_offset_is_calibrated_and_remembered(rename_env, monkeypatch):
+    base_x, base_y = ui_offsets.DEFAULTS["title"]
+    hit_x = 100 + base_x + 40            # rename_env 里 _window_point 是 (100+dx, 200+dy)
+    clicked: list[int] = []
+
+    def click(x, y):
+        clicked.append(x)
+        if x == hit_x:                    # 只有挪过去 40 点才点得到标题
+            local_group._set_clipboard(rename_env["names"][77])
+
+    monkeypatch.setattr(local_group, "_real_click", click)
+
+    r = local_group.rename_group(77, "临时讨论组")
+    assert r["success"] is True
+    assert clicked == [100 + base_x, hit_x]
+    assert ui_offsets.primary("title") == (base_x + 40, base_y)
+
+
+def test_title_probing_never_types_anything(rename_env, monkeypatch):
+    """试探只做「选中 + 复制」。一次没点中的试探如果会打字,那就是往别人的聊天里发消息。"""
+    monkeypatch.setattr(local_group, "_real_click", lambda x, y: None)
+    with pytest.raises(local_group.LocalGroupError, match="没有输入框拿到焦点"):
+        local_group.rename_group(77, "临时讨论组")
+    assert rename_env["typed"] is None
+    assert rename_env["names"][77] == "陈挺、陈涛、任威风"
+
+
 # ─── 回车落空时的重试 ──────────────────────────────────────────────────
 
 class DropsEnter(FakeClient):
@@ -251,7 +352,7 @@ def rename_env(monkeypatch, fake):
                         lambda rid: {"name": "", "rid": rid, "lid": 1, "type": 1, "fw_id": 0})
     monkeypatch.setattr(local_group.local_send, "_open_conversation_by_scheme",
                         lambda conv, **kw: (True, "ok"))
-    monkeypatch.setattr(local_group, "_title_point", lambda: (100, 200))
+    monkeypatch.setattr(local_group, "_window_point", lambda dx, dy: (100 + dx, 200 + dy))
     monkeypatch.setattr(local_group, "_group_names", lambda: dict(state["names"]))
 
     clip = {"v": ""}
