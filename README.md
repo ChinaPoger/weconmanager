@@ -75,7 +75,7 @@ wecom-svr --port 8090 --reload
 | `WECOM_SVR_API_TOKEN` | 空 | 留空则**不鉴权**(仅本地,勿暴露公网) |
 | `WECOM_CORPID` / `WECOM_SECRET` / `WECOM_AGENTID` | 空 | 自建应用凭证,留空回落到 `config.json` |
 | `WECOM_SVR_MARS_*` | 见下 | 群消息同步到 mars,默认全关 |
-| `WECOM_SVR_UI_PLUS_OFFSET` / `_UI_TITLE_OFFSET` | 空 | 手工钉死那两个只能靠坐标点的位置(`"x,y"`),配了就关掉自动校准 |
+| `WECOM_SVR_UI_PLUS_OFFSET` / `WECOM_SVR_UI_TITLE_OFFSET` | 空 | 手工钉死那两个只能靠坐标点的位置(`"x,y"`),配了就关掉自动校准 |
 | `WECOM_SVR_UI_CALIBRATE` | `true` | 点不中时在附近试候选偏移,试中了记进 `.data/ui_offsets.json` |
 
 ## 接口
