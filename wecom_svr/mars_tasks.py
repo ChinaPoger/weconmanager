@@ -14,7 +14,8 @@
     这跟 mars_sync 的「宁可重推」正好相反:那边 mars 有 checksum 唯一索引兜底。
   - **令牌是 fencing。** 认领拿到的 lease_token 要带回 start/ack。本机卡住超过
     租约后醒来,回报会被 mars 以 409 拒掉 —— 那条任务已经属于另一次租约了。
-  - **local.* 默认不在白名单。** 那是以你本人的身份说话,不是应用发通知。
+  - **本人身份的 action 默认不在白名单。** 白名单默认只有 `app.message.send`;
+    不带 `app.` 前缀的那几条是以你本人的身份说话,不是应用发通知。
   - **payload 用和 HTTP 路由同一套 schema 校验。** 校验只有一份,队列这条路
     不会悄悄比 HTTP 那条松。
 """
@@ -159,12 +160,13 @@ class Action(NamedTuple):
     needs_ui: bool
 
 
+# 命名和 HTTP 路由同构:`app.*` 是自建应用身份,不带前缀的是本人身份。
 ACTIONS: dict[str, Action] = {
-    "message.send": Action(SendMessageRequest, _send_app_message, False),  # 官方 API,不碰界面
-    "local.message.send": Action(LocalSendRequest, _send_local_message, True),
-    "local.image.send": Action(LocalImageRequest, _send_local_image, True),
-    "local.group.create": Action(LocalCreateGroupRequest, _create_local_group, True),
-    "local.group.rename": Action(LocalRenameGroupRequest, _rename_local_group, True),
+    "app.message.send": Action(SendMessageRequest, _send_app_message, False),  # 官方 API,不碰界面
+    "message.send": Action(LocalSendRequest, _send_local_message, True),
+    "image.send": Action(LocalImageRequest, _send_local_image, True),
+    "group.create": Action(LocalCreateGroupRequest, _create_local_group, True),
+    "group.rename": Action(LocalRenameGroupRequest, _rename_local_group, True),
 }
 
 

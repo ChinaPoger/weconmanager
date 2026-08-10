@@ -23,7 +23,7 @@ from ..schemas import (
 from ..security import require_token
 from ..uilock import current as ui_current
 
-router = APIRouter(prefix="/api/v1/local", tags=["local"])
+router = APIRouter(prefix="/api/v1", tags=["local"])
 
 
 def _result_response(result: dict) -> JSONResponse:
@@ -127,3 +127,11 @@ def rename_local_group(req: LocalRenameGroupRequest, _: None = Depends(require_t
     """
     result = local_group.rename_group(req.conv_rid, req.name)
     return _result_response(result)
+
+
+# 这些路径的错误 body 用 {"success": false, "error": ...},其余用 errcode/errmsg
+# (main._error_body)。以前靠 "/api/v1/local" 前缀判断,本人身份的接口挪到
+# `/api/v1/*` 裸路径之后前缀没了 —— 只能按实际注册的路由列出来,免得两处漂。
+LOCAL_PATHS: frozenset[str] = frozenset(
+    path for r in router.routes if (path := getattr(r, "path", None))
+)

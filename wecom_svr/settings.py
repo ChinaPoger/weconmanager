@@ -95,9 +95,9 @@ class Settings(BaseSettings):
     # 出错后歇多久再拉。正常轮次不 sleep —— 长轮询自己就是节流
     mars_tasks_idle: float = 3.0
     # ⚠️ 动作白名单。默认只允许「以应用身份发消息」。
-    # local.* 是**以你本人的身份说话**,让一个远端队列能驱动它,权限边界比
-    # 「应用发通知」大一个量级,必须显式写进来。"*" = 全开。
-    mars_tasks_actions: str = "message.send"
+    # 不带 `app.` 前缀的那几条是**以你本人的身份说话**,让一个远端队列能驱动它,
+    # 权限边界比「应用发通知」大一个量级,必须显式写进来。"*" = 全开。
+    mars_tasks_actions: str = "app.message.send"
 
     # ── 界面坐标(仅本人身份操控 macOS 客户端时用得上)──────────────────
     # 只有两个位置没有 AX 元素,只能按主窗口原点取偏移去点(见 ui_offsets.py)。

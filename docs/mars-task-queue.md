@@ -272,7 +272,7 @@ UPDATE ... SET status=4 WHERE status IN (0,1) AND expire_at IS NOT NULL AND expi
 ```json
 {
   "worker": "mac-cc",
-  "action": "local.message.send",
+  "action": "message.send",
   "payload": {"to": "张三", "content": "工单 463038 已超时"},
   "expire_in": 600,
   "dedup_key": "ticket-463038-timeout",
@@ -296,15 +296,21 @@ worker 只需要跟 `time.time()` 比大小,给字符串等于逼它做时区解
 
 ### 4.6 动作表(mars 侧只校验非空,真正认它的是 Mac)
 
+action 名和 wecom-svr 的 HTTP 路由**同构**:带 `app.` 前缀的是自建应用身份,
+不带前缀的是本人身份。两边一起改,别只改一边。
+
 | action | 落到 wecom-svr 的哪里 | 身份 |
 | --- | --- | --- |
-| `message.send` | `POST /api/v1/message/send` | 自建应用 |
-| `local.message.send` | `POST /api/v1/local/message/send` | **本人** |
-| `local.image.send` | `POST /api/v1/local/image/send` | **本人** |
-| `local.group.create` | `POST /api/v1/local/group/create` | **本人** |
-| `local.group.rename` | `POST /api/v1/local/group/rename` | **本人** |
+| `app.message.send` | `POST /api/v1/app/message/send` | 自建应用 |
+| `message.send` | `POST /api/v1/message/send` | **本人** |
+| `image.send` | `POST /api/v1/image/send` | **本人** |
+| `group.create` | `POST /api/v1/group/create` | **本人** |
+| `group.rename` | `POST /api/v1/group/rename` | **本人** |
 
 `payload` 就是对应接口的 body,原样透传。mars 不重新建模这些字段 —— 建了就会漂。
+
+> 不带前缀的那四条默认**不在** worker 的白名单里(§5.2)。"本人身份是默认关的"
+> 靠的是白名单,不是名字长得像 —— 加新 action 时别指望前缀替你把门。
 
 ## 5. Mac 侧(wecom-svr)
 
@@ -333,7 +339,7 @@ pull(wait=25) --空--> 立刻再 pull
 action 时不回答这个问题根本构造不出来。漏标的后果不对称:少标一个会把"客户端忙"
 拖到 `executing` 才暴露,而那时已经不能安全重投。
 
-**串行执行**,不并发:`local.*` 要独占客户端界面(抢焦点、剪贴板、键盘),
+**串行执行**,不并发:本人身份那几条要独占客户端界面(抢焦点、剪贴板、键盘),
 `uilock` 本来就会把并发变成 409。
 
 `precheck`(过期 / 不认识的 action / 不在白名单 / payload 不合法)刻意排在 `/start`
@@ -345,11 +351,12 @@ action 时不回答这个问题根本构造不出来。漏标的后果不对称:
 
 ### 5.2 动作白名单(默认只开应用身份)
 
-`WECOM_SVR_MARS_TASKS_ACTIONS` 默认 `message.send`。
+`WECOM_SVR_MARS_TASKS_ACTIONS` 默认 `app.message.send`。
 
-`local.*` 是**以你本人的身份说话**,让一个远端队列能驱动它,权限边界比"应用发通知"
-大一个量级。要开必须显式写进白名单。不在白名单里的 action 直接 ack 失败
-(`retry=false`),不执行。
+不带 `app.` 前缀的那四条(`message.send` / `image.send` / `group.create` /
+`group.rename`)是**以你本人的身份说话**,让一个远端队列能驱动它,权限边界比
+"应用发通知"大一个量级。要开必须显式写进白名单。不在白名单里的 action 直接 ack
+失败(`retry=false`),不执行。
 
 payload 用**和 HTTP 路由同一套 pydantic schema** 校验(`SendMessageRequest`、
 `LocalSendRequest`…)。同一套校验只有一份,队列这条路不会悄悄比 HTTP 那条松。
@@ -397,7 +404,7 @@ payload 用**和 HTTP 路由同一套 pydantic schema** 校验(`SendMessageReque
 | `WECOM_SVR_MARS_TASKS_TOKEN` | 空 | **留空 = 不拉**。整个功能的总开关 |
 | `WECOM_SVR_MARS_TASKS_ENABLED` | false | 随服务启动常驻 |
 | `WECOM_SVR_MARS_TASKS_WORKER` | 空 → hostname | 认领用的 worker 名 |
-| `WECOM_SVR_MARS_TASKS_ACTIONS` | `message.send` | 白名单,逗号分隔;`*` 全开 |
+| `WECOM_SVR_MARS_TASKS_ACTIONS` | `app.message.send` | 白名单,逗号分隔;`*` 全开 |
 | `WECOM_SVR_MARS_TASKS_WAIT` | 25 | 长轮询秒数(上限 50) |
 | `WECOM_SVR_MARS_TASKS_MAX` | 1 | 一次认领几条。见 §5.1 为什么是 1 |
 | `WECOM_SVR_MARS_TASKS_LEASE` | 120 | 租约秒数,要盖住最慢的操作(拉群几十秒) |
@@ -484,7 +491,7 @@ HTTP 超时由代码算(`wait + mars_timeout`),不给单独的旋钮 —— 配�
    4 个节点同时 `AutoMigrate` 是 check-then-DDL,输掉的那个启动时确实会失败,
    而那时表其实已经被别人建好了,拿一次几毫秒的竞态换一台机器长期 503 不划算。
 
-5. **Mac 侧配 token**,白名单只留 `message.send`,`POST /api/v1/mars/tasks/run`
+5. **Mac 侧配 token**,白名单只留 `app.message.send`,`POST /api/v1/mars/tasks/run`
    手动跑一轮验证。**此时后台循环必须是停的**
    (`GET /api/v1/mars/tasks/status` 看 `running`)—— 循环开着时 `/run` 会直接回 409。
 
@@ -538,9 +545,9 @@ claim→start 的往返和执行时间是共用的;真做一个几十秒的拉�
 ### 10.3 `ClientBusy` 的退避只做了一半
 
 Mac 侧"这一轮有任务因忙退回就歇 `MARS_TASKS_IDLE` 秒"已经止住了空转(§5.4),
-但**队首那条仍然挡着后面**:界面被占的那几十秒里,连根本不碰界面的 `message.send`
-也跟着等。要治得在 mars 侧加 `available_at`,`Claim` 的条件里带上
-`available_at <= now`。
+但**队首那条仍然挡着后面**:界面被占的那几十秒里,连根本不碰界面的
+`app.message.send` 也跟着等。要治得在 mars 侧加 `available_at`,`Claim` 的条件里
+带上 `available_at <= now`。
 
 没做是因为这是单 worker、`max=1`、低吞吐,饿死窗口就是界面被占的那几十秒。
-等真看到 `message.send` 被拖了再加字段。
+等真看到 `app.message.send` 被拖了再加字段。

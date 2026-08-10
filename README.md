@@ -9,8 +9,8 @@
 
 | 接口 | 身份 | 实现 |
 | --- | --- | --- |
-| `POST /api/v1/message/send` | **自建应用** —— 对方看到的是「应用」 | 调 wecom-agent 的 `wecom.py`(官方 API) |
-| `POST /api/v1/local/message/send` | **本人登录账号** —— 对方看到的是你 | 读解密数据库 + AppleScript 操控 macOS 客户端 |
+| `POST /api/v1/app/message/send` | **自建应用** —— 对方看到的是「应用」 | 调 wecom-agent 的 `wecom.py`(官方 API) |
+| `POST /api/v1/message/send` | **本人登录账号** —— 对方看到的是你 | 读解密数据库 + AppleScript 操控 macOS 客户端 |
 
 另有在线文档/表格/智能表接口(`/api/v1/doc|sheet|smartsheet/*`),
 封装上游 `online/` 包 —— 见[文档与表格](#文档与表格)。
@@ -82,26 +82,26 @@ wecom-svr --port 8090 --reload
 
 ```bash
 # 以应用身份发消息(官方 API)
-curl -X POST http://127.0.0.1:8090/api/v1/message/send \
+curl -X POST http://127.0.0.1:8090/api/v1/app/message/send \
   -H 'Content-Type: application/json' \
   -d '{"touser":"zhangsan","msgtype":"text","content":"你好"}'
 
 # 以本人身份发消息(操控客户端)
-curl -X POST http://127.0.0.1:8090/api/v1/local/message/send \
+curl -X POST http://127.0.0.1:8090/api/v1/message/send \
   -H 'Content-Type: application/json' \
   -d '{"conv_rid":3395103030,"content":"你好,我是本人"}'
 
 # 查本地会话拿 RID
-curl -X POST http://127.0.0.1:8090/api/v1/local/conversations \
+curl -X POST http://127.0.0.1:8090/api/v1/conversations \
   -H 'Content-Type: application/json' -d '{"keyword":"notify"}'
 
 # 发图片(image_path 或 image_base64 二选一)
-curl -X POST http://127.0.0.1:8090/api/v1/local/image/send \
+curl -X POST http://127.0.0.1:8090/api/v1/image/send \
   -H 'Content-Type: application/json' \
   -d '{"conv_rid":3395103030,"image_path":"/tmp/a.png"}'
 
 # 查通讯录
-curl -X POST http://127.0.0.1:8090/api/v1/contact/search \
+curl -X POST http://127.0.0.1:8090/api/v1/app/contact/search \
   -H 'Content-Type: application/json' -d '{"keyword":"张三"}'
 
 # 配了 api_token 时
@@ -111,19 +111,19 @@ curl ... -H 'Authorization: Bearer <token>'
 完整端点:
 
 - `GET  /health` —— 健康检查(公开,含 agent home 解析状态)
-- `POST /api/v1/message/send` —— 应用身份发消息,`msgtype`: `text` / `markdown` / `news`
-- `POST /api/v1/local/message/send` —— 本人身份发消息(`to` 或 `conv_rid`)
-- `POST /api/v1/local/image/send` —— 本人身份发图片(需 `conv_rid`)
-- `POST /api/v1/local/conversations` —— 查本地会话(body 可省略)
-- `POST /api/v1/local/conversation/open` —— 只打开会话不发送
-- `GET  /api/v1/local/busy` —— 客户端界面正被哪个操作占着(UI 锁的状态)
-- `POST /api/v1/local/group/create` —— 本人身份拉群(操控客户端,能拉外部/微信)
-- `POST /api/v1/local/group/rename` —— 本人身份改群名(官方 API 改不了的群只能走这条)
-- `POST /api/v1/group/create` —— 应用身份拉群(官方 appchat,**仅限本企业成员**)
-- `POST /api/v1/group/members/search` —— 按名字搜通讯录候选(建群前用来挑人)
-- `POST /api/v1/group/members/resolve` —— 干跑:只看名字解析成谁,不建群
-- `POST /api/v1/group/{get,update,send}` —— 查群 / 改群名换群主加人踢人 / 往群里发消息
-- `POST /api/v1/contact/search` —— 查通讯录
+- `POST /api/v1/app/message/send` —— 应用身份发消息,`msgtype`: `text` / `markdown` / `news`
+- `POST /api/v1/message/send` —— 本人身份发消息(`to` 或 `conv_rid`)
+- `POST /api/v1/image/send` —— 本人身份发图片(需 `conv_rid`)
+- `POST /api/v1/conversations` —— 查本地会话(body 可省略)
+- `POST /api/v1/conversation/open` —— 只打开会话不发送
+- `GET  /api/v1/busy` —— 客户端界面正被哪个操作占着(UI 锁的状态)
+- `POST /api/v1/group/create` —— 本人身份拉群(操控客户端,能拉外部/微信)
+- `POST /api/v1/group/rename` —— 本人身份改群名(官方 API 改不了的群只能走这条)
+- `POST /api/v1/app/group/create` —— 应用身份拉群(官方 appchat,**仅限本企业成员**)
+- `POST /api/v1/app/group/members/search` —— 按名字搜通讯录候选(建群前用来挑人)
+- `POST /api/v1/app/group/members/resolve` —— 干跑:只看名字解析成谁,不建群
+- `POST /api/v1/app/group/{get,update,send}` —— 查群 / 改群名换群主加人踢人 / 往群里发消息
+- `POST /api/v1/app/contact/search` —— 查通讯录
 
 ## 拉群
 
@@ -131,21 +131,21 @@ curl ... -H 'Authorization: Bearer <token>'
 
 | 接口 | 身份 | 能拉谁 | 有回执 |
 | --- | --- | --- | --- |
-| `/api/v1/group/create` | 自建应用 | **只有本企业成员** | ✅ 返回 `chatid` |
-| `/api/v1/local/group/create` | 你本人 | 同事 + 外部联系人 + 微信用户 | ❌ 见下 |
+| `/api/v1/app/group/create` | 自建应用 | **只有本企业成员** | ✅ 返回 `chatid` |
+| `/api/v1/group/create` | 你本人 | 同事 + 外部联系人 + 微信用户 | ❌ 见下 |
 
 ```bash
 # 应用身份(官方 API):成员写中文名/userid/邮箱/「我」都行,离线解析本地通讯录
-curl -X POST http://127.0.0.1:8090/api/v1/group/create \
+curl -X POST http://127.0.0.1:8090/api/v1/app/group/create \
   -H 'Content-Type: application/json' \
   -d '{"name":"临时讨论组","members":["陈涛","陈挺"],"include_self":true}'
 
 # 建群前先干跑,核对名字被解析成了谁
-curl -X POST http://127.0.0.1:8090/api/v1/group/members/resolve \
+curl -X POST http://127.0.0.1:8090/api/v1/app/group/members/resolve \
   -H 'Content-Type: application/json' -d '{"members":["陈涛","陈挺"]}'
 
 # 本人身份(操控客户端):自己自动是群主,不用写进 members
-curl -X POST http://127.0.0.1:8090/api/v1/local/group/create \
+curl -X POST http://127.0.0.1:8090/api/v1/group/create \
   -H 'Content-Type: application/json' \
   -d '{"members":["陈涛","陈挺"],"name":"临时讨论组"}'
 ```
@@ -366,8 +366,14 @@ curl http://127.0.0.1:8090/api/v1/mars/sync/status
 
 沿用原 `api_server.py` 的语义,而非 FastAPI 默认的 422:
 
-- `/api/v1/local/*` → `{"success": false, "error": "..."}`
+- 本人身份那几条(`message/send`、`image/send`、`conversations`、
+  `conversation/open`、`busy`、`group/create`、`group/rename`)
+  → `{"success": false, "error": "..."}`
 - 其它 → `{"errcode": -1, "errmsg": "..."}`
+
+判定不再是路径前缀 —— 本人身份的接口挪到 `/api/v1/*` 裸路径后没有共同前缀了,
+改成按实际注册的路由列表判定(`routers/local.py` 的 `LOCAL_PATHS`),
+免得新增一条接口时两处漂。
 
 状态码:
 
@@ -414,9 +420,11 @@ curl http://127.0.0.1:8090/api/v1/mars/tasks/status
 
 ### 两条不能退化的约束
 
-- **`local.*` 默认不在白名单。** `WECOM_SVR_MARS_TASKS_ACTIONS` 默认只有
-  `message.send`(应用身份)。`local.*` 是**以你本人的身份说话**,让一个远端队列
-  能驱动它,权限边界比"应用发通知"大一个量级,要开必须显式写进配置。
+- **本人身份的 action 默认不在白名单。** `WECOM_SVR_MARS_TASKS_ACTIONS` 默认只有
+  `app.message.send`(应用身份)。action 名和 HTTP 路由同构 —— 带 `app.` 前缀的是
+  应用身份,不带的(`message.send` / `image.send` / `group.create` / `group.rename`)
+  是**以你本人的身份说话**,让一个远端队列能驱动它,权限边界比"应用发通知"
+  大一个量级,要开必须显式写进配置。
 - **宁可漏发,不重发。** 跟群消息同步的取舍正好相反 —— 那边 mars 有 checksum
   唯一索引兜底,重推是安全的;这边发出去就收不回来。所以真正动手前会先调
   mars 的 `/start` 把任务推进 `executing`,失联时 mars 判"结果未知"而**不重投**;
@@ -436,7 +444,7 @@ curl http://127.0.0.1:8090/api/v1/mars/tasks/status
 > ⚠️ **`success: true` 只代表 AppleScript 执行成功,不代表消息已送达。**
 > 这条路径是模拟按键,没有任何回执:如果会话窗口打开了但输入框没拿到焦点,
 > 粘贴和回车会落空,接口依然返回 success。需要送达保证请用官方 API
-> (`/api/v1/message/send` 返回企业微信服务端的 `msgid`)。
+> (`/api/v1/app/message/send` 返回企业微信服务端的 `msgid`)。
 
 ### 本地库的新鲜度上限(WAL)—— 已由 `wal.py` 解决
 
@@ -454,7 +462,7 @@ curl http://127.0.0.1:8090/api/v1/mars/tasks/status
 (取决于企微自己刷 WAL 的节奏),增量刷新 ~0.2s。
 
 > 用到 `/api/v1/mars/sync/*` 与 `messages.py` 的路径都已享受到这个新鲜度。
-> `/api/v1/local/conversations` 等老接口仍直接读解密目录,刷新过后同样受益。
+> `/api/v1/conversations` 等老接口仍直接读解密目录,刷新过后同样受益。
 
 仍然要注意:这是**轮询本地库**,不是回调。要严格的消息级实时投递(以及本机
 不开企微也能收),用上游的 `recv_server.py`(需要 `recv_token` / `recv_aeskey` /
@@ -468,7 +476,7 @@ wecom-svr-local --rid 3395103030 "测试"
 wecom-svr-local --rid 3395103030 --image /tmp/a.png
 wecom-svr-local --rid 3395103030 --open-only
 
-# 拉群 / 改群名:和 /api/v1/local/group/* 是同一套代码,只是不用先起服务
+# 拉群 / 改群名:和 /api/v1/group/* 是同一套代码,只是不用先起服务
 wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组"
 wecom-svr-local --rid 3395103030 --rename "客户群-新名字"
 ```

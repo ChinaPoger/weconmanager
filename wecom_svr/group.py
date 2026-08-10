@@ -8,7 +8,7 @@
   - userlist 至少 2 人;把自己算进去时,「我 + 一个人」就已经满足
   - chatid 不传则由服务端随机生成;传了就必须全局唯一且只含 0-9a-zA-Z
   - 这样建出来的群,消息只能由本应用通过 appchat/send 推送(显示为应用);
-    要以本人身份发言,等群同步到本地库后走 /api/v1/local/message/send
+    要以本人身份发言,等群同步到本地库后走 /api/v1/message/send
 """
 import re
 

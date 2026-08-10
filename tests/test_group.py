@@ -72,20 +72,20 @@ def calls(monkeypatch):
 # ─── 解析 ──────────────────────────────────────────────────────────────
 
 def test_resolve_puts_self_first_and_dedups(client, fake_directory):
-    r = client.post("/api/v1/group/members/resolve",
+    r = client.post("/api/v1/app/group/members/resolve",
                     json={"members": ["陈涛", "陈挺", "任威风"], "include_self": True})
     assert r.status_code == 200
     assert r.json()["userlist"] == ["renweifeng", "chentao", "chenting01"]
 
 
 def test_resolve_keeps_the_asked_name(client, fake_directory):
-    r = client.post("/api/v1/group/members/resolve",
+    r = client.post("/api/v1/app/group/members/resolve",
                     json={"members": ["陈涛"], "include_self": False})
     assert r.json()["members"] == [{**TAO, "query": "陈涛"}]
 
 
 def test_unknown_name_is_400_not_500(client, fake_directory, calls):
-    r = client.post("/api/v1/group/create",
+    r = client.post("/api/v1/app/group/create",
                     json={"name": "群", "members": ["查无此人"]})
     assert r.status_code == 400
     assert "查无此人" in r.json()["errmsg"]
@@ -98,7 +98,7 @@ def test_ambiguous_name_is_400_with_candidates(client, monkeypatch, calls):
 
     monkeypatch.setattr(directory, "resolve_member", boom)
     monkeypatch.setattr(directory, "get_self", lambda: ME)
-    r = client.post("/api/v1/group/create",
+    r = client.post("/api/v1/app/group/create",
                     json={"name": "群", "members": ["陈"], "include_self": False})
     assert r.status_code == 400
     assert "chentao" in r.json()["errmsg"]
@@ -108,7 +108,7 @@ def test_ambiguous_name_is_400_with_candidates(client, monkeypatch, calls):
 # ─── 建群 ──────────────────────────────────────────────────────────────
 
 def test_create_sends_userids_and_defaults_owner_to_self(client, fake_directory, calls):
-    r = client.post("/api/v1/group/create",
+    r = client.post("/api/v1/app/group/create",
                     json={"name": "临时讨论组", "members": ["陈涛", "陈挺"]})
     assert r.status_code == 200
     body = calls[0]["args"]["body"]
@@ -121,7 +121,7 @@ def test_create_sends_userids_and_defaults_owner_to_self(client, fake_directory,
 
 
 def test_create_echoes_resolution_next_to_chatid(client, fake_directory, calls):
-    r = client.post("/api/v1/group/create",
+    r = client.post("/api/v1/app/group/create",
                     json={"name": "群", "members": ["陈涛", "陈挺"]})
     body = r.json()
     assert body["chatid"] == "CHATID001"
@@ -129,7 +129,7 @@ def test_create_echoes_resolution_next_to_chatid(client, fake_directory, calls):
 
 
 def test_create_without_self_needs_two_others(client, fake_directory, calls):
-    r = client.post("/api/v1/group/create",
+    r = client.post("/api/v1/app/group/create",
                     json={"name": "群", "members": ["陈涛"], "include_self": False})
     assert r.status_code == 400
     assert "至少 2 人" in r.json()["errmsg"]
@@ -137,13 +137,13 @@ def test_create_without_self_needs_two_others(client, fake_directory, calls):
 
 
 def test_explicit_owner_wins(client, fake_directory, calls):
-    client.post("/api/v1/group/create",
+    client.post("/api/v1/app/group/create",
                 json={"name": "群", "members": ["陈涛", "陈挺"], "owner": "陈涛"})
     assert calls[0]["args"]["body"]["owner"] == "chentao"
 
 
 def test_bad_chatid_rejected(client, fake_directory, calls):
-    r = client.post("/api/v1/group/create",
+    r = client.post("/api/v1/app/group/create",
                     json={"name": "群", "members": ["陈涛", "陈挺"], "chatid": "有-中文"})
     assert r.status_code == 400
     assert "0-9a-zA-Z" in r.json()["errmsg"]
@@ -155,7 +155,7 @@ def test_official_error_passes_through(client, fake_directory, monkeypatch):
         return {"errcode": 60011, "errmsg": "no privilege to access/modify contact/party/agent"}
 
     monkeypatch.setattr("wecom_svr.group.call_wecom", fail)
-    r = client.post("/api/v1/group/create", json={"name": "群", "members": ["陈涛", "陈挺"]})
+    r = client.post("/api/v1/app/group/create", json={"name": "群", "members": ["陈涛", "陈挺"]})
     assert r.status_code == 200  # 官方业务错误照搬,不翻译成 HTTP 错误
     assert r.json()["errcode"] == 60011
 
@@ -163,7 +163,7 @@ def test_official_error_passes_through(client, fake_directory, monkeypatch):
 # ─── 改群 / 发群消息 ────────────────────────────────────────────────────
 
 def test_update_resolves_add_and_remove(client, fake_directory, calls):
-    r = client.post("/api/v1/group/update",
+    r = client.post("/api/v1/app/group/update",
                     json={"chatid": "C1", "add": ["陈挺"], "remove": ["陈涛"]})
     assert r.status_code == 200
     body = calls[0]["args"]["body"]
@@ -172,12 +172,12 @@ def test_update_resolves_add_and_remove(client, fake_directory, calls):
 
 
 def test_update_needs_something_to_change(client, fake_directory):
-    r = client.post("/api/v1/group/update", json={"chatid": "C1"})
+    r = client.post("/api/v1/app/group/update", json={"chatid": "C1"})
     assert r.status_code == 400
 
 
 def test_send_uses_appchat_send(client, calls):
-    r = client.post("/api/v1/group/send", json={"chatid": "C1", "content": "hi"})
+    r = client.post("/api/v1/app/group/send", json={"chatid": "C1", "content": "hi"})
     assert r.status_code == 200
     assert calls[0]["args"] == {
         "path": "/cgi-bin/appchat/send",
@@ -186,14 +186,14 @@ def test_send_uses_appchat_send(client, calls):
 
 
 def test_send_rejects_unsupported_msgtype(client, calls):
-    r = client.post("/api/v1/group/send",
+    r = client.post("/api/v1/app/group/send",
                     json={"chatid": "C1", "content": "hi", "msgtype": "image"})
     assert r.status_code == 400
     assert calls == []
 
 
 def test_get_uses_query_params(client, calls):
-    client.post("/api/v1/group/get", json={"chatid": "C1"})
+    client.post("/api/v1/app/group/get", json={"chatid": "C1"})
     assert calls[0] == {"category": "call", "method": "GET",
                         "args": {"path": "/cgi-bin/appchat/get", "params": {"chatid": "C1"}}}
 
@@ -203,6 +203,6 @@ def test_get_uses_query_params(client, calls):
 def test_group_create_respects_auth(monkeypatch, fake_directory):
     monkeypatch.setenv("WECOM_SVR_API_TOKEN", "s3cret")
     get_settings.cache_clear()
-    r = TestClient(create_app()).post("/api/v1/group/create",
+    r = TestClient(create_app()).post("/api/v1/app/group/create",
                                       json={"name": "群", "members": ["陈涛", "陈挺"]})
     assert r.status_code == 401

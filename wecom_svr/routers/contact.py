@@ -5,7 +5,7 @@ from ..agent import call_wecom
 from ..schemas import ContactSearchRequest
 from ..security import require_token
 
-router = APIRouter(prefix="/api/v1/contact", tags=["contact"])
+router = APIRouter(prefix="/api/v1/app/contact", tags=["app-contact"])
 
 
 @router.post("/search", summary="查通讯录(官方 API)")
