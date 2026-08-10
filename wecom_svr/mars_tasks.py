@@ -362,8 +362,8 @@ async def start(client: httpx.AsyncClient, task: Task, settings: Settings) -> No
     """
     await _post(
         client,
-        tasks_url(settings, f"/{task.id}/start"),
-        {"lease_token": task.lease_token},
+        tasks_url(settings, "/start"),
+        {"id": task.id, "lease_token": task.lease_token},
         settings,
     )
 
@@ -373,8 +373,8 @@ async def ack(
 ) -> None:
     await _post(
         client,
-        tasks_url(settings, f"/{task_id}/ack"),
-        outcome.to_ack(lease_token),
+        tasks_url(settings, "/ack"),
+        {"id": task_id, **outcome.to_ack(lease_token)},
         settings,
     )
 

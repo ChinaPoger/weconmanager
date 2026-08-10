@@ -260,9 +260,24 @@ UPDATE ... SET status=4 WHERE status IN (0,1) AND expire_at IS NOT NULL AND expi
 | --- | --- |
 | `POST /tasks` | 入队。同 `dedup_key` **且内容相同**则返回原任务 + `duplicated:true`;内容不同是撞 key,回 **409** |
 | `POST /tasks/pull` | 认领。`{"worker","max","wait","lease"}`;`wait` 秒内没活返回空数组 **200** |
-| `POST /tasks/:id/start` | 开工。`{"lease_token"}`;令牌过期回 **409** |
-| `POST /tasks/:id/ack` | 回报。`{"ok","retry","error","result","lease_token"}`;令牌过期、或想把 `executing` 的任务 `retry` 回队列,都回 **409** |
+| `POST /tasks/start` | 开工。`{"id","lease_token"}`;令牌过期回 **409** |
+| `POST /tasks/ack` | 回报。`{"id","ok","retry","error","result","lease_token"}`;令牌过期、或想把 `executing` 的任务 `retry` 回队列,都回 **409** |
 | `GET  /tasks` | 给人看的列表,按 worker/status 过滤 |
+
+**任务 id 在 body 里,不是 `/tasks/:id/start` 这种路径参数。** 这不是风格选择,是
+被 gin 逼的:mars 用的 gin v1.3 路由树**不允许静态兄弟和通配兄弟共存**,
+`/tasks/pull` 和 `/tasks/:id/start` 放在一起会在**注册时** panic ——
+
+```
+panic: wildcard route ':id' conflicts with existing children
+       in path '/api/internal/wecom/tasks/:id/start'
+```
+
+而注册发生在启动阶段,所以后果不是这条路 500,是**整个 mars 起不来**。第一版就是
+这么写的,发上线才炸,5 个节点回滚。现在整条路一个通配符都不用,以后谁往
+`/tasks/` 下面再加静态路由都不会重蹈覆辙,`wecomTasksRoutes` 那个函数单独抽出来
+就是为了让 `TestWecomTasksRoutesNoPanic` 能原样注册一遍 —— 这类错误编译器和
+handler 单测都看不见,只有真注册才暴露。
 
 空队列必须是 200 而不是 400 —— 这条路一天要被敲几万次,用错误码表达"没活"
 会让真正的故障淹在噪声里(`qq/hook/mission` 那条老路就是这么设计的)。

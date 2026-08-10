@@ -47,7 +47,11 @@ def settings(tmp_path) -> Settings:
 
 
 class FakeMars:
-    """一个只认 /pull 和 /:id/ack 的假 mars。"""
+    """一个只认 /tasks/{pull,start,ack} 的假 mars。
+
+    任务 id 在 **body** 里,不在路径上 —— mars 那边 gin v1.3 的路由树不允许
+    `/tasks/pull`(静态)和 `/tasks/:id/start`(通配)做兄弟,注册时就 panic。
+    """
 
     def __init__(self) -> None:
         self.queue: list[dict] = []
@@ -70,13 +74,13 @@ class FakeMars:
             batch, self.queue = self.queue[: body.get("max", 5)], self.queue[body.get("max", 5):]
             return httpx.Response(200, json={"tasks": batch})
         if request.url.path.endswith("/start"):
-            task_id = int(request.url.path.split("/")[-2])
+            task_id = int(body["id"])
             if task_id in self.stale:
                 return httpx.Response(409, text="stale lease")
             self.starts.append((task_id, body))
             return httpx.Response(200, json={"id": task_id, "status": 5})
         if request.url.path.endswith("/ack"):
-            task_id = int(request.url.path.split("/")[-2])
+            task_id = int(body["id"])
             if task_id in self.stale:
                 return httpx.Response(409, text="stale lease")
             if self.ack_fails:
@@ -168,7 +172,7 @@ def test_app_message_is_allowed_by_default(settings, mars, app_send):
 
     assert (result.pulled, result.done, result.failed) == (1, 1, 0)
     # 动手之前先把任务推进 executing,带着认领时拿到的令牌
-    assert mars.starts == [(1, {"lease_token": "mac-test:tok1"})]
+    assert mars.starts == [(1, {"id": 1, "lease_token": "mac-test:tok1"})]
     assert app_send == [("message", "text", {"touser": "zhangsan", "content": "hi"})]
     assert mars.acks[0][0] == 1
     assert mars.last_ack["ok"] is True
@@ -344,7 +348,7 @@ def test_ack_failure_keeps_inflight_for_the_next_round(settings, mars, app_send)
     mars.ack_fails = False
     run(mars_tasks.run_once(settings, wait=0))
     assert len(app_send) == 1
-    assert mars.acks == [(1, {"ok": True, "retry": False, "error": "",
+    assert mars.acks == [(1, {"id": 1, "ok": True, "retry": False, "error": "",
                              "result": {"errcode": 0, "errmsg": "ok", "msgid": "M1"},
                              "lease_token": "mac-test:tok1"})]
     assert mars_tasks.load_state(settings).inflight is None
@@ -386,7 +390,7 @@ def test_nothing_is_persisted_before_the_outcome_exists(settings, mars, monkeypa
     run(mars_tasks.run_once(settings, wait=0))
 
     assert seen["inflight"] is None          # 执行途中本机什么都没落盘
-    assert mars.starts == [(1, {"lease_token": "mac-test:tok1"})]   # 但 mars 知道它在执行
+    assert mars.starts == [(1, {"id": 1, "lease_token": "mac-test:tok1"})]   # 但 mars 知道它在执行
     assert mars.last_ack["ok"] is True
 
 
