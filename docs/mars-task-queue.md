@@ -312,6 +312,57 @@ action 名和 wecom-svr 的 HTTP 路由**同构**:带 `app.` 前缀的是自建�
 > 不带前缀的那四条默认**不在** worker 的白名单里(§5.2)。"本人身份是默认关的"
 > 靠的是白名单,不是名字长得像 —— 加新 action 时别指望前缀替你把门。
 
+### 4.7 发到群
+
+**没有单独的"群发" action。** 群在企微客户端里就是一个会话,所以本人身份发到群
+用的还是 `message.send`,只是 payload 指向群:
+
+```json
+{
+  "worker": "mac-cc",
+  "action": "message.send",
+  "payload": {"conv_rid": 247764039432344, "content": "工单 463038 已超时"},
+  "expire_in": 600,
+  "dedup_key": "ticket-463038-timeout",
+  "created_by": "deimos"
+}
+```
+
+**用 `conv_rid`,别用 `to`(群名)。** `LocalSendRequest` 两个都收,但在队列这条路上
+只有 RID 是对的:
+
+- `to` 是模糊搜索。多条命中时靠 `resolve_conversation_name` 的启发式挑一个
+  (优先 `conversationtype == 1` 的群,还挑不出就取第一条)。手工调接口时你能看
+  回执核对,队列里没人看。
+- **群名会变,而且这套东西自己就提供 `group.rename`。** 名字一改,任务要么失败,
+  要么发进另一个同名会话。
+- 发消息不可撤销,发错群比发失败严重得多 —— 跟 §0 第 4 条是同一个取舍。
+
+RID 从两处拿:`POST /api/v1/conversations`(按关键字搜),或
+`GET /api/v1/mars/sync/groups`(按最近活跃排序,还标了哪些已在同步白名单里)。
+两处返回的都是**裸 RID**。注意 mars 那边 `qq_groups.qq` 存的是
+`wework-<RID>`(`mars_sync` 加的前缀,防止和真实 QQ 群号撞号),从那里取值入队
+**要把前缀去掉**。
+
+`image.send` 发到群同理,但它的 schema **只认 `conv_rid`**,没有按名字找的路。
+
+群发比单发更该带 `dedup_key`:多发一条私聊是尴尬,多发一条群消息是一屋子人看着。
+
+#### 应用身份发到群:目前队列做不了
+
+`app.message.send` 用的是 `SendMessageRequest`,只有 `touser`,发不了群。官方的
+群发是 `POST /api/v1/app/group/send`(按 `chatid`),而**这条没有对应的 action** ——
+§4.6 的表就是全集。
+
+要开这条路得加一个 `app.group.send`(schema 用 `SendGroupRequest`,
+`needs_ui=False`),三处一起改:wecom-svr 的 `ACTIONS` 表、mars 的 action 常量、
+上面那张表。没提前加是因为还没有用例,而每多一条 action 就多一条不可撤销的
+远程能力。
+
+顺带记一下这两条路的能力差(和 README「拉群」那节是同一条边界):appchat 群只有
+**本应用建的**才发得进去,群成员也只能是本企业的人;客户群、带外部联系人的群,
+应用身份根本看不见,只能走本人身份。
+
 ## 5. Mac 侧(wecom-svr)
 
 ### 5.1 循环
