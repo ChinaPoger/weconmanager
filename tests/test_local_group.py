@@ -449,7 +449,7 @@ def test_create_with_name_locates_the_new_group_by_diff(fake, monkeypatch):
 # ─── HTTP 层 ───────────────────────────────────────────────────────────
 
 def test_endpoint_returns_local_error_shape(api, fake):
-    r = api.post("/api/v1/local/group/create", json={"members": ["陈", "陈挺"]})
+    r = api.post("/api/v1/group/create", json={"members": ["陈", "陈挺"]})
     assert r.status_code == 400
     body = r.json()
     assert body["success"] is False
@@ -457,20 +457,20 @@ def test_endpoint_returns_local_error_shape(api, fake):
 
 
 def test_endpoint_success(api, fake):
-    r = api.post("/api/v1/local/group/create", json={"members": ["陈涛", "陈挺"]})
+    r = api.post("/api/v1/group/create", json={"members": ["陈涛", "陈挺"]})
     assert r.status_code == 200
     assert r.json()["member_count"] == 3
 
 
 def test_endpoint_rejects_single_member(api, fake):
-    r = api.post("/api/v1/local/group/create", json={"members": ["陈涛"]})
+    r = api.post("/api/v1/group/create", json={"members": ["陈涛"]})
     assert r.status_code == 400
     assert r.json()["success"] is False
     assert fake.plus_clicked is False
 
 
 def test_rename_endpoint_success(api, rename_env):
-    r = api.post("/api/v1/local/group/rename", json={"conv_rid": 77, "name": "客户群-新名字"})
+    r = api.post("/api/v1/group/rename", json={"conv_rid": 77, "name": "客户群-新名字"})
     assert r.status_code == 200
     body = r.json()
     assert body["success"] is True
@@ -482,7 +482,7 @@ def test_rename_endpoint_success(api, rename_env):
 def test_rename_endpoint_reports_verification_failure(api, rename_env, monkeypatch):
     """回库核验不过要回 400 —— 「脚本没报错」不等于名字改上去了。"""
     monkeypatch.setattr(local_group, "_group_names", lambda: {77: "还是老名字"})
-    r = api.post("/api/v1/local/group/rename", json={"conv_rid": 77, "name": "新名字"})
+    r = api.post("/api/v1/group/rename", json={"conv_rid": 77, "name": "新名字"})
     assert r.status_code == 400
     assert r.json()["success"] is False
     assert "核验失败" in r.json()["error"]
@@ -490,7 +490,7 @@ def test_rename_endpoint_reports_verification_failure(api, rename_env, monkeypat
 
 def test_rename_endpoint_rejects_empty_and_overlong_names(api, rename_env):
     for name in ("", "很长" * 40):
-        r = api.post("/api/v1/local/group/rename", json={"conv_rid": 77, "name": name})
+        r = api.post("/api/v1/group/rename", json={"conv_rid": 77, "name": name})
         assert r.status_code == 400, name
         assert r.json()["success"] is False
     assert rename_env["names"][77] == "陈挺、陈涛、任威风"     # 一次都没动过客户端

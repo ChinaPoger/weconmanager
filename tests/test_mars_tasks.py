@@ -163,7 +163,7 @@ def test_pull_body_carries_worker_and_lease(settings, mars):
 # ─── 白名单 ─────────────────────────────────────────────────────────────
 
 def test_app_message_is_allowed_by_default(settings, mars, app_send):
-    mars.give(1, "message.send", {"touser": "zhangsan", "content": "hi"})
+    mars.give(1, "app.message.send", {"touser": "zhangsan", "content": "hi"})
     result = run(mars_tasks.run_once(settings, wait=0))
 
     assert (result.pulled, result.done, result.failed) == (1, 1, 0)
@@ -175,8 +175,8 @@ def test_app_message_is_allowed_by_default(settings, mars, app_send):
 
 
 def test_local_send_is_refused_unless_whitelisted(settings, mars, local):
-    """local.* 是以本人身份说话,默认不给远端队列驱动。"""
-    mars.give(1, "local.message.send", {"to": "张三", "content": "hi"})
+    """不带 app. 前缀的是以本人身份说话,默认不给远端队列驱动。"""
+    mars.give(1, "message.send", {"to": "张三", "content": "hi"})
     result = run(mars_tasks.run_once(settings, wait=0))
 
     assert local == []                      # 关键:根本没执行
@@ -187,8 +187,8 @@ def test_local_send_is_refused_unless_whitelisted(settings, mars, local):
 
 
 def test_whitelisted_local_send_runs(settings, mars, local):
-    settings = settings.model_copy(update={"mars_tasks_actions": "local.message.send"})
-    mars.give(1, "local.message.send", {"to": "张三", "content": "hi"})
+    settings = settings.model_copy(update={"mars_tasks_actions": "message.send"})
+    mars.give(1, "message.send", {"to": "张三", "content": "hi"})
     run(mars_tasks.run_once(settings, wait=0))
 
     assert local == [{"to": "张三", "content": "hi", "conv_rid": None}]
@@ -211,7 +211,7 @@ def test_unknown_action_never_reaches_the_whitelist_check(settings, mars):
 def test_expired_task_is_not_executed(settings, mars, app_send, monkeypatch):
     """Mac 睡了三小时再醒,不该把三小时前的告警喷出去。"""
     monkeypatch.setattr(mars_tasks.time, "time", lambda: 2000.0)
-    mars.give(1, "message.send", {"touser": "z", "content": "hi"}, expire_at=1000)
+    mars.give(1, "app.message.send", {"touser": "z", "content": "hi"}, expire_at=1000)
     run(mars_tasks.run_once(settings, wait=0))
 
     assert app_send == []
@@ -221,7 +221,7 @@ def test_expired_task_is_not_executed(settings, mars, app_send, monkeypatch):
 
 def test_bad_payload_fails_without_calling_the_handler(settings, mars, app_send):
     """队列这条路和 HTTP 那条路共用同一套 schema,不会更松。"""
-    mars.give(1, "message.send", {"touser": "z"})    # 缺 content
+    mars.give(1, "app.message.send", {"touser": "z"})    # 缺 content
     run(mars_tasks.run_once(settings, wait=0))
 
     assert app_send == []
@@ -235,7 +235,7 @@ def test_app_api_errcode_is_a_failure(settings, mars, monkeypatch):
         return {"errcode": 40003, "errmsg": "invalid userid"}
 
     monkeypatch.setattr(mars_tasks, "call_wecom", fail)
-    mars.give(1, "message.send", {"touser": "nobody", "content": "hi"})
+    mars.give(1, "app.message.send", {"touser": "nobody", "content": "hi"})
     result = run(mars_tasks.run_once(settings, wait=0))
 
     assert result.failed == 1
@@ -244,12 +244,12 @@ def test_app_api_errcode_is_a_failure(settings, mars, monkeypatch):
 
 
 def test_local_failure_body_is_a_failure(settings, mars, monkeypatch):
-    settings = settings.model_copy(update={"mars_tasks_actions": "local.message.send"})
+    settings = settings.model_copy(update={"mars_tasks_actions": "message.send"})
     monkeypatch.setattr(
         mars_tasks.local_send, "send_message",
         lambda **kw: {"success": False, "error": "没找到会话"},
     )
-    mars.give(1, "local.message.send", {"to": "查无此人", "content": "hi"})
+    mars.give(1, "message.send", {"to": "查无此人", "content": "hi"})
     run(mars_tasks.run_once(settings, wait=0))
 
     assert mars.last_ack["ok"] is False
@@ -262,8 +262,8 @@ def test_client_busy_is_reported_before_start(settings, mars):
     这是协议里唯一安全的 retry:任务还是 leased,一条消息都没发过。
     等进了 executing 再喊忙,mars 就分不清「没发」和「发了一半」了。
     """
-    settings = settings.model_copy(update={"mars_tasks_actions": "local.message.send"})
-    mars.give(1, "local.message.send", {"to": "张三", "content": "hi"})
+    settings = settings.model_copy(update={"mars_tasks_actions": "message.send"})
+    mars.give(1, "message.send", {"to": "张三", "content": "hi"})
 
     with ui_session("别的操作占着界面"):
         result = run(mars_tasks.run_once(settings, wait=0))
@@ -279,8 +279,8 @@ def test_client_busy_is_reported_before_start(settings, mars):
 def test_one_failure_does_not_stop_the_batch(settings, mars, app_send):
     """默认一次只领一条(见 mars_tasks_max),但批量领的时候一条失败不该带停后面的。"""
     settings = settings.model_copy(update={"mars_tasks_max": 2})
-    mars.give(1, "message.send", {"touser": "z"})            # 校验失败
-    mars.give(2, "message.send", {"touser": "z", "content": "hi"})
+    mars.give(1, "app.message.send", {"touser": "z"})            # 校验失败
+    mars.give(2, "app.message.send", {"touser": "z", "content": "hi"})
     result = run(mars_tasks.run_once(settings, wait=0))
 
     assert (result.done, result.failed) == (1, 1)
@@ -291,7 +291,7 @@ def test_one_failure_does_not_stop_the_batch(settings, mars, app_send):
 
 def test_stale_lease_at_start_means_never_execute(settings, mars, app_send):
     """本机卡了太久,任务已经被回收并重新认领 —— 这时候动手就是发第二遍。"""
-    mars.give(1, "message.send", {"touser": "z", "content": "hi"})
+    mars.give(1, "app.message.send", {"touser": "z", "content": "hi"})
     mars.stale.add(1)
     result = run(mars_tasks.run_once(settings, wait=0))
 
@@ -303,7 +303,7 @@ def test_stale_lease_at_start_means_never_execute(settings, mars, app_send):
 
 def test_stale_lease_at_ack_drops_the_result(settings, mars, app_send):
     """start 过了但 ack 时租约失效:结果作废,别反复重试。"""
-    mars.give(1, "message.send", {"touser": "z", "content": "hi"})
+    mars.give(1, "app.message.send", {"touser": "z", "content": "hi"})
     original = mars.handle
 
     def go_stale(request):
@@ -331,7 +331,7 @@ def test_start_is_skipped_for_tasks_judged_dead(settings, mars, app_send):
 # ─── 幂等:宁可漏发,不重发 ─────────────────────────────────────────────
 
 def test_ack_failure_keeps_inflight_for_the_next_round(settings, mars, app_send):
-    mars.give(1, "message.send", {"touser": "z", "content": "hi"})
+    mars.give(1, "app.message.send", {"touser": "z", "content": "hi"})
     mars.ack_fails = True
     result = run(mars_tasks.run_once(settings, wait=0))
 
@@ -356,7 +356,7 @@ def test_crash_mid_send_is_settled_as_sent_not_retried(settings, mars, app_send)
     重发是对方屏幕上多一条消息,漏发只是少一条通知 —— 所以按已发送结案。
     """
     mars_tasks.save_state(State(inflight={
-        "id": 7, "action": "message.send", "phase": "started", "token": "mac-test:tok7",
+        "id": 7, "action": "app.message.send", "phase": "started", "token": "mac-test:tok7",
     }), settings)
     run(mars_tasks.run_once(settings, wait=0))
 
@@ -374,7 +374,7 @@ def test_nothing_is_persisted_before_the_outcome_exists(settings, mars, monkeypa
     本机再记一遍「我做到哪了」是冗余的:mars 那边 executing + 租约超时已经是
     同一个结论。少记一次,就少一个能写坏、能被并发读岔的状态。
     """
-    settings = settings.model_copy(update={"mars_tasks_actions": "local.message.send"})
+    settings = settings.model_copy(update={"mars_tasks_actions": "message.send"})
     seen = {}
 
     def send(**kw):
@@ -382,7 +382,7 @@ def test_nothing_is_persisted_before_the_outcome_exists(settings, mars, monkeypa
         return {"success": True}
 
     monkeypatch.setattr(mars_tasks.local_send, "send_message", send)
-    mars.give(1, "local.message.send", {"to": "张三", "content": "hi"})
+    mars.give(1, "message.send", {"to": "张三", "content": "hi"})
     run(mars_tasks.run_once(settings, wait=0))
 
     assert seen["inflight"] is None          # 执行途中本机什么都没落盘
@@ -402,9 +402,9 @@ def test_state_file_is_written_atomically(settings):
 
 
 def test_counters_accumulate_across_rounds(settings, mars, app_send):
-    mars.give(1, "message.send", {"touser": "z", "content": "hi"})
+    mars.give(1, "app.message.send", {"touser": "z", "content": "hi"})
     run(mars_tasks.run_once(settings, wait=0))
-    mars.give(2, "message.send", {"touser": "z"})           # 失败
+    mars.give(2, "app.message.send", {"touser": "z"})           # 失败
     run(mars_tasks.run_once(settings, wait=0))
 
     state = mars_tasks.load_state(settings)
@@ -453,12 +453,12 @@ def test_status_reports_config_without_leaking_the_token(client):
     assert body["configured"] is True
     assert body["config"]["token_configured"] is True
     assert TOKEN not in json.dumps(body)
-    assert body["config"]["allowed_actions"] == ["message.send"]
+    assert body["config"]["allowed_actions"] == ["app.message.send"]
     assert body["running"] is False
 
 
 def test_run_pulls_a_round(client, mars):
-    mars.give(1, "message.send", {"touser": "z", "content": "hi"})
+    mars.give(1, "app.message.send", {"touser": "z", "content": "hi"})
     body = client.post("/api/v1/mars/tasks/run", json={"wait": 0}).json()
     assert body["pulled"] == 1
 

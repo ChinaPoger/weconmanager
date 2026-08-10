@@ -1,12 +1,12 @@
 """FastAPI 应用 —— 企业微信消息发送服务。
 
 两套发消息互补:
-    /api/v1/message/send       → 官方 API,消息显示为「应用」发送
-    /api/v1/local/message/send → 操控本地客户端,消息以你本人的身份发送
+    /api/v1/app/message/send → 官方 API,消息显示为「应用」发送
+    /api/v1/message/send     → 操控本地客户端,消息以你本人的身份发送
 
 错误结构沿用原 api_server.py:
-    /api/v1/local/*  → {"success": false, "error": "..."}
-    其它             → {"errcode": -1, "errmsg": "..."}
+    本人身份的那几条(local.LOCAL_PATHS) → {"success": false, "error": "..."}
+    其它                                 → {"errcode": -1, "errmsg": "..."}
 """
 import logging
 from contextlib import asynccontextmanager
@@ -39,10 +39,10 @@ log = logging.getLogger(__name__)
 DESCRIPTION = """
 企业微信消息发送 API。底层引用 [wecom-agent](https://github.com/tzwkb/wecom-agent) 作为 pkg。
 
-- **/api/v1/message/send** — 以「自建应用」身份发消息(官方 API)
-- **/api/v1/local/message/send** — 以「本人登录账号」身份发消息(操控 macOS 客户端)
-- **/api/v1/group/create** — 拉群(官方 appchat),成员可直接写中文名和「我」
-- **/api/v1/contact/search** — 查通讯录
+- **/api/v1/app/message/send** — 以「自建应用」身份发消息(官方 API)
+- **/api/v1/message/send** — 以「本人登录账号」身份发消息(操控 macOS 客户端)
+- **/api/v1/app/group/create** — 拉群(官方 appchat),成员可直接写中文名和「我」
+- **/api/v1/app/contact/search** — 查通讯录
 - **/api/v1/mars/sync/** — 把本地群消息同步到 mars 的群消息接口
 - **/api/v1/mars/tasks/** — 反过来:从 mars 拉任务并执行(mars 让本机发消息)
 
@@ -51,7 +51,7 @@ DESCRIPTION = """
 
 
 def _is_local_path(path: str) -> bool:
-    return path.startswith("/api/v1/local")
+    return path in local.LOCAL_PATHS
 
 
 def _error_body(path: str, message: str) -> dict:

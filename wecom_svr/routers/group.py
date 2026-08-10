@@ -19,7 +19,7 @@ from ..schemas_group import (
 )
 from ..security import require_token
 
-router = APIRouter(prefix="/api/v1/group", tags=["group"])
+router = APIRouter(prefix="/api/v1/app/group", tags=["app-group"])
 
 
 async def _resolve_owner(name: str | None) -> str:
@@ -94,5 +94,5 @@ async def update_group(req: UpdateGroupRequest, _: None = Depends(require_token)
 
 @router.post("/send", summary="往群里发消息(应用身份)")
 async def send_to_group(req: SendGroupRequest, _: None = Depends(require_token)) -> dict:
-    """以「应用」身份发。要以本人身份发,等群同步到本地库后走 /api/v1/local/message/send。"""
+    """以「应用」身份发。要以本人身份发,等群同步到本地库后走 /api/v1/message/send。"""
     return await group.send(req.chatid, req.content, req.msgtype)

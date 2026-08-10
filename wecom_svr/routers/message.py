@@ -5,7 +5,7 @@ from ..agent import call_wecom
 from ..schemas import SendMessageRequest
 from ..security import require_token
 
-router = APIRouter(prefix="/api/v1/message", tags=["message"])
+router = APIRouter(prefix="/api/v1/app/message", tags=["app-message"])
 
 
 @router.post("/send", summary="以应用身份发消息(官方 API)")

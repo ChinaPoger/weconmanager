@@ -20,7 +20,7 @@ def main() -> None:
     logging.basicConfig(level=a.log_level.upper())
 
     if not (settings.corpid and settings.secret):
-        print("⚠️  缺少 corpid/secret,官方 API(/api/v1/message/send)会失败")
+        print("⚠️  缺少 corpid/secret,官方 API(/api/v1/app/message/send)会失败")
     if not settings.auth_enabled:
         print("🔓 未启用鉴权(仅本地使用,勿暴露公网)")
 

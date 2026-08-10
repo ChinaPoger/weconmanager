@@ -82,7 +82,7 @@ def test_send_while_busy_returns_409_not_400(monkeypatch):
                                                  "type": 1, "fw_id": 0, "skip": 0})
     client = TestClient(create_app())
     with uilock.ui_session("拉群"):
-        r = client.post("/api/v1/local/message/send", json={"conv_rid": 1, "content": "hi"})
+        r = client.post("/api/v1/message/send", json={"conv_rid": 1, "content": "hi"})
     assert r.status_code == 409
     body = r.json()
     assert body["success"] is False
@@ -91,11 +91,11 @@ def test_send_while_busy_returns_409_not_400(monkeypatch):
 
 def test_busy_endpoint_reflects_state():
     client = TestClient(create_app())
-    assert client.get("/api/v1/local/busy").json() == {
+    assert client.get("/api/v1/busy").json() == {
         "success": True, "busy": False, "operation": None, "seconds": 0,
     }
     with uilock.ui_session("拉群"):
-        body = client.get("/api/v1/local/busy").json()
+        body = client.get("/api/v1/busy").json()
     assert body["busy"] is True and body["operation"] == "拉群"
 
 
