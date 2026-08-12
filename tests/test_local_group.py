@@ -188,8 +188,8 @@ def test_missing_panel_after_plus_is_a_clear_error(monkeypatch):
 
 # ─── 坐标自动校准 ──────────────────────────────────────────────────────
 #
-# "+" 和会话标题是仅有的两个没有 AX 元素、只能按坐标点的位置。量出来的常量迟早
-# 会被客户端改版打掉,所以点不中要能自己在附近找回来 —— 这几条守的就是那件事。
+# "+" 仍只能按坐标点;会话标题坐标是旧版客户端兼容路径。量出来的常量迟早会被
+# 客户端改版打掉,所以点不中要能自己在附近找回来 —— 这几条守的就是那件事。
 
 class OnlyAtOffset(FakeClient):
     """只有点在某个横向偏移上才会开面板,用来验校准真的在挪位置。"""
@@ -352,6 +352,8 @@ def rename_env(monkeypatch, fake):
                         lambda rid: {"name": "", "rid": rid, "lid": 1, "type": 1, "fw_id": 0})
     monkeypatch.setattr(local_group.local_send, "_open_conversation_by_scheme",
                         lambda conv, **kw: (True, "ok"))
+    # 这个 fixture 测旧版坐标兼容路径;新版 AX 路径单独在下方覆盖。
+    monkeypatch.setattr(local_group, "_rename_title_via_ax", lambda name: None)
     monkeypatch.setattr(local_group, "_window_point", lambda dx, dy: (100 + dx, 200 + dy))
     monkeypatch.setattr(local_group, "_group_names", lambda: dict(state["names"]))
 
@@ -387,6 +389,28 @@ def test_rename_verifies_against_the_database(rename_env):
     assert rename_env["names"][77] == "临时讨论组"
 
 
+def test_rename_prefers_writable_ax_title(rename_env, monkeypatch):
+    """5.0.9 的标题是可写 AXTextField,不应再走剪贴板和坐标探测。"""
+    def rename_via_ax(name):
+        old = rename_env["names"][77]
+        rename_env["names"][77] = name
+        return old
+
+    monkeypatch.setattr(local_group, "_rename_title_via_ax", rename_via_ax)
+    monkeypatch.setattr(
+        local_group,
+        "_open_edit_box_and_read_current",
+        lambda: pytest.fail("新版 AX 标题可用时不应走坐标兼容路径"),
+    )
+
+    r = local_group.rename_group(77, "临时讨论组")
+
+    assert r["success"] is True
+    assert r["old_name"] == "陈挺、陈涛、任威风"
+    assert rename_env["names"][77] == "临时讨论组"
+    assert rename_env["clicked"] is False
+
+
 def test_rename_aborts_when_no_edit_box_took_focus(rename_env, monkeypatch):
     """点了标题但没有输入框拿到焦点 —— 再往下走会把群名发成一条消息。"""
     monkeypatch.setattr(local_group, "_real_click", lambda x, y: None)  # 剪贴板保持哨兵
@@ -403,6 +427,18 @@ def test_rename_aborts_when_clipboard_looks_like_chat_history(rename_env, monkey
     with pytest.raises(local_group.LocalGroupError, match="不像群名"):
         local_group.rename_group(77, "临时讨论组")
     assert rename_env["typed"] is None
+
+
+def test_clipboard_with_non_utf8_bytes_does_not_crash(rename_env, monkeypatch):
+    monkeypatch.setattr(
+        local_group.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Result", (), {"stdout": b"\xc8\xff"})(),
+    )
+    monkeypatch.setattr(local_group, "_real_click", lambda x, y: None)
+
+    with pytest.raises(local_group.LocalGroupError, match=r"没有输入框拿到焦点|不像群名"):
+        local_group.rename_group(77, "临时讨论组")
 
 
 def test_rename_reports_when_the_name_landed_on_another_group(rename_env, monkeypatch):
@@ -443,6 +479,25 @@ def test_create_with_name_locates_the_new_group_by_diff(fake, monkeypatch):
     r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组")
     assert r["success"] is True
     assert r["rid"] == 42 and r["name"] == "临时讨论组"
+    assert captured == {"rid": 42, "name": "临时讨论组"}
+
+
+def test_create_with_name_waits_for_delayed_database_visibility(fake, monkeypatch):
+    snapshots = iter([{1: "旧群"}, {1: "旧群"}, {1: "旧群", 42: ""}])
+    captured = {}
+    monkeypatch.setattr(local_group, "_group_names", lambda: next(snapshots))
+    monkeypatch.setattr(
+        local_group,
+        "_rename_locked",
+        lambda rid, name: captured.update(rid=rid, name=name) or {"success": True},
+    )
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_TIMEOUT", 5.0)
+
+    r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组")
+
+    assert r["success"] is True
+    assert r["rid"] == 42
+    assert r["name"] == "临时讨论组"
     assert captured == {"rid": 42, "name": "临时讨论组"}
 
 

@@ -13,9 +13,10 @@ userid,外部/微信联系人塞不进去;而「创建客户群」官方压根�
     合成点击也打不进 CEF 自绘控件,回车是唯一可靠的选中方式)
   - 右侧标题里的「N contact(s) selected」能读出来,每步都能回读校验
 
-坐标依赖只剩两个不在 AX 树里的位置("+" 按钮和会话标题),按主窗口原点取相对
-偏移。它们都不是「点了就算」:点完必须看到成功信号(面板真的开了 / 输入框真的
-拿到了焦点),看不到就换一个候选偏移再试,试中了记下来 —— 见 ui_offsets.py。
+坐标依赖只剩不在 AX 树里的 "+" 按钮,按主窗口原点取相对偏移。新版客户端已把
+会话标题暴露成可写的 AXTextField,直接写值并 AXConfirm;旧版找不到该控件时才
+回退到坐标点击。坐标动作都不是「点了就算」,必须看到成功信号,看不到就换候选
+偏移再试,试中了记下来 —— 见 ui_offsets.py。
 """
 import logging
 import re
@@ -49,6 +50,10 @@ DETAIL_ROWS = 8
 SELECT_ATTEMPTS = 3
 COUNT_SETTLE_TRIES = 3
 COUNT_SETTLE_DELAY = 0.7
+# 企业微信建群后写入 Info.db/WAL 可能有几十秒延迟。只等 2 秒会把已经
+# 建好的群误报成「新增 0 个」,进而跳过改名。
+GROUP_APPEAR_TIMEOUT = 90.0
+GROUP_APPEAR_POLL = 1.0
 
 
 class LocalGroupError(LocalSendError):
@@ -423,6 +428,32 @@ def _confirm() -> None:
 ''')
 
 
+def calibrate_ui() -> dict:
+    """无副作用验证客户端 UI,并校准本机的 "+" 坐标。
+
+    打开「发起群聊」面板后立即取消,不选择联系人、不创建群。能完成这一步说明:
+    企业微信正在运行且有主窗口、服务宿主拿到了辅助功能/自动化权限,并且当前
+    窗口布局的 "+" 偏移已经验证并记入 ui_offsets.json。
+    """
+    ensure_macos()
+    opened = False
+    with ui_session("启动 UI 预检"):
+        _activate()
+        try:
+            _open_picker()
+            opened = True
+        finally:
+            if opened:
+                _close_picker()
+                if _sheet_open():
+                    raise LocalGroupError(
+                        "启动 UI 预检打开了「发起群聊」面板,但取消后面板仍未关闭。"
+                        "请手动关闭该面板后重启服务。"
+                    )
+    point = ui_offsets.primary("plus")
+    return {"success": True, "plus_offset": f"{point[0]},{point[1]}"}
+
+
 # ─── 公开 API ──────────────────────────────────────────────────────────
 
 def create_group(members: list[str], name: str = "") -> dict:
@@ -489,11 +520,11 @@ def create_group(members: list[str], name: str = "") -> dict:
         if not wanted_name:
             return result
 
-        new_rids = sorted(set(_group_names()) - before)
+        new_rids = _wait_new_group_rids(before)
         if len(new_rids) != 1:
             result["name_error"] = (
-                f"群建好了,但没能唯一定位新建的会话(新增 {len(new_rids)} 个),群名没改成。"
-                "请手动改名。"
+                "群建好了,等待本地会话落库后仍没能唯一定位新建的会话"
+                f"(新增 {len(new_rids)} 个),群名没改成。请手动改名。"
             )
             return result
 
@@ -509,6 +540,49 @@ def create_group(members: list[str], name: str = "") -> dict:
 # ─── 改群名 ────────────────────────────────────────────────────────────
 
 _SENTINEL = "\x00wecom-svr-clipboard-probe\x00"
+_AX_TITLE_MISSING = "__WECOM_SVR_AX_TITLE_MISSING__"
+
+
+def _rename_title_via_ax(new_name: str) -> str | None:
+    """通过新版客户端暴露的标题 AXTextField 改名。
+
+    企业微信 5.0.9 已把聊天区标题变成可写 AXTextField,且支持 AXConfirm。
+    标题框和左侧搜索框同属内容 splitter group,用聊天区 splitter 的左边界区分:
+    标题框在聊天区内,搜索框在会话列表内。
+
+    返回旧标题;旧版客户端没有这个控件时返回 None,由调用方走坐标兼容路径。
+    """
+    out = _osa(_MAIN_WINDOW + f'''
+  set contentSplit to splitter group 1 of (splitter group 1 of mainWin)
+  set chatSplit to splitter group 1 of contentSplit
+  set chatPos to position of chatSplit
+  set chatX to item 1 of chatPos
+  set target to missing value
+  repeat with tf in (text fields of contentSplit)
+    set tp to position of tf
+    set ts to size of tf
+    if (item 1 of tp) ≥ chatX and (item 1 of ts) > 40 then
+      set target to contents of tf
+      exit repeat
+    end if
+  end repeat
+  if target is missing value then return "{_AX_TITLE_MISSING}"
+
+  set oldValue to value of target as text
+  set value of attribute "AXFocused" of target to true
+  set value of target to "{_escape(new_name)}"
+  delay 0.4
+  try
+    perform action "AXConfirm" of target
+  on error
+    keystroke return
+  end try
+  return oldValue
+''')
+    value = out.strip().strip('"')
+    if value == _AX_TITLE_MISSING:
+        return None
+    return value
 
 
 def _window_point(dx: int, dy: int) -> tuple[int, int]:
@@ -546,7 +620,7 @@ def _probe_title(dx: int, dy: int) -> str:
     if got == _SENTINEL:
         raise LocalGroupError(f"点 {dx, dy} 后没有输入框拿到焦点")
     text = got.strip()
-    if not text or "\n" in text or len(text) > MAX_NAME_LEN * 2:
+    if not text or "\ufffd" in text or "\n" in text or len(text) > MAX_NAME_LEN * 2:
         raise LocalGroupError(f"点 {dx, dy} 复制回来的内容不像群名(可能选中的是聊天记录)")
     return text
 
@@ -590,6 +664,17 @@ def _group_names() -> dict[int, str]:
     return {g["rid"]: g["name"] for g in messages.list_groups(include_unnamed=True, limit=None)}
 
 
+def _wait_new_group_rids(before: set[int]) -> list[int]:
+    """等待新建会话写入本地库,返回相对 before 新出现的 RID。"""
+    deadline = time.monotonic() + GROUP_APPEAR_TIMEOUT
+    while True:
+        new_rids = sorted(set(_group_names()) - before)
+        # 多个新增会话无法安全判断哪个属于本次请求,立即放弃改名。
+        if new_rids or time.monotonic() >= deadline:
+            return new_rids
+        time.sleep(GROUP_APPEAR_POLL)
+
+
 def _rename_locked(rid: int, new_name: str) -> dict:
     """改名的界面部分 —— **调用方必须已经持有 ui_session**(锁不可重入)。"""
     conv = local_send.get_conversation_by_rid(int(rid))
@@ -607,9 +692,11 @@ def _rename_locked(rid: int, new_name: str) -> dict:
         if not ok:
             raise LocalGroupError(f"打开会话失败: {msg}")
 
-        was = _open_edit_box_and_read_current()
-        _set_clipboard(new_name)
-        _osa('''
+        was = _rename_title_via_ax(new_name)
+        if was is None:
+            was = _open_edit_box_and_read_current()
+            _set_clipboard(new_name)
+            _osa('''
   keystroke "a" using command down
   delay 0.2
   keystroke "v" using command down
