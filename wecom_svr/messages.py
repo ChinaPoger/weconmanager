@@ -61,7 +61,11 @@ MEDIA_PLACEHOLDER = {"图片": IMAGE_PLACEHOLDER, "语音": "[语音]", "文件"
 # 这两处必须一起改,分家到 media.py 就等着漏改。
 IMAGE_TYPES = frozenset({4, 14, 29})
 
-# 图片文件名的扩展名,用来判断被引用的是不是图片
+# type=123 通常是卡片,但企微把「图片 + 随图文字」也装在这个类型里。它的 content
+# 顶层 field 1 有多个消息段:一段是图片元数据/文件名,另一段是用户输入的文字。
+RICH_IMAGE_TYPES = frozenset({123})
+
+# 图片文件名的扩展名,用来判断被引用或图文消息里的载荷是不是图片
 _IMAGE_EXT = re.compile(r"\.(png|jpe?g|gif|heic|webp|bmp)\b", re.I)
 
 _KEYS_JSON = "wxwork_keys.json"
@@ -348,6 +352,32 @@ def _type_name(content_type: int) -> str:
     return TYPE_OVERRIDES.get(content_type) or _vendor().export.type_name(content_type)
 
 
+def _rich_image_text(content_type: int, content) -> str:
+    """识别 type=123 里的「图片 + 随图文字」,不是这种结构则返回空串。
+
+    普通 type=123 是应用卡片,仍交给上游按卡片解析。图文消息则在顶层 field 1
+    放多个子消息:含图片文件名的那段代表图片,其余段是随图文字。必须把整条原始
+    content 留给 media 解析 md5,这里只负责产出 `[图片]` 锚点和文字。
+    """
+    if content_type not in RICH_IMAGE_TYPES or not content:
+        return ""
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+
+    parts = _pb_fields(content).get(1, [])
+    rendered: list[str] = []
+    has_image = False
+    for part in parts:
+        text = (_vendor().export.render(0, part) or "").strip()
+        if _IMAGE_EXT.search(text):
+            has_image = True
+        elif text and text not in rendered:
+            rendered.append(text)
+    if not has_image:
+        return ""
+    return "\n".join([IMAGE_PLACEHOLDER, *rendered])
+
+
 def _render(content_type: int, content, label: str) -> str:
     """正文 —— 被修正过类型的走我们的占位符,其余交给上游。
 
@@ -356,6 +386,8 @@ def _render(content_type: int, content, label: str) -> str:
     """
     if content_type in TYPE_OVERRIDES and (ph := MEDIA_PLACEHOLDER.get(label)):
         return ph
+    if rich := _rich_image_text(content_type, content):
+        return rich
     return _vendor().export.render(content_type, content) or ""
 
 
@@ -608,8 +640,9 @@ def fetch_since(
         scan_end[rid] = Cursor(int(r["send_time"] or 0), int(r["LID"]))
         scan_counts[rid] = scan_counts.get(rid, 0) + 1
         ctype = r["content_type"]
-        label = _type_name(ctype)
-        text = _render(ctype, r["content"], label).strip()
+        rich_image = _rich_image_text(ctype, r["content"])
+        label = "图片" if rich_image else _type_name(ctype)
+        text = (rich_image or _render(ctype, r["content"], label)).strip()
 
         # 引用回复:被引内容不在 content 列里,得单独解出来 —— 不带上的话
         # 「103会议室」这种回复到了下游没头没尾,看不出在回谁
@@ -640,7 +673,7 @@ def fetch_since(
             "skipped": skipped,
             # 图片类保留原始正文,推送前由 media 解析出文件名去缓存里找原图。
             # 只对图片带,别的类型没必要把二进制拖着走。
-            "raw": r["content"] if ctype in IMAGE_TYPES else None,
+            "raw": r["content"] if ctype in IMAGE_TYPES or rich_image else None,
             # 引用里那张图同样要能点开 —— 被引图的文件名在引用字段的载荷里,
             # 和本条消息自己的图走同一套解析
             "quote_raw": quote_payload if quote_text == IMAGE_PLACEHOLDER else None,
