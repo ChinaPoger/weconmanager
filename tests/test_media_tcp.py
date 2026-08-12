@@ -193,7 +193,8 @@ def test_a_refused_hd_copy_is_retried_as_a_full_size_original(
     second = dict(media_tcp._parse_field_list(media_tcp._split_frames(served.sent)[1]))
     assert first[b"filetype"] == media_tcp.FILETYPE_HD
     assert second[b"filetype"] == media_tcp.FILETYPE_FULL
-    # 重试要盯着同一个 fileid,并且始终不带 downpicformat(带上服务端就不回包)
+    # 重试要盯着同一个 fileid,并且始终不带 downpicformat —— 带上拿回来的是显示版,
+    # 比原件小得多,解密时过不了长度和 md5 校验
     assert second[b"fileid"] == first[b"fileid"] == b"signed-file-id"
     assert b"downpicformat" not in second
 
