@@ -58,6 +58,20 @@ class Settings(BaseSettings):
     # 轮询间隔。源库 mtime 没变就只是一次 stat,压到秒级也不费什么
     mars_sync_interval: float = 3.0
     mars_sync_batch: int = 200
+    # 图片消息最多等多少秒再推。企微收到图只写消息行,图片文件要等你点开会话
+    # 才下载 —— 3 秒的轮询几乎总是跑在下载前面,于是推出去的永远是 `[图片]`
+    # 占位符,而下游按 md5(群号+发送人+时间+正文) 去重,事后补推只会多出一条。
+    # 所以只能在推之前等。水位按群独立,等待只阻塞本群;0 = 不等,退回旧行为。
+    mars_image_wait: float = 60.0
+    # 图片主动获取顺序:BigCDN TCP → 触发企微客户端渲染。TCP 的会话凭据只放在
+    # gitignored 的 media_tcp.json,不进 .env/日志/状态接口。
+    mars_image_tcp_enabled: bool = True
+    mars_image_tcp_config: Path | None = None
+    mars_image_tcp_timeout: float = 8.0
+    mars_image_client_trigger_enabled: bool = True
+    mars_image_client_wait: float = 8.0
+    mars_image_client_poll: float = 0.25
+    mars_image_trigger_cooldown: float = 15.0
     # 白名单:群名或会话 RID,逗号分隔。**留空 = 一条都不同步**
     mars_sync_groups: str = ""
     # 显式开启后忽略白名单,同步本地所有群。默认关闭,避免误把全部历史消息推到 Mars。
@@ -116,7 +130,7 @@ class Settings(BaseSettings):
     kodo_sk: str = ""
     kodo_bucket: str = ""
     kodo_domain: str = ""
-    kodo_prefix: str = "wecom-group-media"
+    kodo_prefix: str = "robot"
     kodo_timeout: int = 20
 
     @property
