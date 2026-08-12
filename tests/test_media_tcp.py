@@ -2,6 +2,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -135,6 +136,32 @@ def test_download_builds_hd_request_and_validates_the_response(tmp_path, monkeyp
     assert request[b"fileid"] == b"signed-file-id"
     assert request[b"filetype"] == b"1"
     assert b"downpicformat" not in request
+
+
+@pytest.mark.parametrize("fileid_size", [212, 214, 216, 218, 300])
+def test_the_command_header_carries_this_frames_payload_length(fileid_size):
+    """20 字节命令头的末两字节必须是本帧字段区的真实长度。
+
+    抓包导入的 header 冻着抓包当时那一次的长度,而 fileid 长度逐图不同(线上实测
+    212/214/216/218/300 都有)。长度报短了,服务端会一直等剩下的字节 —— 表现为
+    连上、认证过、然后再也不回下载帧;报长了它把字段区读歪,同样不回包。
+    """
+    config = media_tcp.TCPConfig(
+        host="203.0.113.8", port=80,
+        auth_header=b"A" * 18 + b"\xff\xff",        # 冻住的长度,必须被覆盖
+        download_header=b"D" * 18 + b"\xff\xff",
+        common_fields=((b"ver", b"1"), (b"authkey", b"secret-session")),
+    )
+    ticket = media_tcp.ImageTicket(
+        fileid=b"F" * fileid_size, aes_key=b"0123456789abcdef",
+        md5="0" * 32, size=1,
+    )
+
+    frames = media_tcp._split_frames(media_tcp.build_request(config, ticket))
+
+    for frame in frames:
+        declared = struct.unpack_from(">H", frame, 5 + 18)[0]
+        assert declared == len(frame) - 25, "命令头声明的长度和真实字段区长度不符"
 
 
 @pytest.mark.parametrize("refusal", [b"-5103017", b"-5103059"])

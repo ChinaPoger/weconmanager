@@ -200,8 +200,20 @@ def _field(key: bytes, value: bytes) -> bytes:
     return struct.pack(">I", len(key)) + key + struct.pack(">I", len(value)) + value
 
 
+def _sized_header(header: bytes, payload_size: int) -> bytes:
+    """把 20 字节命令头最后两字节改写成本帧字段区的真实长度。
+
+    抓包导入 header 时,连同当时那一次请求的长度一起冻住了。而 fileid 长度**逐图
+    不同**(实测 212/214/216/218/300),于是这个冻住的值只对「和抓包时一样长」的
+    那些图是对的:短了服务端会一直等剩下的字节 —— 现象就是连上、认证通过、然后
+    再也不回下载帧,直到我们自己超时;长了它把字段区读歪,同样不回包。
+    """
+    return header[:18] + struct.pack(">H", payload_size)
+
+
 def _frame(header: bytes, fields: list[tuple[bytes, bytes]]) -> bytes:
-    body = header + b"".join(_field(key, value) for key, value in fields)
+    payload = b"".join(_field(key, value) for key, value in fields)
+    body = _sized_header(header, len(payload)) + payload
     total = len(body) + 5
     return bytes([MAGIC]) + struct.pack(">I", total) + body
 
