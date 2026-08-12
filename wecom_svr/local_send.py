@@ -165,8 +165,10 @@ def _set_clipboard(text: str):
 
 
 def _get_clipboard() -> str:
-    r = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
-    return r.stdout
+    r = subprocess.run(["pbpaste"], capture_output=True, timeout=5)
+    # 剪贴板可能当前存的是图片/富文本等非 UTF-8 数据。按文本读取时不能
+    # 让解码异常穿透 HTTP 层;调用方会把替换后的内容识别为“不是群名”。
+    return r.stdout.decode("utf-8", errors="replace")
 
 
 def _normalize_file_path(path: str) -> str:

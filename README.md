@@ -64,6 +64,31 @@ wecom-svr --port 8090 --reload
 
 启动后 OpenAPI 文档在 <http://127.0.0.1:8090/docs>。
 
+### 新机器首次启动
+
+默认采用“自动初始化 + 严格门禁”:Uvicorn 在端口进入 ready 前先完成以下检查:
+
+1. 用本机 key 刷新解密 `Info.db` / `Session.db`。
+2. key 不可用时自动运行 `decrypt/macos/find_key_fast.py`,再重新验证数据库。
+3. 打开并立即取消“发起群聊”面板,验证辅助功能/自动化权限并校准本机 `+` 偏移;
+   首次成功后生成 `.data/ui_offsets.json`。
+
+第 3 步不会选择联系人或创建群。任一步失败都会终止启动,避免服务看起来在线、
+直到首个真实请求才发现新机器未初始化。自动取 key 仍要求企业微信正在运行且已登录;
+若系统报 `task_for_pid` 权限错误,需按 wecom-agent 文档正确重签客户端后再启动,
+服务不会自动执行重签。
+
+按部署用途可显式降级:
+
+- 纯官方 API: `WECOM_SVR_STARTUP_PREFLIGHT_ENABLED=false`
+- 只采集/解密消息、不操控 UI: `WECOM_SVR_STARTUP_UI_CHECK=false`
+- 要求人工预先准备 key: `WECOM_SVR_STARTUP_AUTO_INIT=false`
+
+启动成功后 `/health` 的 `startup_preflight` 会返回数据库、取 key、通讯录和 UI 的检查
+结果。其中通讯录(`contacts_ready`,来自 `Session.db` 的 `USER` 表)是**软门禁**:
+它只影响按名字查人和官方建群,纯发消息/纯采集的部署用不到,所以查不到只在这里报
+`false` 并记一条 warning,不挡启动。
+
 ## 配置
 
 优先级:环境变量 / `.env` > `$WECOM_AGENT_HOME/config.json` > 默认值。
@@ -73,9 +98,13 @@ wecom-svr --port 8090 --reload
 | `WECOM_AGENT_HOME` | `vendor/wecom-agent` | wecom-agent checkout 路径 |
 | `WECOM_SVR_HOST` / `WECOM_SVR_PORT` | `127.0.0.1` / `8090` | 监听地址 |
 | `WECOM_SVR_API_TOKEN` | 空 | 留空则**不鉴权**(仅本地,勿暴露公网) |
+| `WECOM_SVR_STARTUP_PREFLIGHT_ENABLED` | `true` | 启动前检查本地数据库和客户端 UI;失败阻止 ready |
+| `WECOM_SVR_STARTUP_AUTO_INIT` | `true` | key 无效时自动运行 `find_key_fast.py` |
+| `WECOM_SVR_STARTUP_UI_CHECK` | `true` | 首次/每次启动无副作用校准 `+` 偏移;采集-only 可关闭 |
+| `WECOM_SVR_STARTUP_KEY_TIMEOUT` | `180` | 自动取 key 的超时秒数 |
 | `WECOM_CORPID` / `WECOM_SECRET` / `WECOM_AGENTID` | 空 | 自建应用凭证,留空回落到 `config.json` |
 | `WECOM_SVR_MARS_*` | 见下 | 群消息同步到 mars,默认全关 |
-| `WECOM_SVR_UI_PLUS_OFFSET` / `WECOM_SVR_UI_TITLE_OFFSET` | 空 | 手工钉死那两个只能靠坐标点的位置(`"x,y"`),配了就关掉自动校准 |
+| `WECOM_SVR_UI_PLUS_OFFSET` / `WECOM_SVR_UI_TITLE_OFFSET` | 空 | 手工钉死坐标位置(`"x,y"`);标题项仅兼容旧版客户端 |
 | `WECOM_SVR_UI_CALIBRATE` | `true` | 点不中时在附近试候选偏移,试中了记进 `.data/ui_offsets.json` |
 
 ## 接口
@@ -178,9 +207,15 @@ curl -X POST http://127.0.0.1:8090/api/v1/group/create \
 - **计数超出预期就直接停**,不靠再点几下去凑。多选人比少选危险得多。
 
 `name` 是「先建群、再改名」两步(面板里没有命名输入框):建完用建群前后的群 RID 差集
-定位新群,打开它、点标题把标题变成输入框、覆写、回车,**最后回库核验那个 RID 的群名
-真的变了**。改名失败不回滚群 —— 群已经建出来了,回滚更吓人,接口会在 `name_error`
-里说清楚让你手动改。
+定位新群,打开它、改标题、覆写、回车,**最后回库核验那个 RID 的群名真的变了**。
+改名失败不回滚群 —— 群已经建出来了,回滚更吓人,接口会在 `name_error` 里说清楚
+让你手动改。
+
+差集本身**不足以**证明那个新会话是你建的:这期间别人也可能把你拉进一个群,而 UI 锁
+只挡得住本机并发。所以差集之后还有两道:看到第一个新会话再等 `GROUP_APPEAR_SETTLE`
+重新取一次差集(同时冒出来两个就放弃改名),以及改名前先把打开的那个会话的标题读
+回来,**必须是这几个被选中的人拼出来的**才动手。认不出来只是不改名(带说明让你手动
+改),认错了却是把名字改到别人的群上,事后的回库核验查的是同一个错 RID,兜不住。
 
 两个关键的实测结论,踩过才知道:
 
