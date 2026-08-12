@@ -31,6 +31,20 @@ MAGIC = 0xAB
 CONFIG_VERSION = 1
 MAX_FRAME_BYTES = 33 * 1024 * 1024
 
+# filetype 选哪一份文件。1 是 HD 分身,2 是原件,3 是缩略图(同一张图实测只回
+# 12KB/37KB,不能当原图用)。多数图两份都在,于是默认先要 HD;但有一批图只有
+# 原件,filetype=1 一律被拒,换 filetype=2 才拿得到 md5 对得上的完整原图。
+#
+# 拒绝的 retcode 不止一个(已实测到 -5103017 和 -5103059,两者都是 filetype=2
+# 能救回来的),所以这里不枚举 retcode:HD 那次只要没成,就用 filetype=2 再要
+# 一次。被拒是一个带 retcode 的正常响应、不是超时,这个额外往返很便宜,而换回
+# 来的是一张本来要退回去触发企微客户端的图。
+#
+# 另外别给这些 filetype 附带 downpicformat —— 实测带上 downpicformat=4 之后
+# 服务端对**任何**图都不再回包,连 filetype=1 本来能下的那些也一起挂掉。
+FILETYPE_HD = b"1"
+FILETYPE_FULL = b"2"
+
 
 class MediaTCPError(RuntimeError):
     """TCP 配置、协议或图片校验失败。"""
@@ -205,7 +219,9 @@ def _with_seq(fields: tuple[tuple[bytes, bytes], ...], seq: bytes) -> list[tuple
     return out
 
 
-def build_request(config: TCPConfig, ticket: ImageTicket) -> bytes:
+def build_request(
+    config: TCPConfig, ticket: ImageTicket, filetype: bytes = FILETYPE_HD
+) -> bytes:
     auth = _frame(config.auth_header, _with_seq(config.common_fields, _next_seq()))
     fields = _with_seq(config.common_fields, _next_seq())
     fields.extend([
@@ -213,7 +229,7 @@ def build_request(config: TCPConfig, ticket: ImageTicket) -> bytes:
         (b"ipseq", b"0"),
         (b"offset", b"0"),
         (b"fileid", ticket.fileid),
-        (b"filetype", b"1"),             # 1 = HD 原图;2 + downpicformat=4 是显示版
+        (b"filetype", filetype),         # 取值见 FILETYPE_HD / FILETYPE_FULL
         (b"wxmsgflag", b""),
         (b"wxchattype", b"1"),
         (b"wxautostart", b"117"),
@@ -461,14 +477,15 @@ def _extension(data: bytes) -> str:
     return ".bin"
 
 
-def download(content, settings: Settings) -> tuple[bytes, str]:
-    """走 BigCDN TCP 拉高清原图,返回 ``(bytes, ext)``。"""
-    if not settings.mars_image_tcp_enabled:
-        raise MediaTCPError("TCP 图片下载已关闭")
-    ticket = image_ticket(content)
-    config = load_config(settings)
-    request = build_request(config, ticket)
-    timeout = float(settings.mars_image_tcp_timeout)
+def _fetch(
+    config: TCPConfig, ticket: ImageTicket, filetype: bytes, timeout: float
+) -> tuple[bytes, str]:
+    """一次完整的「鉴权 + 下载」往返,返回 ``(filedata 密文, 下载帧 retcode)``。
+
+    鉴权失败直接抛 —— 换 filetype 重试救不了它。下载帧的 retcode 原样交回,
+    由 `download` 决定是重试还是认输。
+    """
+    request = build_request(config, ticket, filetype)
     try:
         with socket.create_connection((config.host, config.port), timeout=timeout) as sock:
             sock.settimeout(timeout)
@@ -479,10 +496,26 @@ def download(content, settings: Settings) -> tuple[bytes, str]:
             image_response = _parse_frame(_recv_frame(sock))
     except (OSError, TimeoutError) as e:
         raise MediaTCPError(f"连接 BigCDN 失败: {e}") from e
-    if _retcode(image_response) != "0":
-        raise MediaTCPError(f"BigCDN 下载失败 retcode={_retcode(image_response)!r}")
-    ciphertext = image_response.get(b"filedata")
-    if ciphertext is None:
+    return image_response.get(b"filedata") or b"", _retcode(image_response)
+
+
+def download(content, settings: Settings) -> tuple[bytes, str]:
+    """走 BigCDN TCP 拉原图,返回 ``(bytes, ext)``。"""
+    if not settings.mars_image_tcp_enabled:
+        raise MediaTCPError("TCP 图片下载已关闭")
+    ticket = image_ticket(content)
+    config = load_config(settings)
+    timeout = float(settings.mars_image_tcp_timeout)
+
+    ciphertext, retcode = _fetch(config, ticket, FILETYPE_HD, timeout)
+    if retcode != "0":
+        # 见 FILETYPE_FULL:HD 被拒不代表图没了,更可能是这张只有原件。
+        log.debug("BigCDN 拒了 %s 的 HD 分身(retcode=%s),改要原件",
+                  ticket.md5, retcode)
+        ciphertext, retcode = _fetch(config, ticket, FILETYPE_FULL, timeout)
+    if retcode != "0":
+        raise MediaTCPError(f"BigCDN 下载失败 retcode={retcode!r}")
+    if not ciphertext:
         raise MediaTCPError("BigCDN 响应缺少 filedata")
     data = decrypt_filedata(ciphertext, ticket)
     return data, _extension(data)
