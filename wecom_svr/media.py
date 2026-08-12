@@ -34,6 +34,7 @@
 不配 kodo 就退回 `[图片]` 占位符。
 """
 import base64
+import contextlib
 import functools
 import glob
 import hashlib
@@ -48,7 +49,9 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 import httpx
 
@@ -67,10 +70,171 @@ _MEDIA_NAME = re.compile(rb"([^\x00-\x1f/\\]{1,120}\.(?:png|jpe?g|heic|gif|webp|
 
 # RID 理论上是纯数字,但它进对象 key,不能指望这一点 —— 别的字符一律换成下划线
 _KEY_UNSAFE = re.compile(r"[^0-9A-Za-z_-]")
+_HEX32 = re.compile(rb"^[0-9a-fA-F]{32}$")
+# 这是 Content 生成协议的一部分;改变它会改变历史消息抽出的媒体集合。
+MEDIA_TREE_MAX_DEPTH = 6
+MEDIA_TREE_MAX_NODES = 4096
+MEDIA_TREE_MAX_BYTES = 16 * 1024 * 1024
+_MEDIA_CONTAINER_FIELDS = frozenset({1, 17, 103, 107, 1002})
+_MARS_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
 
 
 class MediaError(RuntimeError):
     """取图或上传失败(可预期,调用方退回占位符即可)。"""
+
+
+@functools.cache
+def _pillow():
+    """`Image.open`,首次用到时才装。
+
+    Pillow + pillow-heif 加起来 30 ms 的 import,而它们只在**白名单外**的格式上用得着。
+    这个模块现在被 messages 顶层导入,每个入口(服务、CLI)都会付这笔钱 —— 不该为一条
+    偶发路径拖慢所有启动。
+    """
+    from PIL import Image
+    from pillow_heif import register_heif_opener  # type: ignore[import-untyped]
+
+    register_heif_opener()               # iPhone 原图是 HEIC,Pillow 本体不认
+    return Image.open
+
+
+@dataclass(frozen=True)
+class MediaItem:
+    """消息树里一个可识别媒体项。顺序由 :func:`collect` 的规范遍历定义。"""
+
+    md5: str
+    size: int
+    filename: str
+    kind: Literal["image", "file"]
+    ticket: media_tcp.ImageTicket | None
+
+
+def _pb_nodes(buf: bytes) -> list[tuple[int, int, bytes | int]] | None:
+    """完整解析一层 protobuf;截断、非法字段或不支持的 wire type 返回 None。"""
+    out: list[tuple[int, int, bytes | int]] = []
+    offset = 0
+    try:
+        while offset < len(buf):
+            key, offset = media_tcp.read_varint(buf, offset)
+            field, wire = key >> 3, key & 7
+            if field <= 0 or field > 16383:
+                return None
+            if wire == 2:
+                size, offset = media_tcp.read_varint(buf, offset)
+                end = offset + size
+                if end > len(buf):
+                    return None
+                out.append((field, wire, buf[offset:end]))
+                offset = end
+            elif wire == 0:
+                value, offset = media_tcp.read_varint(buf, offset)
+                out.append((field, wire, value))
+            elif wire == 1:
+                if offset + 8 > len(buf):
+                    return None
+                out.append((field, wire, buf[offset:offset + 8]))
+                offset += 8
+            elif wire == 5:
+                if offset + 4 > len(buf):
+                    return None
+                out.append((field, wire, buf[offset:offset + 4]))
+                offset += 4
+            else:
+                return None
+    except media_tcp.MediaTCPError:
+        return None
+    return out
+
+
+def _item_at(nodes: list[tuple[int, int, bytes | int]]) -> MediaItem | None:
+    fields: dict[int, bytes | int] = {}
+    for field, _wire, value in nodes:
+        fields.setdefault(field, value)      # 重复字段取首次出现,和 collect 的规范序一致
+    try:
+        fileid, size, key_hex, digest_raw = fields[1], fields[4], fields[8], fields[10]
+    except KeyError:
+        return None
+    if not isinstance(fileid, bytes) or not fileid or not isinstance(size, int) or size <= 0:
+        return None
+    if (
+        not isinstance(key_hex, bytes)
+        or not isinstance(digest_raw, bytes)
+        or not _HEX32.fullmatch(digest_raw)
+    ):
+        return None
+    digest = digest_raw.decode("ascii").lower()
+    filename = ""
+    name_raw = fields.get(2, b"")
+    if isinstance(name_raw, bytes):
+        try:
+            filename = name_raw.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    if _HEX32.fullmatch(key_hex):
+        ticket = media_tcp.ImageTicket(fileid, bytes.fromhex(key_hex.decode("ascii")), digest, size)
+        return MediaItem(digest, size, filename, "image", ticket)
+    if not key_hex:
+        return MediaItem(digest, size, filename, "file", None)
+    return None                         # 未知协议,不要武断地当附件或图片
+
+
+def collect(content) -> list[MediaItem]:
+    """正文 → 全部媒体,规范序(字段号、wire occurrence、深度优先),按 md5 去重。
+
+    正文与引用由调用方分别调用,这里不会跨段去重。递归深度和其它边界是输出协议,
+    不能当普通性能参数随意调整。
+    """
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+    if not isinstance(content, bytes) or not content or len(content) > MEDIA_TREE_MAX_BYTES:
+        return []
+    root = _pb_nodes(content)
+    if root is None:
+        return []
+    found: list[MediaItem] = []
+    node_count = 0
+    byte_count = 0
+
+    def walk(nodes: list[tuple[int, int, bytes | int]], size: int, depth: int) -> None:
+        """已解析好的一层 → 收下它的媒体项,再按规范序下沉。
+
+        节点由调用方解析后传进来,不在这里再解一遍:决定要不要递归本来就得先解析,
+        重解一次既费时,又给「判断时」和「下沉后」留了看法不一致的余地。
+        """
+        nonlocal node_count, byte_count
+        if node_count >= MEDIA_TREE_MAX_NODES:
+            return
+        byte_count += size
+        if byte_count > MEDIA_TREE_MAX_BYTES:
+            return
+        node_count += 1
+        if item := _item_at(nodes):
+            found.append(item)
+        if depth >= MEDIA_TREE_MAX_DEPTH:
+            return
+        # sorted 会丢掉跨字段顺序;这里明确按字段号排序,稳定排序保留同字段 wire order。
+        for field, wire, value in sorted(nodes, key=lambda n: n[0]):
+            if wire != 2 or field not in _MEDIA_CONTAINER_FIELDS or not isinstance(value, bytes):
+                continue
+            child = _pb_nodes(value)
+            # opaque 载荷(fileid、md5、字符串)偶尔也能被 protobuf 扫完,所以下沉
+            # 的条件不是「解得动」,而是「解出来确实像媒体节点或媒体容器」。
+            if child and (_item_at(child) or {n[0] for n in child} & _MEDIA_CONTAINER_FIELDS):
+                walk(child, len(value), depth + 1)
+
+    walk(root, len(content), 0)
+    # 同 md5 后遇到 image 时把 file 就地升级,保留首次位置和首次文件名。
+    # dict 保序,且替换已有 key 不会改变它的位置 —— 正好是要的语义。
+    out: dict[str, MediaItem] = {}
+    for item in found:
+        first = out.get(item.md5)
+        if first is None:
+            out[item.md5] = item
+        elif first.kind == "file" and item.kind == "image":
+            out[item.md5] = MediaItem(
+                item.md5, item.size, first.filename or item.filename, "image", item.ticket,
+            )
+    return list(out.values())
 
 
 def extract_filename(content) -> str:
@@ -233,17 +397,24 @@ def _candidates(
     更不该白跑第二遍。
     """
     if md5 and settings is not None:
+        # 逐个试已知扩展名,而不是 glob `{md5}.*`:通配会把整个 media-cache 目录
+        # scandir 一遍(实测 5k 个文件 2.0ms),而这里问的只是「这几个名字在不在」
+        # —— 换成 lexists 是 0.01ms,等图时每 0.25s 就要问一次。
+        service_root = settings.data_dir / "media-cache"
         service_hits = [
-            p for p in glob.glob(str(settings.data_dir / "media-cache" / f"{md5}.*"))
-            if os.path.isfile(p)
+            str(service_root / f"{md5}{ext}") for ext in media_tcp.EXTENSIONS
+            if os.path.isfile(service_root / f"{md5}{ext}")
         ]
         if service_hits:
             return service_hits, True
 
     root = _images_root()
     if md5:
+        # 同理:变体只有 `<md5>`/`_HD`/`_THUMB` 三种(见模块 docstring 和
+        # `_variant_rank`),写成字面量就不必为每个年-月目录再 scandir 一遍。
         hits = [
-            p for p in glob.glob(os.path.join(root, "*", f"{md5}*", "*"))
+            p for variant in (md5, f"{md5}_HD", f"{md5}_THUMB")
+            for p in glob.glob(os.path.join(root, "*", variant, "*"))
             if os.path.isfile(p)
         ]
         if hits:
@@ -396,6 +567,53 @@ def _put(open_stream, name: str, digest: str, ext: str,
     return url
 
 
+def _transcoded(source: str | bytes, ext: str) -> tuple[str, Callable[[], io.BytesIO]] | None:
+    """白名单外的格式(HEIC、认不出魔数的 `.bin`)→ `(新扩展名, 取字节的函数)`。
+
+    白名单内返回 None,一个字节都不动。
+
+    **转 JPEG 而不是 PNG**: 落到这条路上的几乎全是相机原图,一张 4032x3024 的 HEIC
+    转 PNG 是几十 MB,转 JPEG 是 2 MB 上下 —— 这张图接下来还要过 kodo 和 mars 前端。
+    带透明通道的转 PNG,JPEG 没有 alpha。
+
+    扩展名只读文件头就能定,真正的解码留给返回的函数:`_put` 命中已上传的对象时
+    就完全不必解这张图。
+
+    Pillow 的解码异常**不都是 OSError**(`DecompressionBombError` 直接继承 Exception),
+    漏网的话会一路抛穿 message_body,而水位不动 —— 同一条消息每轮都再炸一次。
+    所以这里一律收口成 MediaError,让调用方退回占位符。
+    """
+    if ext in _MARS_IMAGE_EXTS:
+        return None
+    image_open = _pillow()
+
+    @contextlib.contextmanager
+    def opened():
+        """Pillow 的解码异常一律收口成 MediaError,让调用方退回占位符。"""
+        try:
+            with image_open(source if isinstance(source, str) else io.BytesIO(source)) as image:
+                yield image
+        except MediaError:
+            raise
+        except Exception as e:
+            raise MediaError(f"无法把 {ext or '.bin'} 转成 mars 支持的图片: {e}") from e
+
+    with opened() as probe:              # Image.open 是惰性的,这里只读到文件头
+        alpha = probe.mode in ("RGBA", "LA", "PA") or "transparency" in probe.info
+
+    def encode() -> io.BytesIO:
+        out = io.BytesIO()
+        with opened() as image:
+            if alpha:
+                image.convert("RGBA").save(out, format="PNG")
+            else:
+                image.convert("RGB").save(out, format="JPEG", quality=85)
+        out.seek(0)
+        return out
+
+    return (".png" if alpha else ".jpg"), encode
+
+
 def upload(path: str, settings: Settings, rid="", send_time: int = 0, md5: str = "") -> str:
     """上传本地图片,返回公网 URL。已存在则直接复用,不重传。
 
@@ -404,9 +622,15 @@ def upload(path: str, settings: Settings, rid="", send_time: int = 0, md5: str =
     """
     _require_kodo(settings)          # 先挡住,免得白读一遍文件算 md5
     ext = os.path.splitext(path)[1].lower() or ".bin"
+    name = os.path.basename(path)
+
+    def open_stream() -> io.IOBase:
+        return open(path, "rb")
     try:
-        return _put(lambda: open(path, "rb"), os.path.basename(path),
-                    md5 or file_md5(path), ext, settings, rid, send_time)
+        if transcoded := _transcoded(path, ext):
+            ext, open_stream = transcoded
+            name = f"image{ext}"
+        return _put(open_stream, name, md5 or file_md5(path), ext, settings, rid, send_time)
     except OSError as e:
         raise MediaError(f"读取待上传文件失败: {e}") from e
 
@@ -415,10 +639,17 @@ def upload_bytes(data: bytes, ext: str, settings: Settings, rid="", send_time: i
     """上传一段字节(CDN 拉回来的图),返回公网 URL。
 
     这条路没有正文 md5(表情包/转发图那类),只能拿收到的字节算 —— 对 key 来说够用,
-    它在这里只当区分位,不承担「认出这是同一张图」的职责。
+    它在这里只当区分位,不承担「认出这是同一张图」的职责。转码只换扩展名,
+    区分位仍是**原始字节**的 md5,所以同一张图重推落在同一个 key 上。
     """
-    return _put(lambda: io.BytesIO(data), f"image{ext}", hashlib.md5(data).hexdigest(),
-                ext, settings, rid, send_time)
+    ext = ext.lower()
+    digest = hashlib.md5(data).hexdigest()
+    if transcoded := _transcoded(data, ext):
+        ext, open_stream = transcoded
+    else:
+        def open_stream() -> io.BytesIO:
+            return io.BytesIO(data)
+    return _put(open_stream, f"image{ext}", digest, ext, settings, rid, send_time)
 
 
 # content-type → 扩展名。不用 mimetypes.guess_extension: 它对 image/jpeg 的
@@ -524,6 +755,12 @@ def locate(content, settings: Settings | None = None) -> Located:
     return Located(md5, filename, extract_url(content), hits, by_md5)
 
 
+def locate_item(item: MediaItem, settings: Settings | None = None) -> Located:
+    """一个已抽取媒体项 → 本地缓存位置。"""
+    hits, by_md5 = _candidates(item.filename, item.md5, settings)
+    return Located(item.md5, item.filename, "", hits, by_md5)
+
+
 _trigger_lock = threading.Lock()
 _triggered_at: dict[int, float] = {}
 
@@ -575,20 +812,26 @@ def _trigger_client(rid: int, lid: int, settings: Settings) -> bool:
     return ok
 
 
-def ensure_local(content, settings: Settings, rid=0, lid: int = 0) -> str:
-    """确保图片可读:本地命中 → BigCDN TCP → 触发企微客户端。"""
-    loc = locate(content, settings)
-    if loc.hits:
-        return loc.best()
-    if not loc.known or loc.url:
-        return ""
+def _ensure(
+    relocate: Callable[[], Located], fetch: Callable[[], str] | None,
+    settings: Settings, rid=0, lid: int = 0, deadline: float | None = None,
+) -> str:
+    """本地命中 → `fetch()`(BigCDN TCP)→ 触发企微客户端等它自己下。
 
-    if settings.mars_image_tcp_enabled and loc.md5:
+    `relocate` 每次调用都重新 glob:等的就是「文件刚刚出现」。`deadline` 是**整条
+    消息**共享的取图预算,给 None 表示只受本次 `mars_image_client_wait` 约束。
+
+    单图正文和媒体树里的项走的是同一段逻辑,差别只在怎么定位、怎么下载。分成两份
+    抄的话,给其中一条加取图路径而忘了另一条,那些消息会被永远判定成「还在路上」。
+    """
+    if fetch and settings.mars_image_tcp_enabled and (deadline is None or time.monotonic() < deadline):
         try:
-            data, ext = media_tcp.download(content, settings)
-            return _cache_download(data, ext, loc.md5, settings)
-        except (media_tcp.MediaTCPError, OSError) as e:
-            log.info("BigCDN TCP 拉图失败(%s),改用客户端触发: %s", loc.md5, e)
+            return fetch()
+        except (media_tcp.MediaTCPError, MediaError, OSError) as e:
+            log.info("BigCDN TCP 拉图失败,改用客户端触发: %s", e)
+
+    if deadline is not None and time.monotonic() >= deadline:
+        return ""
 
     # 切会话和等文件必须处在同一次 UI 独占里。只锁 ``open -g`` 那一瞬间的话,
     # 并发的发消息/开群会马上把企微切走,下载就会随机中断。嵌套调用里的
@@ -602,22 +845,79 @@ def ensure_local(content, settings: Settings, rid=0, lid: int = 0) -> str:
         # 内层会把自己误判成并发请求并立即抛 ClientBusy。
         with ui_reserve("加载会话图片"):
             if not _trigger_client(int(rid or 0), int(lid or 0), settings):
-                return locate(content, settings).best()
+                return relocate().best()
 
-            wait = max(0.0, float(settings.mars_image_client_wait))
+            stop = time.monotonic() + max(0.0, float(settings.mars_image_client_wait))
+            if deadline is not None:
+                stop = min(stop, deadline)
             poll = max(0.05, float(settings.mars_image_client_poll))
-            deadline = time.monotonic() + wait
             while True:
-                current = locate(content, settings)
+                current = relocate()
                 if path := current.original():
                     return path
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= stop:
                     # 原图一直没到时才接受已存在的渲染件,保持旧的“有图比没图强”策略。
                     return current.best()
-                time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+                time.sleep(min(poll, max(0.0, stop - time.monotonic())))
     except ClientBusy as e:
         log.info("企微客户端正忙,本轮不触发群 %s 加载图片: %s", rid, e)
-        return locate(content, settings).best()
+        return relocate().best()
+
+
+def ensure_local(content, settings: Settings, rid=0, lid: int = 0) -> str:
+    """确保图片可读:本地命中 → BigCDN TCP → 触发企微客户端。"""
+    loc = locate(content, settings)
+    if loc.hits:
+        return loc.best()
+    if not loc.known or loc.url:
+        return ""
+
+    def fetch() -> str:
+        data, ext = media_tcp.download(content, settings)
+        return _cache_download(data, ext, loc.md5, settings)
+
+    return _ensure(lambda: locate(content, settings), fetch if loc.md5 else None,
+                   settings, rid, lid)
+
+
+def ensure_item_local(
+    item: MediaItem, settings: Settings, rid=0, lid: int = 0,
+    deadline: float | None = None, loc: Located | None = None,
+) -> str:
+    """确保一个媒体项可读。所有项共享一个 monotonic deadline,避免逐图叠加等待。
+
+    `loc` 让调用方把自己刚 glob 出来的结果传进来 —— 这一趟 glob 不便宜
+    (`_candidates` 的 docstring 记了实测数字),不该为同一个问题走两遍。
+    """
+    if item.kind != "image" or item.ticket is None:
+        return ""
+    found = loc if loc is not None else locate_item(item, settings)
+    if found.hits:
+        return found.best()
+
+    def fetch() -> str:
+        assert item.ticket is not None
+        data, ext = media_tcp.download_ticket(item.ticket, settings, deadline=deadline)
+        return _cache_download(data, ext, item.md5, settings)
+
+    return _ensure(lambda: locate_item(item, settings), fetch, settings, rid, lid, deadline)
+
+
+def resolve_item(
+    item: MediaItem, settings: Settings, rid="", send_time: int = 0, lid: int = 0,
+    deadline: float | None = None,
+) -> str:
+    """单个媒体项 → mars 可识别的公网图片 URL;失败返回空串。"""
+    if not settings.kodo_enabled or item.kind != "image":
+        return ""
+    try:
+        path = ensure_item_local(item, settings, rid, lid, deadline)
+        if not path:
+            return ""
+        return upload(path, settings, rid, send_time, md5=item.md5)
+    except (MediaError, OSError) as e:
+        log.warning("取图/上传失败(%s),退回占位符: %s", item.filename or item.md5, e)
+        return ""
 
 
 def pending(content, settings: Settings) -> bool:

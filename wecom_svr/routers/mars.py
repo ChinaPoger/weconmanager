@@ -162,8 +162,13 @@ async def preview(
         # 和真实一轮共用同一个规划器,否则改了扣图规则 preview 就会开始说谎
         due, held_by_group = await asyncio.to_thread(mars_sync.plan_round, batch, rids, settings)
         held = sum(held_by_group.values())
+        # frozen_hook 而不是 to_hook:已经落过 outbox 的消息推的是冻结的那份,
+        # 重算一遍的话 preview 说的就不是「下一轮会推什么」了。
         pending = await asyncio.to_thread(
-            lambda: [{**message, "hook": mars_sync.to_hook(message, settings)} for message in due]
+            lambda: [
+                {**message, "hook": mars_sync.frozen_hook(message, settings)}
+                for message in due
+            ]
         )
     return {
         "errcode": 0,
@@ -210,17 +215,19 @@ async def set_watermark(req: WatermarkRequest, _: None = Depends(require_token))
         for key in keys:
             group = state.groups[key]
             old = group.cursor
-            if req.resume_from_tombstone:
-                try:
-                    group.resume_from_tombstone()
-                except mars_sync.MarsSyncError as e:
-                    raise mars_sync.MarsNotConfigured(f"群 {key} {e}") from e
-            elif req.send_time is not None:
-                group.cursor = Cursor(req.send_time, req.lid or 0)
-            elif req.backfill_seconds is not None:
-                group.cursor = mars_sync.cursor_for_backfill(req.backfill_seconds)
-            else:
-                group.cursor = await asyncio.to_thread(messages.latest_cursor, int(key))
+            try:
+                if req.resume_from_tombstone:
+                    group.resume_from_tombstone(force=req.force)
+                elif req.send_time is not None:
+                    group.rewind(Cursor(req.send_time, req.lid or 0), force=req.force)
+                elif req.backfill_seconds is not None:
+                    group.rewind(mars_sync.cursor_for_backfill(req.backfill_seconds),
+                                 force=req.force)
+                else:
+                    latest = await asyncio.to_thread(messages.latest_cursor, int(key))
+                    group.rewind(latest, force=req.force)
+            except mars_sync.MarsSyncError as e:
+                raise mars_sync.MarsNotConfigured(f"群 {key} {e}") from e
             group.last_error = ""
             group.fail_streak = 0
             changes[key] = {"old": old.to_dict(), "new": group.cursor.to_dict()}

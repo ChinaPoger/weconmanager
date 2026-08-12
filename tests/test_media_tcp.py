@@ -254,3 +254,13 @@ def test_client_trigger_uses_background_url_scheme_with_message_id(monkeypatch):
     assert ok is True
     assert seen[0][0] == ["open", "-g", url]
     assert "roomid=1688" in url and "msgid=99" in url
+
+
+def test_every_magic_extension_is_declared():
+    """`EXTENSIONS` 是 media 缓存探测的白名单,漏一个那类图就永远找不到。"""
+    samples = [
+        b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a",
+        b"RIFF\x00\x00\x00\x00WEBP", b"BM", b"not an image",
+    ]
+    produced = {media_tcp._extension(s) for s in samples}
+    assert produced == set(media_tcp.EXTENSIONS)

@@ -34,12 +34,13 @@ import shutil
 import time
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 import httpx
 
 from . import media, messages
 from .bgloop import BackgroundLoop
-from .messages import IMAGE_PLACEHOLDER, Cursor, media_payloads
+from .messages import FILE_PLACEHOLDER, IMAGE_PLACEHOLDER, Cursor, media_payloads
 from .settings import Settings, get_settings
 
 log = logging.getLogger(__name__)
@@ -83,6 +84,8 @@ def _summarize_errors(errors) -> str:
 @dataclass
 class GroupState:
     cursor: Cursor = field(default_factory=Cursor)
+    # 多媒体 Content 规则的部署边界。此点以前禁止自动回放,避免旧消息用新规则重算。
+    media_cutover: Cursor | None = None
     active: bool = True
     last_error: str = ""
     fail_streak: int = 0
@@ -96,7 +99,21 @@ class GroupState:
     gap_from: Cursor | None = None
     gap_messages: int = 0
 
-    def resume_from_tombstone(self) -> None:
+    def rewind(self, cursor: Cursor, *, force: bool = False) -> None:
+        """把水位挪到 `cursor`,挡住跨越多媒体切换点的回放。
+
+        和 `media_cutover` 放在一起,而不是留在 HTTP handler 里 —— 立这个字段的
+        地方和用它的地方分家,以后多一条改水位的路径就会漏掉这一层检查。
+        """
+        if not force and self.media_cutover and cursor < self.media_cutover:
+            raise MarsSyncError(
+                f"新水位早于多媒体切换点 "
+                f"{self.media_cutover.send_time}/{self.media_cutover.lid},禁止跨点回放。"
+                "确实要重放(接受 mars 里出现重复行)就加 force=true"
+            )
+        self.cursor = cursor
+
+    def resume_from_tombstone(self, *, force: bool = False) -> None:
         """把水位退回移出群之前的位置,并清掉墓碑。
 
         和 `reconcile_state` 里立墓碑的那几行是一对 —— 放在一起,以后多一个墓碑
@@ -104,13 +121,14 @@ class GroupState:
         """
         if self.gap_from is None:
             raise MarsSyncError("没有可恢复的 tombstone 水位")
-        self.cursor = self.gap_from
+        self.rewind(self.gap_from, force=force)
         self.gap_from = None
         self.gap_messages = 0
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d["cursor"] = self.cursor.to_dict()
+        d["media_cutover"] = self.media_cutover.to_dict() if self.media_cutover else None
         d["gap_from"] = self.gap_from.to_dict() if self.gap_from else None
         return d
 
@@ -118,8 +136,10 @@ class GroupState:
     def from_dict(cls, d: dict | None) -> "GroupState":
         d = d or {}
         gap = d.get("gap_from")
+        cutover = d.get("media_cutover")
         return cls(
             cursor=Cursor.from_dict(d.get("cursor")),
+            media_cutover=Cursor.from_dict(cutover) if cutover else None,
             active=bool(d.get("active", True)),
             last_error=_error_text(d.get("last_error")),
             fail_streak=int(d.get("fail_streak") or 0),
@@ -153,7 +173,7 @@ class State:
     @classmethod
     def from_dict(cls, d: dict) -> "State":
         version = int(d.get("version") or 1)
-        if version not in (1, 2):
+        if version not in (1, 2, 3):
             raise ValueError(f"不支持的状态版本 {version}")
         raw_groups = d.get("groups") or {}
         if not isinstance(raw_groups, dict):
@@ -257,20 +277,78 @@ def _swap(part: str, url: str) -> str:
     return f"{part} {url}".strip()
 
 
-def _resolved(
-    part: str, raw, settings: Settings, rid="", send_time: int = 0, lid: int = 0,
-) -> str:
-    """有原图就把这一段里的 `[图片]` 换成公网 URL,换不到就原样留着。
+@dataclass(frozen=True)
+class Segment:
+    """一条消息里某个媒体载荷分到的配额。
 
-    替换而不是追加: 前端已经能把 URL 渲染成图,再留一个「[图片]」在图上方
-    纯属噪音。反过来,URL 没解析出来时占位符必须留着,否则这段就空了。
-
-    `rid`/`send_time` 只往下透给对象 key,不参与「取哪张图」。
+    `mars_image_max_per_message` 是**整条消息**的上限,而正文和引用是分开解析的
+    (`MEDIA_FIELDS` 的顺序就是分配顺序)。谁分到哪几张必须只算一次:`_ready_count`
+    按它决定等哪些图,`message_body` 按它决定排哪些 URL,两边算出不同的答案就会
+    出现「等的不是要排的那张」—— 消息带着占位符推走,而水位那侧还以为等齐了。
     """
-    if not (settings.kodo_enabled and part and raw):
-        return part
-    url = media.resolve(raw, settings, rid, send_time, lid)
-    return _swap(part, url) if url else part
+
+    raw: bytes | None
+    images: list[media.MediaItem]  # 本段要展示的图,已经扣过整条消息的配额
+    files: list[media.MediaItem]   # 附件:没有 aeskey,下不了,只写文件名
+    legacy: bool                   # 媒体树里认不出票据,退回旧的单图解析
+    omitted: int                   # 超出上限、本条不展示的图片数
+
+
+def media_plan(msg: dict, settings: Settings) -> tuple[Segment, Segment]:
+    """整条消息的媒体分配。**唯一**一处决定「哪几张图属于哪一段」。"""
+    remaining = max(0, int(settings.mars_image_max_per_message))
+    plan: list[Segment] = []
+    for raw in media_payloads(msg):
+        items = media.collect(raw) if raw else []
+        if not raw:
+            plan.append(Segment(raw, [], [], False, 0))
+        elif not items:                   # 兼容旧的文件名/CDN 单图载荷:至多一张
+            legacy = remaining > 0
+            remaining -= int(legacy)
+            plan.append(Segment(raw, [], [], legacy, 0 if legacy else 1))
+        else:
+            images = [item for item in items if item.kind == "image"]
+            shown = images[:remaining]
+            remaining -= len(shown)
+            plan.append(Segment(
+                raw, shown, [item for item in items if item.kind == "file"],
+                False, len(images) - len(shown),
+            ))
+    body, quote = plan                    # MEDIA_FIELDS 固定是 (raw, quote_raw)
+    return body, quote
+
+
+def _resolved(
+    part: str, segment: Segment, settings: Settings,
+    rid="", send_time: int = 0, lid: int = 0, deadline: float | None = None,
+) -> list[str]:
+    """按分好的配额渲染一段,**按行返回**。正文和引用各调一次,不跨段去重。
+
+    返回行而不是拼好的字符串:调用方还要给引用逐行加前缀、还要汇总省略提示,拼完
+    再 `splitlines()` 拆回去,就是把刚握在手里的结构从自己的输出里重新解析一遍。
+
+    每张图独占一行 —— 前端 `.qq-msg-image` 本来就竖排,而换行让 URL 没被渲染成图时
+    (URL 挂了、前端旧版本)退化成一行一个链接,仍然可读。
+    """
+    if not part:
+        return []
+    if not settings.kodo_enabled:
+        rendered = [""] * len(segment.images)
+    elif segment.legacy:
+        url = media.resolve(segment.raw, settings, rid, send_time, lid)
+        return [_swap(part, url) if url else part]
+    else:
+        rendered = [
+            media.resolve_item(item, settings, rid, send_time, lid, deadline)
+            for item in segment.images
+        ]
+
+    # 取到的第一张换掉正文里的占位符,剩下的各占一行;没取到的留占位符文本。
+    head = _swap(part, rendered[0]) if rendered and rendered[0] else part
+    lines = [head, *(url or IMAGE_PLACEHOLDER for url in rendered[1:])]
+    if segment.files and head.strip() == FILE_PLACEHOLDER:
+        lines = lines[1:]                 # 上游合成的裸「[文件]」由文件名行顶掉
+    return [*lines, *(f"{FILE_PLACEHOLDER} {item.filename}".rstrip() for item in segment.files)]
 
 
 def message_body(msg: dict, settings: Settings) -> str:
@@ -288,18 +366,122 @@ def message_body(msg: dict, settings: Settings) -> str:
     """
     rid, send_time = msg.get("rid", ""), int(msg.get("send_time") or 0)
     lid = int(msg.get("lid") or 0)
-    text = _without_push_placeholder(msg.get("text") or "", msg.get("type") or "")
-    text = _resolved(text, msg.get("raw"), settings, rid, send_time, lid)
+    # 整条消息共享一个取图预算,而不是每张图各等一个 mars_image_client_wait ——
+    # 一条 11 张图的消息卡着的是本群的水位。
+    deadline = time.monotonic() + max(0.0, float(settings.mars_image_client_wait))
+    body_plan, quote_plan = media_plan(msg, settings)
+    lines = _resolved(
+        _without_push_placeholder(msg.get("text") or "", msg.get("type") or ""),
+        body_plan, settings, rid, send_time, lid, deadline,
+    )
     quote = _resolved(
-        msg.get("quote_text") or "", msg.get("quote_raw"), settings, rid, send_time, lid,
+        msg.get("quote_text") or "", quote_plan, settings, rid, send_time, lid, deadline,
     )
 
     # 引用的内容已经在正文里出现过就不再缀一遍(回复时把原话复述一遍很常见)。
     # 比对放在换完 URL 之后: 两张图都解析成同一个 URL 才是真的同一张图,
     # 在占位符阶段比就会把「图片回复图片」误判成重复,把引用整个丢掉。
-    if not quote or quote in text:
-        return text
-    return f"{text}\n{QUOTE_PREFIX}{quote}" if text else f"{QUOTE_PREFIX}{quote}"
+    body = "\n".join(lines).strip()
+    if (quoted := "\n".join(quote).strip()) and quoted not in body:
+        lines += [f"{QUOTE_PREFIX}{line}" for line in quote]
+    if omitted := body_plan.omitted + quote_plan.omitted:
+        lines.append(f"(另有 {omitted} 张未展示)")
+    return "\n".join(lines).strip()
+
+
+def _outbox_path(msg: dict, settings: Settings) -> Path:
+    rid, lid = int(msg.get("rid") or 0), int(msg.get("lid") or 0)
+    return settings.mars_outbox_dir / str(rid) / f"{int(msg.get('send_time') or 0)}-{lid}.json"
+
+
+def peek_outbox(msg: dict, settings: Settings) -> dict | None:
+    """这条消息的 Content 已经定过了吗?定过就返回那一份,没有返回 None。
+
+    只读。`/preview` 用它保证「下一轮会推什么」说的是实话 —— 重新算一遍的话,
+    对已经落过 outbox 的消息,preview 展示的会是新解析结果,推出去的却是冻结的旧值。
+    """
+    path = _outbox_path(msg, settings)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise MarsStateError(f"读取 mars outbox 失败 {path}: {e}") from e
+    try:
+        hook = json.loads(raw)
+        if not isinstance(hook, dict) or not isinstance(hook.get("message"), str):
+            raise TypeError("hook 格式无效")
+        return hook
+    except (json.JSONDecodeError, TypeError) as e:
+        raise MarsStateError(f"mars outbox 损坏 {path}: {e}") from e
+
+
+def frozen_hook(msg: dict, settings: Settings) -> dict:
+    """这条消息**下一轮会推**的 hook,只读:定过就用定过的那份,没定过才现算。
+
+    `/preview` 和 `outbox_hook` 必须给出同一个答案 —— 各写一遍的话,改了冻结规则
+    (比如哪些消息值得落盘)就会让 preview 悄悄开始说谎。
+    """
+    return peek_outbox(msg, settings) or to_hook(msg, settings)
+
+
+def outbox_hook(msg: dict, settings: Settings) -> dict:
+    """首次生成 hook 后原子落盘;任何投递重试都复用完全相同的 Content。
+
+    为什么必须落盘: mars 的去重 checksum 含正文,所以同一条源消息的 Content 必须在
+    它的**所有投递尝试**之间一致 —— 推成功但响应丢了、进程在 push 和落水位之间崩了,
+    下一轮都会重新解析媒体,而那时缓存里可能多了一张图,于是 mars 里多一行。
+
+    没有媒体的消息不落盘: 它的 Content 已经是本地库那一行的纯函数,重算必然相同,
+    为它付一次 fsync 只是白花钱。
+    """
+    if not any(media_payloads(msg)):
+        return to_hook(msg, settings)
+    if (existing := peek_outbox(msg, settings)) is not None:
+        return existing
+
+    path = _outbox_path(msg, settings)
+    hook = to_hook(msg, settings)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}-{time.time_ns()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("x", encoding="utf-8") as stream:
+            json.dump(hook, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        # hard link 是原子的且不会覆盖赢家:并发生成时只有第一个成为首次决定。
+        os.link(tmp, path)
+        return hook
+    except FileExistsError:
+        return peek_outbox(msg, settings) or hook
+    except OSError as e:
+        raise MarsStateError(f"写 mars outbox 失败 {path}: {e}") from e
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def prune_outbox(cursors: dict[str, Cursor], settings: Settings) -> None:
+    """丢掉水位已经越过的那些 —— 它们不会再被投递,冻结的 Content 也就没用了。
+
+    这是 outbox 的**唯一**回收路径。不删的话每条推过的消息都会永久留下一个小文件,
+    inode 先于字节撑爆。写在落水位之后:先删后落盘的话,崩溃就会让一条正在重试的
+    消息丢掉它的首次决定。
+
+    只传**本轮水位动过的群**。文件只会因为水位前进而失效,所以别的群扫了也是白扫 ——
+    `state.groups` 会累积每一个见过的群(含墓碑),几百个目录每轮 opendir 一遍,
+    其中绝大多数根本不存在。
+    """
+    for key, cursor in cursors.items():
+        for entry in (settings.mars_outbox_dir / key).glob("*-*.json"):
+            send_time, _, lid = entry.stem.partition("-")
+            try:
+                if Cursor(int(send_time), int(lid)) <= cursor:
+                    entry.unlink(missing_ok=True)
+            except (ValueError, OSError) as e:   # 清不掉只是留下垃圾,不该让本轮失败
+                log.warning("清理 mars outbox %s 失败: %s", entry, e)
 
 
 def to_hook(msg: dict, settings: Settings) -> dict:
@@ -381,12 +563,26 @@ def _ready_count(msgs: list[dict], settings: Settings) -> int:
     for i, m in enumerate(msgs):
         if now - int(m.get("send_time") or 0) >= wait:
             continue                       # 等够了,带着占位符推走
-        payloads = media_payloads(m)
         rid, lid = int(m.get("rid") or 0), int(m.get("lid") or 0)
-        for raw in payloads:
-            if media.pending(raw, settings):
-                media.ensure_local(raw, settings, rid, lid)
-        if any(media.pending(raw, settings) for raw in payloads):
+        # 和 message_body 用同一个预算和同一份配额,否则等的和排的会是不同的图。
+        deadline = time.monotonic() + max(0.0, float(settings.mars_image_client_wait))
+        # 先把这条能取的都取了再判断:某张取不到不该妨碍同一条里其余几张落地,
+        # 否则窗口到期时它们仍是占位符。
+        waiting = False
+        for segment in media_plan(m, settings):
+            if segment.legacy:
+                if media.pending(segment.raw, settings):
+                    media.ensure_local(segment.raw, settings, rid, lid)
+                    waiting = waiting or media.pending(segment.raw, settings)
+                continue
+            for item in segment.images:
+                # 定位一次就把结果一路传下去 —— 每次 glob 都要扫遍缓存目录
+                # (`_candidates` 的 docstring 记了实测数字),同一个问题不问三遍。
+                loc = media.locate_item(item, settings)
+                if not loc.hits:
+                    got = media.ensure_item_local(item, settings, rid, lid, deadline, loc)
+                    waiting = waiting or not got
+        if waiting:
             return i
     return len(msgs)
 
@@ -511,6 +707,8 @@ def reconcile_state(
             key = str(rid)
             target_group = state.groups.get(key)
             if target_group is None:
+                # 不设 media_cutover:切换点表示「这之前推过的是旧规则的 Content」,
+                # 而全新的群一条都没推过,给它钉一个只会平白挡住正常的 backfill。
                 state.groups[key] = GroupState(
                     cursor=initial_cursor(settings, rid), active=True, last_seen=now
                 )
@@ -528,6 +726,20 @@ def reconcile_state(
                 target_group.last_error = ""
                 target_group.fail_streak = 0
                 changed = True
+
+    # v3 首次启用多媒体规则时把当前水位钉成切换点:切换点之前的消息按旧规则推过,
+    # 用新规则重算 Content 会在 mars 里留下第二行,所以不许回放到那之前。
+    #
+    # 必须遍历**全部**群,不能只遍历 rids —— 升级那一刻不在白名单里(客户端没开、
+    # 群名改了)的群否则永远拿不到切换点,以后重新加回来就能无声地跨点回放。
+    #
+    # ⚠️ 有一段窗口关不上:升级前「已 push 成功但水位没来得及落盘」的消息位于切换点
+    # 之后,又还没有 outbox,重推时会用新规则重算。见 docs/multi-media-messages.md §8。
+    if state.version < 3:
+        for group in state.groups.values():
+            group.media_cutover = group.cursor
+        state.version = 3
+        changed = True
 
     state.refresh_shadow_cursor()
     if changed and persist:
@@ -605,9 +817,11 @@ async def _sync_once(
         result.held += held
         result.group_results[str(rid)]["held"] = held
 
-    hooks = await asyncio.to_thread(lambda: [to_hook(m, settings) for m in due])
+    # 先落 outbox 再发 HTTP:即使响应丢失或进程在更新水位前崩溃,下轮 Content 也不漂移。
+    hooks = await asyncio.to_thread(lambda: [outbox_hook(m, settings) for m in due])
     # 一个群推挂了就停在那儿,后面的留给下一轮 —— errors 同时就是「已中断的群」
     errors: dict[int, str] = {}
+    advanced: set[str] = set()           # 水位真动过的群,回收 outbox 只看它们
     if due:
         async with loop.http_client(settings.mars_timeout) as client:
             for msg, hook in zip(due, hooks, strict=True):
@@ -621,6 +835,7 @@ async def _sync_once(
                     log.warning("群 %s 推送中断于 LID=%s: %s", rid, msg["lid"], e)
                     continue
                 state.groups[str(rid)].cursor = Cursor(msg["send_time"], msg["lid"])
+                advanced.add(str(rid))
                 result.pushed += 1
                 result.group_results[str(rid)]["pushed"] += 1
 
@@ -664,6 +879,9 @@ async def _sync_once(
     if state.to_dict() != before:
         state.last_run = now
         save_state(state, settings)
+        # 落盘之后再回收:先删的话,崩在这中间就会让重试中的消息丢掉首次决定。
+        outbox_cursors: dict[str, Cursor] = {key: state.groups[key].cursor for key in advanced}
+        await asyncio.to_thread(prune_outbox, outbox_cursors, settings)
 
     result.cursor = state.cursor
     result.error = round_error
