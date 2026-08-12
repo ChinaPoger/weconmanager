@@ -107,6 +107,55 @@ def test_no_url_when_the_body_is_the_usual_asn1_blob():
     assert media.extract_url(None) == ""
 
 
+# ─── 链接卡片 ───────────────────────────────────────────────────────────
+
+def _pb_bytes(number: int, value: bytes) -> bytes:
+    return _varint(number << 3 | 2) + _varint(len(value)) + value
+
+
+def _link_card(thumbnail: bytes) -> bytes:
+    """线上那种链接卡片:`pb1 → pb105`,里面 1=链接 2=缩略图 3=标题 4=摘要。"""
+    card = b"".join([
+        _pb_bytes(1, b"http://grafana.prometheus.qiniu.io/d/Rs3AIHhvk/qdesk"),
+        _pb_bytes(2, thumbnail),
+        _pb_bytes(3, b"[Alerting] chat api error"),
+        _pb_bytes(4, b"wecom_group error: 21"),
+    ])
+    return _pb_field1(_pb_bytes(105, card))
+
+
+def test_a_link_card_is_not_an_image_message(settings):
+    """卡片缩略图不是这条消息的附件 —— 认成图就会白等一个窗口再空触发客户端。
+
+    缩略图文件名(这里是 S3 上那张 png)会被 extract_filename 抠出来,于是
+    `known` 为真、`hits` 为空,`pending` 就永远是 True。实测这类消息从来没有
+    本地缓存命中,所以整条按「认不出图」处理。
+    """
+    card = _link_card(b"https://s3.ap-southeast-1.amazonaws.com/g/hluxUy4LWp4.png")
+
+    assert media.extract_filename(card).endswith(".png")   # 抠得出来,但不是附件
+    located = media.locate(card, settings)
+    assert not located.known
+    assert located.md5 == "" and located.filename == "" and located.hits == []
+    assert media.pending(card, settings) is False
+    # 卡片缩略图不该被当成这条消息的图同步出去
+    assert media.resolve(card, settings) == ""
+
+
+def test_a_real_image_body_is_still_located(settings, cache):
+    """卡片那条短路不能顺手把真图也判死 —— 真图正文里没有 pb105。
+
+    要 `cache` 夹具:真图会一路走到 `_candidates` 去 glob 缓存目录,不打桩的话
+    `_images_root()` 会去找真实的企微 profile,CI 上没装企微就直接 SystemExit。
+    卡片那条用例不需要,因为它在 glob 之前就短路了。
+    """
+    name = "企业微信截图_4b36e11f-0a5d-4901-aa7c-a78f595e1a03.png".encode()
+    blob = b"\x12\x34" + _pb_str(name) + b"\x99\x88"
+
+    assert media._is_link_card(blob) is False
+    assert media.locate(blob, settings).filename == name.decode()
+
+
 def test_truncated_body_does_not_blow_up():
     assert media.extract_url(b"\x0a\xff") == ""
     assert media.extract_url(b"\x0a\x50" + CDN[:10]) == ""    # 长度超出实际字节

@@ -485,8 +485,39 @@ class Located:
         return ""
 
 
+# 链接卡片的载荷埋在 `pb1 → pb105`:1=跳转链接 2=缩略图 URL 3=标题 4=摘要。
+_LINK_CARD_FIELD = 105
+
+
+def _is_link_card(content) -> bool:
+    """这条是链接卡片,不是图片消息。
+
+    卡片正文里能搜到一个 `.png`(Grafana 告警卡是 S3 上的截图,别的卡是
+    `icon.png`、`merge_excel.png` 之类),`extract_filename` 会把它当成附件名,
+    于是整条消息被判成「有图还没到」:压住本群同步一整个 `mars_image_wait`,
+    再触发一次注定落空的企微客户端切会话 —— 卡片缩略图不进本地图片缓存,正文里
+    也没有 BigCDN 票据(实测 ct=4 全都没有,0/173)。
+
+    整条按「认不出图」处理不会误伤真图:实测 400 条 ct=4 里 4 条是卡片,**没有
+    一条有本地缓存命中**,而那 60 条有命中的全是真截图、一条卡片都不是。
+
+    只认这一个位置、不全文搜 —— 理由同 `extract_url`。
+    """
+    if not content:
+        return False
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+    inner = _pb_field1(content)
+    if not inner:
+        return False
+    from .messages import _pb_fields
+    return _LINK_CARD_FIELD in _pb_fields(inner)
+
+
 def locate(content, settings: Settings | None = None) -> Located:
     """正文 → 这张图的去向。一次解析、一次 glob,`pending` 和 `resolve` 共用。"""
+    if _is_link_card(content):
+        return Located("", "", "", [], False)
     md5 = extract_media_md5(content)
     filename = extract_filename(content)
     hits, by_md5 = _candidates(filename, md5, settings)
