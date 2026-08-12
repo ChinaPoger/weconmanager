@@ -137,6 +137,59 @@ def test_download_builds_hd_request_and_validates_the_response(tmp_path, monkeyp
     assert b"downpicformat" not in request
 
 
+@pytest.mark.parametrize("refusal", [b"-5103017", b"-5103059"])
+def test_a_refused_hd_copy_is_retried_as_a_full_size_original(
+    tmp_path, monkeypatch, refusal
+):
+    """只有原件、没有 HD 分身的图:filetype=1 被拒,filetype=2 才有数据。
+
+    线上这类图占「真的会走到 TCP」那批的一成多,退回客户端触发的代价远高于多一次
+    往返。拒绝的 retcode 实测不止一个,所以重试不挑 retcode —— 参数化的这两个都
+    是真实抓到的值,任何一个都得能救回来。
+    """
+    data = b"\x89PNG\r\n\x1a\n" + b"image" * 20
+    settings = _settings(tmp_path)
+    _write_config(settings)
+    auth = media_tcp._frame(b"R" * 20, [(b"retcode", b"0")])
+    refused = _Socket(auth + media_tcp._frame(b"I" * 20, [(b"retcode", refusal)]))
+    served = _Socket(auth + media_tcp._frame(
+        b"I" * 20, [(b"retcode", b"0"), (b"filedata", _encrypted(data))]))
+    sockets = iter([refused, served])
+    monkeypatch.setattr(
+        media_tcp.socket, "create_connection", lambda *_a, **_kw: next(sockets))
+
+    downloaded, ext = media_tcp.download(_content(data), settings)
+
+    assert downloaded == data
+    assert ext == ".png"
+    first = dict(media_tcp._parse_field_list(media_tcp._split_frames(refused.sent)[1]))
+    second = dict(media_tcp._parse_field_list(media_tcp._split_frames(served.sent)[1]))
+    assert first[b"filetype"] == media_tcp.FILETYPE_HD
+    assert second[b"filetype"] == media_tcp.FILETYPE_FULL
+    # 重试要盯着同一个 fileid,并且始终不带 downpicformat(带上服务端就不回包)
+    assert second[b"fileid"] == first[b"fileid"] == b"signed-file-id"
+    assert b"downpicformat" not in second
+
+
+def test_a_refused_original_gives_up_instead_of_looping(tmp_path, monkeypatch):
+    """原件也被拒就认输 —— 只补一次 filetype,不无限换着要。"""
+    settings = _settings(tmp_path)
+    _write_config(settings)
+    auth = media_tcp._frame(b"R" * 20, [(b"retcode", b"0")])
+    refused = media_tcp._frame(b"I" * 20, [(b"retcode", b"-5103017")])
+    opened = []
+
+    def _connect(*_args, **_kwargs):
+        opened.append(1)
+        return _Socket(auth + refused)
+
+    monkeypatch.setattr(media_tcp.socket, "create_connection", _connect)
+
+    with pytest.raises(media_tcp.MediaTCPError, match="下载失败"):
+        media_tcp.download(_content(b"image"), settings)
+    assert len(opened) == 2
+
+
 def test_download_rejects_a_nonzero_retcode(tmp_path, monkeypatch):
     settings = _settings(tmp_path)
     _write_config(settings)
