@@ -266,6 +266,8 @@ def test_media_is_skipped_entirely_when_kodo_is_off(settings, monkeypatch):
 def waiting(settings, monkeypatch):
     """把 media.pending 打桩:raw 是 b"late" 的那张图还没落到本地。"""
     monkeypatch.setattr(mars_sync.media, "pending", lambda raw, s: raw == b"late")
+    # 等图规划现在会主动尝试拉取;这里仍要整体隔离真实企微 profile,CI 没有本地缓存。
+    monkeypatch.setattr(mars_sync.media, "ensure_local", lambda raw, s, rid, lid: "")
     monkeypatch.setattr(mars_sync.media, "resolve", lambda raw, s, *a: "")
     monkeypatch.setattr(mars_sync.time, "time", lambda: 1000.0)
     return settings.model_copy(update={**KODO, "mars_image_wait": 60})
