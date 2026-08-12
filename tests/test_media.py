@@ -142,8 +142,13 @@ def test_a_link_card_is_not_an_image_message(settings):
     assert media.resolve(card, settings) == ""
 
 
-def test_a_real_image_body_is_still_located(settings):
-    """卡片那条短路不能顺手把真图也判死 —— 真图正文里没有 pb105。"""
+def test_a_real_image_body_is_still_located(settings, cache):
+    """卡片那条短路不能顺手把真图也判死 —— 真图正文里没有 pb105。
+
+    要 `cache` 夹具:真图会一路走到 `_candidates` 去 glob 缓存目录,不打桩的话
+    `_images_root()` 会去找真实的企微 profile,CI 上没装企微就直接 SystemExit。
+    卡片那条用例不需要,因为它在 glob 之前就短路了。
+    """
     name = "企业微信截图_4b36e11f-0a5d-4901-aa7c-a78f595e1a03.png".encode()
     blob = b"\x12\x34" + _pb_str(name) + b"\x99\x88"
 
