@@ -176,21 +176,21 @@ const pattern = typeInfo.value.type === '图片' ? HTTP_URL : IMAGE_URL
 
 处置(三选一,本设计选第一条):
 
-1. **上传前统一转码**成 png/jpeg,或至少保证后缀与实际字节一致且在白名单内;
+1. **上传原图,由 Kodo Dora 实时转成 JPEG**;
 2. 扩 mars 的 `IMAGE_URL` 白名单(要改 mars,和「零改动」矛盾);
 3. 接受 HEIC/未知格式不显示,并记日志。
 
-实现补充(`media._transcoded`):**转 JPEG,不转 PNG**。落到这条路上的几乎全是相机
-原图,一张 4032×3024 的 HEIC 转 PNG 是几十 MB —— 这张图还要过 kodo 和 mars 前端。
-带 alpha 的转 PNG(JPEG 没有 alpha)。扩展名只读文件头就能定,真正的解码推迟到
-`_put` 确认对象不存在之后。
+实现补充(`media._display_url`):原始 HEIC/`.bin` 直接上传到 Kodo,不在本机解码；返回
+URL 时追加七牛 `imageView2/1/format/jpg`。七牛文档要求 `format` 必须和 `mode` 一起使用，
+该 URL 首次访问时由 Dora 生成 JPEG,并由 CDN 缓存。这样 CPU、内存和临时文件都不再承担
+HEIC 转码，重试时源对象和处理 URL 也保持稳定。
 
-⚠️ Pillow 的解码异常**不都是 `OSError`**:`DecompressionBombError` 直接继承
-`Exception`。漏网的话会一路抛穿 `message_body`,而水位不动 —— 同一条消息每轮再炸
-一次。所以转码那两处一律收口成 `MediaError`,让调用方退回占位符。
+对象 key 使用 `.jpg` 作为**展示对象的扩展名**，但 multipart 文件名保留原始文件名，
+以便 Kodo 按实际输入格式识别 HEIC。Mars 只收到带 `.jpg` 的 URL，因此仍能命中
+`IMAGE_URL` 白名单；已支持的格式不追加处理参数，也不产生实时处理费用。
 
-所以 §0 那句「mars 侧不需要任何改动」要收窄成:**在 png/jpeg/gif/webp/bmp 范围内
-不需要改动**。这一点是本文最初写错、经复核修正的。
+因此，Mars 侧仍不需要改动：正常格式直接使用原 URL，HEIC/`.bin` 使用带 `.jpg`
+路径后缀和 `imageView2/1/format/jpg` 的稳定展示 URL。
 
 ---
 
@@ -331,7 +331,7 @@ url3
 |---|---|
 | **重试间 Content 漂移 → mars 多一行** | **第 0 期 outbox**(§2)。这是最高优先级,且现有单图代码已经有这个洞 |
 | Phase 1 改变已推消息的 Content | 部署切换水位 + 禁止跨点回放(§8) |
-| HEIC / `.bin` 在 mars 不渲染 | 上传前转码或跳过(§3);当前样本未命中,但结构上可达 |
+| HEIC / `.bin` 在 mars 不渲染 | Kodo Dora 实时转 JPEG,并使用 `.jpg` 展示 URL(§3) |
 | 11 张图卡住一个群 | §5.4 的上限 + 整条预算 |
 | 合并转发里的链接被渲染成碎图 | 不把这类消息报成 `messageType='图片'`(§5.3) |
 | 递归把 opaque 字节误认成嵌套 message | 收紧递归条件 + 半白名单(§5.1) |
@@ -379,7 +379,7 @@ url3
 | **0** | **outbox**:落盘首次决定的 Content,重试复用 | §2 的前提。**必须先做**,否则后面每一期都在放大重复风险 |
 | **1** | `collect` + `messages.py` 两个门 + 附件文本化 + 仍只用第一张 | 46 条受益 |
 | **2** | 多图排版 + 上限 + 预算 | 51 条受益 |
-| **3** | 格式兜底(HEIC/`.bin` 转码或跳过) | §3 的缺口 |
+| **3** | 格式兜底(HEIC/`.bin` 由 Kodo 实时转 JPEG) | §3 的缺口，已由 Kodo Dora 承担 |
 
 「装饰过滤」不单独成期:按 §5.2 的新定义,没有票据就不会产生 image 项,也就
 不会 pending —— 它被第 1 期自然吸收了。(前一版把它列成独立一期是重复计算。)

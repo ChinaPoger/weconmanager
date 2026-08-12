@@ -34,7 +34,6 @@
 不配 kodo 就退回 `[图片]` 占位符。
 """
 import base64
-import contextlib
 import functools
 import glob
 import hashlib
@@ -81,21 +80,6 @@ _MARS_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
 
 class MediaError(RuntimeError):
     """取图或上传失败(可预期,调用方退回占位符即可)。"""
-
-
-@functools.cache
-def _pillow():
-    """`Image.open`,首次用到时才装。
-
-    Pillow + pillow-heif 加起来 30 ms 的 import,而它们只在**白名单外**的格式上用得着。
-    这个模块现在被 messages 顶层导入,每个入口(服务、CLI)都会付这笔钱 —— 不该为一条
-    偶发路径拖慢所有启动。
-    """
-    from PIL import Image
-    from pillow_heif import register_heif_opener  # type: ignore[import-untyped]
-
-    register_heif_opener()               # iPhone 原图是 HEIC,Pillow 本体不认
-    return Image.open
 
 
 @dataclass(frozen=True)
@@ -481,13 +465,20 @@ def upload_token(settings: Settings, key: str, expires: int = 3600) -> str:
 
 
 def object_url(settings: Settings, key: str) -> str:
-    """key → 公网 URL。
-
-    现在的 key 全是 ASCII,`quote` 基本是个恒等变换,留着是因为 `kodo_prefix` 可配,
-    不想让一个带空格/中文的前缀拼出个不合法的 URL。注意只编码这一处 —— uploadToken
-    的 scope 和直传表单的 key 都要用**原始** key,编码过的会签出一个对不上的 token。
-    """
+    """key → 公网源文件 URL。"""
     return f"{settings.kodo_domain.rstrip('/')}/{urllib.parse.quote(key)}"
+
+
+def _display_url(source_url: str, needs_conversion: bool) -> str:
+    """返回 Mars 可渲染的 URL,让 Kodo Dora 在访问时完成格式转换。
+
+    imageView2 的 ``format`` 必须和 ``mode`` 一起使用。这里固定输出 jpg,让 HEIC
+    和无扩展名图片也能被 Mars 的图片白名单识别。对 Mars 已支持的格式不加处理参数,
+    避免额外的实时处理费用。
+    """
+    if not needs_conversion:
+        return source_url
+    return f"{source_url}?imageView2/1/format/jpg"
 
 
 def _exists(url: str, timeout: int) -> bool:
@@ -551,7 +542,7 @@ def _require_kodo(settings: Settings) -> None:
 
 
 def _put(open_stream, name: str, digest: str, ext: str,
-         settings: Settings, rid, send_time: int) -> str:
+         settings: Settings, rid, send_time: int, *, needs_conversion: bool = False) -> str:
     """算 key → 已存在就复用 → 否则直传。两条上传路径唯一的差别只是字节从哪来。
 
     `open_stream` 是个无参函数而不是现成的流: 命中 `_exists` 时就不必先把文件打开
@@ -559,59 +550,11 @@ def _put(open_stream, name: str, digest: str, ext: str,
     """
     _require_kodo(settings)
     key = _object_key(rid, send_time, digest, ext, settings)
-    url = object_url(settings, key)
-    if _exists(url, settings.kodo_timeout):
-        return url
-    with open_stream() as stream:
-        _post_form(stream, name, key, upload_token(settings, key), settings.kodo_timeout)
-    return url
-
-
-def _transcoded(source: str | bytes, ext: str) -> tuple[str, Callable[[], io.BytesIO]] | None:
-    """白名单外的格式(HEIC、认不出魔数的 `.bin`)→ `(新扩展名, 取字节的函数)`。
-
-    白名单内返回 None,一个字节都不动。
-
-    **转 JPEG 而不是 PNG**: 落到这条路上的几乎全是相机原图,一张 4032x3024 的 HEIC
-    转 PNG 是几十 MB,转 JPEG 是 2 MB 上下 —— 这张图接下来还要过 kodo 和 mars 前端。
-    带透明通道的转 PNG,JPEG 没有 alpha。
-
-    扩展名只读文件头就能定,真正的解码留给返回的函数:`_put` 命中已上传的对象时
-    就完全不必解这张图。
-
-    Pillow 的解码异常**不都是 OSError**(`DecompressionBombError` 直接继承 Exception),
-    漏网的话会一路抛穿 message_body,而水位不动 —— 同一条消息每轮都再炸一次。
-    所以这里一律收口成 MediaError,让调用方退回占位符。
-    """
-    if ext in _MARS_IMAGE_EXTS:
-        return None
-    image_open = _pillow()
-
-    @contextlib.contextmanager
-    def opened():
-        """Pillow 的解码异常一律收口成 MediaError,让调用方退回占位符。"""
-        try:
-            with image_open(source if isinstance(source, str) else io.BytesIO(source)) as image:
-                yield image
-        except MediaError:
-            raise
-        except Exception as e:
-            raise MediaError(f"无法把 {ext or '.bin'} 转成 mars 支持的图片: {e}") from e
-
-    with opened() as probe:              # Image.open 是惰性的,这里只读到文件头
-        alpha = probe.mode in ("RGBA", "LA", "PA") or "transparency" in probe.info
-
-    def encode() -> io.BytesIO:
-        out = io.BytesIO()
-        with opened() as image:
-            if alpha:
-                image.convert("RGBA").save(out, format="PNG")
-            else:
-                image.convert("RGB").save(out, format="JPEG", quality=85)
-        out.seek(0)
-        return out
-
-    return (".png" if alpha else ".jpg"), encode
+    source_url = object_url(settings, key)
+    if not _exists(source_url, settings.kodo_timeout):
+        with open_stream() as stream:
+            _post_form(stream, name, key, upload_token(settings, key), settings.kodo_timeout)
+    return _display_url(source_url, needs_conversion)
 
 
 def upload(path: str, settings: Settings, rid="", send_time: int = 0, md5: str = "") -> str:
@@ -621,16 +564,18 @@ def upload(path: str, settings: Settings, rid="", send_time: int = 0, md5: str =
     这样本地只缓存到渲染件时,key 仍然认的是这张图的身份,不会一图两对象。
     """
     _require_kodo(settings)          # 先挡住,免得白读一遍文件算 md5
-    ext = os.path.splitext(path)[1].lower() or ".bin"
+    source_ext = os.path.splitext(path)[1].lower() or ".bin"
+    needs_conversion = source_ext not in _MARS_IMAGE_EXTS
+    ext = source_ext if not needs_conversion else ".jpg"
     name = os.path.basename(path)
 
     def open_stream() -> io.IOBase:
         return open(path, "rb")
     try:
-        if transcoded := _transcoded(path, ext):
-            ext, open_stream = transcoded
-            name = f"image{ext}"
-        return _put(open_stream, name, md5 or file_md5(path), ext, settings, rid, send_time)
+        return _put(
+            open_stream, name, md5 or file_md5(path), ext, settings, rid, send_time,
+            needs_conversion=needs_conversion,
+        )
     except OSError as e:
         raise MediaError(f"读取待上传文件失败: {e}") from e
 
@@ -642,14 +587,17 @@ def upload_bytes(data: bytes, ext: str, settings: Settings, rid="", send_time: i
     它在这里只当区分位,不承担「认出这是同一张图」的职责。转码只换扩展名,
     区分位仍是**原始字节**的 md5,所以同一张图重推落在同一个 key 上。
     """
-    ext = ext.lower()
+    source_ext = ext.lower()
+    needs_conversion = source_ext not in _MARS_IMAGE_EXTS
+    ext = source_ext if not needs_conversion else ".jpg"
     digest = hashlib.md5(data).hexdigest()
-    if transcoded := _transcoded(data, ext):
-        ext, open_stream = transcoded
-    else:
-        def open_stream() -> io.BytesIO:
-            return io.BytesIO(data)
-    return _put(open_stream, f"image{ext}", digest, ext, settings, rid, send_time)
+
+    def open_stream() -> io.BytesIO:
+        return io.BytesIO(data)
+    return _put(
+        open_stream, f"image{source_ext}", digest, ext, settings, rid, send_time,
+        needs_conversion=needs_conversion,
+    )
 
 
 # content-type → 扩展名。不用 mimetypes.guess_extension: 它对 image/jpeg 的

@@ -10,7 +10,6 @@ import os
 import time
 
 import pytest
-from PIL import Image
 
 from wecom_svr import media, uilock
 from wecom_svr.settings import Settings
@@ -474,35 +473,13 @@ def test_already_uploaded_is_not_sent_again(tmp_path, settings, monkeypatch):
     assert media.upload(str(f), settings).endswith(".png")
 
 
-def test_unknown_extension_is_transcoded_to_jpeg_before_upload(tmp_path, settings, posted):
+def test_unknown_extension_uses_kodo_realtime_conversion(tmp_path, settings, posted):
     image = tmp_path / "camera.bin"
-    Image.new("RGB", (2, 2), "red").save(image, format="PNG")
+    image.write_bytes(b"source bytes")
     url = media.upload(str(image), settings, rid=1, send_time=TS, md5="a" * 32)
 
-    assert url.endswith("-aaaaaaaa.jpg")
+    assert url.endswith("-aaaaaaaa.jpg?imageView2/1/format/jpg")
     assert posted[0].endswith("-aaaaaaaa.jpg")
-
-
-def test_transparency_survives_as_png(tmp_path, settings, posted):
-    image = tmp_path / "sticker.bin"
-    Image.new("RGBA", (2, 2), (255, 0, 0, 128)).save(image, format="PNG")
-    assert media.upload(str(image), settings, rid=1, send_time=TS, md5="a" * 32).endswith(".png")
-
-
-def test_undecodable_bytes_fall_back_to_the_placeholder(tmp_path, settings):
-    blob = tmp_path / "attachment.bin"
-    blob.write_bytes(b"PK\x03\x04 not an image")
-    with pytest.raises(media.MediaError):
-        media.upload(str(blob), settings, rid=1, send_time=TS, md5="a" * 32)
-
-
-def test_a_decompression_bomb_does_not_escape_as_a_bare_exception(tmp_path, settings, monkeypatch):
-    """Pillow 的 DecompressionBombError 不是 OSError —— 漏出去会每轮炸同一条消息。"""
-    image = tmp_path / "bomb.bin"
-    Image.new("RGB", (2, 2), "red").save(image, format="PNG")
-    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1)
-    with pytest.raises(media.MediaError):
-        media.upload(str(image), settings, rid=1, send_time=TS, md5="a" * 32)
 
 
 def test_upload_without_config_is_refused(tmp_path):
