@@ -17,9 +17,6 @@ dependencies = [
     "httpx>=0.27",
     # 群消息同步要自己增量解密 Info.db(wxwork_crypto 的后端之一)
     "cryptography>=42.0",
-    # mars 前端不识别 HEIC/.bin;图片上传前统一规范成可渲染格式。
-    "Pillow>=10.0",
-    "pillow-heif>=0.18",
 ]
 
 [project.optional-dependencies]
