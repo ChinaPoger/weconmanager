@@ -80,6 +80,19 @@ def _pb(field: int, payload: bytes) -> bytes:
 LINK_PREVIEW = _pb(3045, b"meta") + _pb(1042, b"GitHub Issue #147")
 
 
+def test_type_123_image_with_caption_keeps_both_parts():
+    """企微把图片加随图文字也标成卡片;不能只留下图片文件名。"""
+    content = _pb(1, b"WeChatWorkScreenshot_deadbeef.png") + _pb(1, b"aaaa")
+
+    assert messages._rich_image_text(123, content) == "[图片]\naaaa"
+    assert messages._render(123, content, "卡片") == "[图片]\naaaa"
+
+
+def test_regular_type_123_card_is_not_mistaken_for_an_image():
+    content = _pb(1, "普通应用卡片".encode())
+    assert messages._rich_image_text(123, content) == ""
+
+
 def _summary(extracontent) -> str:
     """extracontent → 引用摘要。两步是因为载荷要留给引用图用,只扫一次。"""
     return messages._quote_summary(messages._quote_payload(extracontent))
