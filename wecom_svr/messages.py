@@ -91,19 +91,20 @@ class Cursor:
 class Batch:
     """一次取数的结果。
 
-    `cursor` 是**扫描到的**最后一行(含被过滤掉的系统消息),不是 messages 的最后
-    一条 —— 全批都被过滤时,水位得靠它才能往前走。
+    `scan_end` 是各群**扫描到的**最后一行(含被过滤掉的系统消息),不是 messages
+    的最后一条 —— 某群整批都被过滤时,它的水位得靠这里才能往前走。
     """
 
     messages: list[dict] = field(default_factory=list)
-    cursor: Cursor = field(default_factory=Cursor)
-    scanned: int = 0     # SQL 实际返回的行数(过滤前)
+    scan_end: dict[int, Cursor] = field(default_factory=dict)
+    scan_counts: dict[int, int] = field(default_factory=dict)
+    selected_rids: list[int] = field(default_factory=list)
+    next_offset: int = 0  # 下轮群配额从哪里开始,避免群数大于批大小时饿死尾部群
 
-    def __len__(self) -> int:
-        return len(self.messages)
-
-    def __iter__(self):
-        return iter(self.messages)
+    @property
+    def scanned(self) -> int:
+        """SQL 实际返回的行数(过滤前)。就是各群扫描数之和,不另存一份。"""
+        return sum(self.scan_counts.values())
 
 
 # ─── 上游 decrypt/ 模块的按需加载 ────────────────────────────────────────
@@ -358,6 +359,18 @@ def _render(content_type: int, content, label: str) -> str:
     return _vendor().export.render(content_type, content) or ""
 
 
+#: 一条消息里可能挂着图的原始载荷字段。产出在 `fetch_since`,消费在
+#: `mars_sync.message_body`(解析成 URL)和 `_ready_count`(判断还等不等得到)。
+#: 集中在这里,是因为「哪些字段可能有图」多一个就得同时改这几处,漏一处都是静默的:
+#: 漏了解析那侧图就永远出不来,漏了判断那侧消息就永远不等。
+MEDIA_FIELDS = ("raw", "quote_raw")
+
+
+def media_payloads(msg: dict) -> list:
+    """这条消息里所有可能藏着图的原始正文。"""
+    return [msg.get(f) for f in MEDIA_FIELDS]
+
+
 def _pb_fields(buf: bytes) -> dict[int, list[bytes]]:
     """扫 protobuf 顶层字段 → {字段号: [长度分隔型的载荷]}。
 
@@ -478,7 +491,9 @@ def resolve_groups(selectors: Iterable[str]) -> tuple[list[dict], list[str]]:
 
     白名单写群名更好读,但群名会被改;两种都收,让调用方自己权衡。
     """
-    groups = list_groups()
+    # 同步白名单不能受“挑选界面最多 200 条”的限制。一个长期不活跃的群仍然
+    # 必须能按名字/RID 命中。
+    groups = list_groups(limit=None)
     by_rid = {str(g["rid"]): g for g in groups}
     by_name = {g["name"]: g for g in groups}
 
@@ -499,60 +514,99 @@ def resolve_groups(selectors: Iterable[str]) -> tuple[list[dict], list[str]]:
     return hit, missing
 
 
-def latest_cursor() -> Cursor:
-    """当前最新一条消息的位置 —— 首次同步默认从这里往后,不倒灌历史。"""
-    rows = _rows("SELECT send_time, LID FROM MESSAGE ORDER BY send_time DESC, LID DESC LIMIT 1")
+def latest_cursor(rid: int | None = None) -> Cursor:
+    """当前最新一条消息的位置;给了 RID 就只看该群。"""
+    sql = "SELECT send_time, LID FROM MESSAGE"
+    params: tuple = ()
+    if rid is not None:
+        sql += " WHERE conv_id = ?"
+        params = (int(rid),)
+    sql += " ORDER BY send_time DESC, LID DESC LIMIT 1"
+    rows = _rows(sql, params)
     if not rows:
         return Cursor()
     return Cursor(int(rows[0]["send_time"] or 0), int(rows[0]["LID"] or 0))
 
 
+MAX_GROUPS_PER_QUERY = 400  # sqlite 默认 compound SELECT 上限是 500
+
+
+def _quotas(rids: list[int], limit: int, offset: int) -> tuple[list[tuple[int, int]], int]:
+    """给群分本轮额度,并返回下轮轮转起点。
+
+    群数超过 limit 时只能让其中 limit 个群各拿一条;轮转保证其余群在后续轮次
+    一定被选中。群数不超过 limit 时每群至少一条,余数也从 offset 开始分。
+    """
+    if not rids or limit <= 0:
+        return [], 0
+    n = len(rids)
+    start = offset % n
+    ordered = rids[start:] + rids[:start]
+    group_count = min(n, limit, MAX_GROUPS_PER_QUERY)
+    active = ordered[:group_count]
+    base, extra = divmod(limit, group_count)
+    selected = [(rid, base + (1 if i < extra else 0)) for i, rid in enumerate(active)]
+    if group_count < n:
+        return selected, (start + group_count) % n
+    return selected, (start + extra) % n if extra else start
+
+
 def fetch_since(
-    cursor: Cursor,
-    rids: Iterable[int] | None = None,
+    cursors: dict[int, Cursor],
     limit: int = 500,
     include_skipped: bool = False,
+    offset: int = 0,
 ) -> "Batch":
-    """取水位之后的群消息,按 (send_time, LID) 升序。
+    """按每群水位取连续前缀,全局仍按 (send_time, LID) 升序返回。
 
-    rids 为 None 表示所有群 —— 只在预览时这么用,同步一律带白名单。
-
-    返回 Batch 而不是裸 list,是因为 LIMIT 作用在过滤之前: 一批全是系统消息时
-    messages 会是空的,但水位必须照样越过它们,否则调用方会永远卡在同一批上。
+    每个 UNION 分支有自己的 LIMIT,因此深积压群不能吃光整批。LIMIT 仍然在
+    系统消息过滤之前生效,所以 `scan_end` 必须按群记录过滤前的扫描终点。
     """
     v = _vendor()
     senders = _load_senders()
     names = {rid: s["name"] for rid, s in senders.items() if s["name"]}
 
-    where = ["c.conversationtype = ?", "(m.send_time > ? OR (m.send_time = ? AND m.LID > ?))"]
-    params: list = [GROUP_CONV_TYPE, cursor.send_time, cursor.send_time, cursor.lid]
-
-    rid_list = [int(r) for r in rids] if rids is not None else None
-    if rid_list is not None:
-        if not rid_list:
-            return Batch(cursor=cursor)
-        where.append(f"m.conv_id IN ({','.join('?' * len(rid_list))})")
-        params += rid_list
+    rid_list = [int(r) for r in cursors]
+    selected, next_offset = _quotas(rid_list, int(limit), int(offset))
+    if not selected:
+        return Batch(next_offset=next_offset)
 
     # content 必须 cast 成 blob: 列声明是 TEXT,sqlite 会把能过 UTF-8 的行当 str
     # 返回,而正文是 protobuf 混排二进制,再 encode 一次就毁了(图片文件名就丢在
     # 这一步)。extracontent 同理。
+    branches: list[str] = []
+    params: list = []
+    for rid, quota in selected:
+        cursor = cursors[rid]
+        branches.append(
+            "SELECT * FROM ("
+            " SELECT LID, conv_id, sender_id, content_type, send_time, content, extracontent"
+            " FROM MESSAGE WHERE conv_id = ?"
+            " AND (send_time > ? OR (send_time = ? AND LID > ?))"
+            " ORDER BY send_time, LID LIMIT ?"
+            ")"
+        )
+        params.extend((rid, cursor.send_time, cursor.send_time, cursor.lid, quota))
+
     sql = (
         "SELECT m.LID, m.conv_id, m.sender_id, m.content_type, m.send_time,"
         "       CAST(m.content AS BLOB) AS content,"
         "       CAST(m.extracontent AS BLOB) AS extracontent, c.name AS conv_name"
-        " FROM MESSAGE m JOIN CONVERSATION c ON c.RID = m.conv_id"
-        f" WHERE {' AND '.join(where)}"
-        " ORDER BY m.send_time, m.LID LIMIT ?"
+        f" FROM ({' UNION ALL '.join(branches)}) m"
+        " JOIN CONVERSATION c ON c.RID = m.conv_id AND c.conversationtype = ?"
+        " ORDER BY m.send_time, m.LID"
     )
-    params.append(int(limit))
+    params.append(GROUP_CONV_TYPE)
 
     rows = _rows(sql, params)
 
     out: list[dict] = []
-    end = cursor
+    scan_end: dict[int, Cursor] = {}
+    scan_counts: dict[int, int] = {}
     for r in rows:
-        end = Cursor(int(r["send_time"] or 0), int(r["LID"]))
+        rid = int(r["conv_id"])
+        scan_end[rid] = Cursor(int(r["send_time"] or 0), int(r["LID"]))
+        scan_counts[rid] = scan_counts.get(rid, 0) + 1
         ctype = r["content_type"]
         label = _type_name(ctype)
         text = _render(ctype, r["content"], label).strip()
@@ -591,4 +645,26 @@ def fetch_since(
             # 和本条消息自己的图走同一套解析
             "quote_raw": quote_payload if quote_text == IMAGE_PLACEHOLDER else None,
         })
-    return Batch(messages=out, cursor=end, scanned=len(rows))
+    return Batch(
+        messages=out,
+        scan_end=scan_end,
+        scan_counts=scan_counts,
+        selected_rids=[rid for rid, _quota in selected],
+        next_offset=next_offset,
+    )
+
+
+def count_since(cursors: dict[int, Cursor]) -> dict[int, int]:
+    """按群估算当前积压条数(过滤前),供状态页使用。"""
+    if not cursors:
+        return {}
+    clauses: list[str] = []
+    params: list = []
+    for rid, cursor in cursors.items():
+        clauses.append("(conv_id = ? AND (send_time > ? OR (send_time = ? AND LID > ?)))")
+        params.extend((int(rid), cursor.send_time, cursor.send_time, cursor.lid))
+    rows = _rows(
+        f"SELECT conv_id, COUNT(*) AS n FROM MESSAGE WHERE {' OR '.join(clauses)} GROUP BY conv_id",
+        params,
+    )
+    return {int(r["conv_id"]): int(r["n"]) for r in rows}

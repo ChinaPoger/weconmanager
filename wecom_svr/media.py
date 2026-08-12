@@ -6,13 +6,28 @@
 企微清缓存或换机器就没了。
 
 两段:
-  - **定位**: 消息正文里带着原始文件名,缓存路径是
-    `Caches/Images/<年-月>/<md5>[_HD]/<文件名>`。按文件名 glob 两级目录即可
-    (实测 8537 个目录、0.1s),不用去解正文里那段 ASN.1 拿 md5。
-    同名会命中缩略图和 `_HD` 两份,取大的那份。
+  - **定位**: 缓存路径是 `Caches/Images/<年-月>/<md5>[_HD|_THUMB]/<文件名>`,
+    **目录名就是发送方原图的 md5**,而那个 md5 在消息正文的 ASN.1 里就有
+    (`extract_media_md5`,实测 57/61 与目录名逐字相符)。所以定位是按 md5 直奔
+    目录,不靠文件名 —— 文件名会重(实测 `pic.jpg` 一个名字对着 8 张不同的图)。
+    没有文件名的那类(表情包、转发进来的图)正文开头直接放着企微 CDN 直链,
+    走 `extract_url` 拉回来 —— 但**不能把那个链接直接推给 mars**:它是企微的
+    资源,寿命和权限都不归我们管,同样要落到自己的 bucket 里。
   - **上传**: 走七牛直传表单 API,自己签 uploadToken(HMAC-SHA1),不引 SDK。
-    对象 key 用**文件内容的 md5**,所以同一张图重复同步只会覆盖同一个对象,
-    天然去重;上传前先 HEAD 一次,已经在就直接复用。
+    对象 key 是 `<群 RID>/<YYYYMMDD>/<HHMMSS>-<md5前8>.<ext>`,按群按天分目录,
+    控制台里能直接翻某个群某天的图;末尾那 8 位 md5 不是装饰,`_object_key` 的
+    docstring 说明了它挡住的两件事。key 是纯函数,重推同一条消息命中同一个对象,
+    上传前先 HEAD 一次就跳过。
+
+同一张图在缓存里最多三个变体,`_HD` 那份才是发送方原始字节:
+
+    <md5>_HD/    原始字节(md5 == 目录名,3875/3876)
+    <md5>/       客户端渲染件 —— 可能重编码变大,也可能被放大 2 倍
+    <md5>_THUMB/ 缩略图
+
+⚠️ 所以**不能按体积挑**: `_HD` 有 12.1% 比渲染件还小(实测有一张原图 407x138、
+渲染件却是插值放大到 800x271 的 —— 字节多一倍,信息一点没多)。旧实现的
+「同名取大的那份」因此挑错了 526 张。现在按 md5 认原图,挑不到才退回体积。
 
 ⚠️ 目标 bucket 是**公开可读**的(拿到 URL 就能打开,无需鉴权)。群聊图片传上去
 等于放到公网上,只是没人知道地址。这是调用方要自己权衡的事,所以默认不开:
@@ -23,23 +38,35 @@ import functools
 import glob
 import hashlib
 import hmac
+import io
 import json
 import logging
 import mimetypes
 import os
 import re
+import tempfile
+import threading
 import time
+import urllib.parse
+from dataclasses import dataclass
 
 import httpx
 
+from . import media_tcp
 from .settings import Settings
 
 log = logging.getLogger(__name__)
 
 UPLOAD_HOST = "https://up.qiniup.com"
 
+# 从企微 CDN 拉原图的上限。比这大的多半不是聊天图片,不值得为它撑住内存
+MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
+
 # 正文里内嵌的原始文件名。前面常有一个 protobuf 长度字节,所以不锚定开头
 _MEDIA_NAME = re.compile(rb"([^\x00-\x1f/\\]{1,120}\.(?:png|jpe?g|heic|gif|webp|bmp))")
+
+# RID 理论上是纯数字,但它进对象 key,不能指望这一点 —— 别的字符一律换成下划线
+_KEY_UNSAFE = re.compile(r"[^0-9A-Za-z_-]")
 
 
 class MediaError(RuntimeError):
@@ -79,26 +106,182 @@ def extract_filename(content) -> str:
         return ""
 
 
+# 正文里那段 ASN.1 是**十六进制 ASCII 文本**,不是二进制 —— 所以 `04 10` 在字节流里
+# 长成字面的 "0410" 四个字符。别用正则去抓它:正则匹配不允许重叠,前面一个 "0410"
+# 会把真正那个连同后面 32 位一起吞掉(踩过,抓出来的是错位 6 个字符的一串)。
+_HEX_RUN = re.compile(rb"[0-9a-fA-F]{64,}")
+
+
+def _der_octets16(blob: bytes, out: list[str], depth: int = 0) -> None:
+    """递归走 DER,收集所有 16 字节的 OCTET STRING。
+
+    要递归是因为 md5 埋在第二层: 顶层 `30`(SEQUENCE)里是 `04 62`(OCTET STRING),
+    它的**值本身**又是一个 `30`(SEQUENCE),md5 的 `04 10` 在那里面。只走顶层会
+    整个跳过去。
+    """
+    i, n = 0, len(blob)
+    while i + 2 <= n:
+        tag, size = blob[i], blob[i + 1]
+        if size & 0x80:                 # 长格式长度,这里的结构里不该出现
+            return
+        value = blob[i + 2:i + 2 + size]
+        if len(value) != size:          # 截断了,别再往下猜
+            return
+        if tag == 0x04 and size == 16:
+            out.append(value.hex())
+        elif value[:1] == b"\x30" and depth < 4:
+            _der_octets16(value[2:], out, depth + 1)
+        i += 2 + size
+
+
+def extract_media_md5(content) -> str:
+    """从消息正文里取**发送方原图的 md5**,取不到返回空串。
+
+    这个 md5 就是缓存目录名(`Caches/Images/<年-月>/<md5>[_HD]/`),所以它同时是
+    「去哪找原图」和「对象 key 用什么」两个问题的答案 —— 不用读文件算 hash,也不会
+    因为本地只缓存了渲染件就换一个 key(那会让同一张图落到两个对象上)。
+    """
+    if not content:
+        return ""
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+    m = _HEX_RUN.search(content)
+    if not m:
+        return ""
+    hexed = m.group(0)
+    if len(hexed) % 2:                  # 奇数长度说明多圈进来一个字符
+        hexed = hexed[:-1]
+    try:
+        blob = bytes.fromhex(hexed.decode())
+    except ValueError:
+        return ""
+    if blob[:1] != b"\x30":
+        return ""
+    found: list[str] = []
+    _der_octets16(blob[2:], found)
+    # 结构里只有一个 16 字节 OCTET STRING;真出现多个,靠后那个才是 md5
+    return found[-1] if found else ""
+
+
+def _pb_field1(buf: bytes) -> bytes:
+    """正文 protobuf 第一个字段的值,前提是它是 length-delimited(wire type 2)。
+
+    只看第一个字段就够了 —— 需要它的场景(下面的 extract_url)本来就依赖
+    「链接在最前面」这个位置信息来和别的链接区分开。
+    """
+    if not buf or buf[0] != 0x0A:
+        return b""
+    size = shift = 0
+    i = 1
+    while i < len(buf):
+        byte = buf[i]
+        i += 1
+        size |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            break
+        shift += 7
+        if shift > 28:                       # varint 长得离谱,别当它是长度
+            return b""
+    else:
+        return b""
+    return buf[i:i + size] if len(buf) >= i + size else b""
+
+
+def extract_url(content) -> str:
+    """正文里的企微 CDN 直链,没有则返回空串。
+
+    表情包和转发进来的图没有原始文件名(手机端发的图更是只有一段 ASN.1),
+    这类消息把图片地址直接放在 protobuf 字段 1。
+
+    必须**按位置**取,不能全文正则搜 http:// —— 合并转发的聊天记录正文里也有
+    一堆链接,但那些是发言人头像(`wwhead`/`mmhead`),藏在嵌套消息里。按位置
+    取就天然不会碰到它们,也不用去维护一张域名/路径白名单。
+    """
+    if not content:
+        return ""
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+    head = _pb_field1(content)
+    if not head.startswith((b"http://", b"https://")):
+        return ""
+    try:
+        return head.decode("ascii")
+    except UnicodeDecodeError:
+        return ""
+
+
 @functools.lru_cache(maxsize=1)
 def _images_root() -> str:
     from .messages import _vendor
     return os.path.join(_vendor().paths.caches(), "Images")
 
 
-def find_local(filename: str) -> str:
-    """在企微图片缓存里按文件名定位原图,找不到返回空串。
+def _variant_rank(path: str) -> int:
+    """`_HD` 优先 —— 它在 3875/3876 的情况下就是原图,先试它能少读几个文件。"""
+    d = os.path.basename(os.path.dirname(path))
+    return 0 if d.endswith("_HD") else (2 if d.endswith("_THUMB") else 1)
 
-    同名会同时命中缩略图和 `_HD` 高清版,取字节数大的那份 —— 推给下游的
-    应该是能看清的那张。
+
+def _candidates(
+    filename: str, md5: str, settings: Settings | None = None,
+) -> tuple[list[str], bool]:
+    """缓存里所有可能是这张图的文件,以及「是不是按 md5 命中的」。
+
+    **只 glob,不读文件。**「这张图到没到」是每轮同步都要问的问题(`pending`),
+    而挑出哪一份是原图要读文件算 md5 —— 把两件事分开,判断在不在就不必付读文件
+    的代价。按文件名那条路要扫遍所有 md5 目录(实测 8.7k 次 scandir,92ms),
+    更不该白跑第二遍。
     """
+    if md5 and settings is not None:
+        service_hits = [
+            p for p in glob.glob(str(settings.data_dir / "media-cache" / f"{md5}.*"))
+            if os.path.isfile(p)
+        ]
+        if service_hits:
+            return service_hits, True
+
+    root = _images_root()
+    if md5:
+        hits = [
+            p for p in glob.glob(os.path.join(root, "*", f"{md5}*", "*"))
+            if os.path.isfile(p)
+        ]
+        if hits:
+            return hits, True
+
     if not filename:
-        return ""
+        return [], False
     # glob 的特殊字符要转义,否则文件名里的 [] 会被当成字符集
-    pattern = os.path.join(_images_root(), "*", "*", glob.escape(filename))
-    hits = [p for p in glob.glob(pattern) if os.path.isfile(p)]
+    pattern = os.path.join(root, "*", "*", glob.escape(filename))
+    return [p for p in glob.glob(pattern) if os.path.isfile(p)], False
+
+
+def _best(hits: list[str], by_md5: bool, md5: str) -> str:
+    """候选里挑原图。**会读文件算 md5**,所以只在真要用这张图时调。"""
     if not hits:
         return ""
-    return max(hits, key=lambda p: os.path.getsize(p))
+    if by_md5:
+        for p in sorted(hits, key=_variant_rank):
+            if file_md5(p) == md5:
+                return p
+    return max(hits, key=os.path.getsize)
+
+
+def find_local(filename: str, md5: str = "", settings: Settings | None = None) -> str:
+    """在企微图片缓存里定位原图,找不到返回空串。
+
+    **有 md5 就按 md5 找**,不看文件名:目录名就是原图 md5,而文件名会重
+    (`pic.jpg` 一个名字对着 8 张不同的图)。同一个 md5 底下最多三个变体,
+    挑**字节 md5 对得上**的那份 —— 那才是发送方原始字节。
+
+    挑不到原图(实测 181/3812 ≈ 4.7% 本地只缓存了渲染件)就退回体积最大的那份:
+    有图比没图强。注意这时**对象 key 仍用原图 md5**,所以以后原图到了也不会再传
+    一遍 —— 这是明确的取舍,不是疏漏。
+
+    没有 md5 时退回旧的按文件名找。
+    """
+    hits, by_md5 = _candidates(filename, md5, settings)
+    return _best(hits, by_md5, md5)
 
 
 def file_md5(path: str) -> str:
@@ -127,28 +310,33 @@ def upload_token(settings: Settings, key: str, expires: int = 3600) -> str:
 
 
 def object_url(settings: Settings, key: str) -> str:
-    return f"{settings.kodo_domain.rstrip('/')}/{key}"
+    """key → 公网 URL。
+
+    现在的 key 全是 ASCII,`quote` 基本是个恒等变换,留着是因为 `kodo_prefix` 可配,
+    不想让一个带空格/中文的前缀拼出个不合法的 URL。注意只编码这一处 —— uploadToken
+    的 scope 和直传表单的 key 都要用**原始** key,编码过的会签出一个对不上的 token。
+    """
+    return f"{settings.kodo_domain.rstrip('/')}/{urllib.parse.quote(key)}"
 
 
 def _exists(url: str, timeout: int) -> bool:
-    """已经传过就别再传一遍 —— key 是内容 md5,存在即等价。"""
+    """已经传过就别再传一遍 —— key 由(群, 时刻, 内容)推导,存在即等价。"""
     try:
         return httpx.head(url, timeout=timeout, follow_redirects=True).status_code == 200
     except httpx.HTTPError:
         return False
 
 
-def _post_form(path: str, key: str, token: str, timeout: int) -> None:
+def _post_form(stream, filename: str, key: str, token: str, timeout: int) -> None:
     """七牛直传表单。multipart 交给 httpx 编,不自己拼 boundary。"""
-    ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     try:
-        with open(path, "rb") as f:
-            resp = httpx.post(
-                UPLOAD_HOST,
-                data={"token": token, "key": key},
-                files={"file": (os.path.basename(path), f, ctype)},
-                timeout=timeout,
-            )
+        resp = httpx.post(
+            UPLOAD_HOST,
+            data={"token": token, "key": key},
+            files={"file": (filename, stream, ctype)},
+            timeout=timeout,
+        )
     except OSError as e:
         raise MediaError(f"读取待上传文件失败: {e}") from e
     except httpx.HTTPError as e:
@@ -158,37 +346,291 @@ def _post_form(path: str, key: str, token: str, timeout: int) -> None:
         raise MediaError(f"上传失败 {resp.status_code}: {resp.text[:200]}")
 
 
-def upload(path: str, settings: Settings) -> str:
-    """上传本地图片,返回公网 URL。已存在则直接复用,不重传。"""
+def _object_key(rid, send_time: int, digest: str, ext: str, settings: Settings) -> str:
+    """key = `<prefix>/<群 RID>/<YYYYMMDD>/<HHMMSS>-<md5 前 8 位><ext>`。
+
+    按群分目录、按天再按时刻排序,在 kodo 控制台里能直接翻某个群某天的图 ——
+    这是这套命名唯一的目的,`<md5>/<文件名>` 那版做不到。
+
+    但**光有「群 + 秒」不够**,末尾那 8 位 md5 是必需的,两个原因:
+
+      1. **同群同秒会撞车。** 多选发图一次就是好几张,全库实测 5590 张图里有 123 张
+         挤在 58 个「同群同秒」的槽位上(最多一槽 4 张)。少了区分位,其中 65 张会被
+         后来的静默覆盖 —— 本地库只有秒级时间,没有更细的刻度可用。
+      2. **桶是公开可读的。** key 全部可推导的话,知道群号按秒遍历一天就能把整个群的
+         图扒下来。8 位 md5 = 40 亿分之一,把枚举这条路堵死。
+
+    仍然是**内容 + 位置的纯函数**,所以重推同一条消息落在同一个 key 上,`_exists`
+    一次 HEAD 就跳过重传。代价是同一张图出现在两个群会传两份 —— 既然本来就想按群分,
+    这不算损失。
+    """
+    prefix = settings.kodo_prefix.strip("/")
+    # send_time 缺失时退回纪元 0(1970-01-01)而不是 now(): key 必须是确定的,
+    # 否则同一条消息每重推一次就多出一个对象
+    t = time.localtime(send_time or 0)
+    group = _KEY_UNSAFE.sub("_", str(rid or "unknown"))
+    return (f"{prefix}/{group}/{time.strftime('%Y%m%d', t)}"
+            f"/{time.strftime('%H%M%S', t)}-{digest[:8]}{ext}")
+
+
+def _require_kodo(settings: Settings) -> None:
+    """没配对象存储就别做后面那些活(读文件、算 md5)—— 先说清楚再退出。"""
     if not settings.kodo_enabled:
         raise MediaError("未配置对象存储(kodo_ak/kodo_sk/kodo_bucket/kodo_domain)")
 
-    ext = os.path.splitext(path)[1].lower() or ".bin"
-    key = f"{settings.kodo_prefix.strip('/')}/{file_md5(path)}{ext}"
-    url = object_url(settings, key)
 
+def _put(open_stream, name: str, digest: str, ext: str,
+         settings: Settings, rid, send_time: int) -> str:
+    """算 key → 已存在就复用 → 否则直传。两条上传路径唯一的差别只是字节从哪来。
+
+    `open_stream` 是个无参函数而不是现成的流: 命中 `_exists` 时就不必先把文件打开
+    (或者把 CDN 那几十 MB 拿在手里)。
+    """
+    _require_kodo(settings)
+    key = _object_key(rid, send_time, digest, ext, settings)
+    url = object_url(settings, key)
     if _exists(url, settings.kodo_timeout):
         return url
-    _post_form(path, key, upload_token(settings, key), settings.kodo_timeout)
+    with open_stream() as stream:
+        _post_form(stream, name, key, upload_token(settings, key), settings.kodo_timeout)
     return url
 
 
-def resolve(content, settings: Settings) -> str:
+def upload(path: str, settings: Settings, rid="", send_time: int = 0, md5: str = "") -> str:
+    """上传本地图片,返回公网 URL。已存在则直接复用,不重传。
+
+    `md5` 是**原图**的 md5(来自消息正文)。传了就用它当区分位,不去读文件算 ——
+    这样本地只缓存到渲染件时,key 仍然认的是这张图的身份,不会一图两对象。
+    """
+    _require_kodo(settings)          # 先挡住,免得白读一遍文件算 md5
+    ext = os.path.splitext(path)[1].lower() or ".bin"
+    try:
+        return _put(lambda: open(path, "rb"), os.path.basename(path),
+                    md5 or file_md5(path), ext, settings, rid, send_time)
+    except OSError as e:
+        raise MediaError(f"读取待上传文件失败: {e}") from e
+
+
+def upload_bytes(data: bytes, ext: str, settings: Settings, rid="", send_time: int = 0) -> str:
+    """上传一段字节(CDN 拉回来的图),返回公网 URL。
+
+    这条路没有正文 md5(表情包/转发图那类),只能拿收到的字节算 —— 对 key 来说够用,
+    它在这里只当区分位,不承担「认出这是同一张图」的职责。
+    """
+    return _put(lambda: io.BytesIO(data), f"image{ext}", hashlib.md5(data).hexdigest(),
+                ext, settings, rid, send_time)
+
+
+# content-type → 扩展名。不用 mimetypes.guess_extension: 它对 image/jpeg 的
+# 返回值随 Python 版本变过(.jpe/.jpg),而这个值会进对象 key,不能飘
+_CDN_EXT = {
+    "image/gif": ".gif", "image/png": ".png", "image/jpeg": ".jpg",
+    "image/webp": ".webp", "image/bmp": ".bmp", "image/heic": ".heic",
+}
+
+
+def download(url: str, timeout: int) -> tuple[bytes, str]:
+    """从企微 CDN 取原图,返回 (内容, 扩展名)。"""
+    try:
+        resp = httpx.get(url, timeout=timeout, follow_redirects=True)
+    except httpx.HTTPError as e:
+        raise MediaError(f"下载失败: {e}") from e
+    if resp.status_code != 200:
+        raise MediaError(f"下载失败 {resp.status_code}")
+
+    data = resp.content
+    if not data:
+        raise MediaError("下载到的是空内容")
+    if len(data) > MAX_DOWNLOAD_BYTES:
+        raise MediaError(f"图片过大: {len(data)} 字节")
+
+    ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+    return data, _CDN_EXT.get(ctype, ".jpg")
+
+
+@dataclass(frozen=True)
+class Located:
+    """一条正文里认得出的那张图:在哪、叫什么、能不能取到。
+
+    `pending` 和 `resolve` 问的是同一个问题的两面(「还等不等得到」/「现在就取」),
+    以前各自解析一遍正文、各自 glob 一遍缓存 —— 同一条消息每轮要走两次。更要命的是
+    两份定位逻辑必须手工保持一致:给 `resolve` 加一条取图路径而忘了改 `pending`,
+    那些消息就会被永远判定成「还在路上」,每轮都白等满一个窗口。
+    """
+    md5: str
+    filename: str
+    url: str                 # 正文里的企微 CDN 直链(表情包/转发图才有)
+    hits: list[str]          # 缓存里的候选,只 glob 出来的
+    by_md5: bool
+
+    @property
+    def known(self) -> bool:
+        """正文里认得出这张图 —— 认不出就等不到任何东西。"""
+        return bool(self.md5 or self.filename)
+
+    def best(self) -> str:
+        """候选里挑原图。会读文件,所以只在真要用这张图时调。"""
+        return _best(self.hits, self.by_md5, self.md5)
+
+    def original(self) -> str:
+        """只接受字节 md5 对得上的完整原图;客户端写到一半的文件不会命中。"""
+        if not self.md5:
+            return self.best()
+        for path in sorted(self.hits, key=_variant_rank):
+            try:
+                if file_md5(path) == self.md5:
+                    return path
+            except OSError:
+                continue
+        return ""
+
+
+def locate(content, settings: Settings | None = None) -> Located:
+    """正文 → 这张图的去向。一次解析、一次 glob,`pending` 和 `resolve` 共用。"""
+    md5 = extract_media_md5(content)
+    filename = extract_filename(content)
+    hits, by_md5 = _candidates(filename, md5, settings)
+    return Located(md5, filename, extract_url(content), hits, by_md5)
+
+
+_trigger_lock = threading.Lock()
+_triggered_at: dict[int, float] = {}
+
+
+def _cache_download(data: bytes, ext: str, digest: str, settings: Settings) -> str:
+    """原子写服务自己的 TCP 图片缓存;不碰企微管理的缓存目录。"""
+    root = settings.data_dir / "media-cache"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{digest}{ext}"
+    if path.exists():
+        return str(path)
+    fd, tmp = tempfile.mkstemp(dir=str(root), prefix=f".{digest}-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return str(path)
+
+
+def _trigger_client(rid: int, lid: int, settings: Settings) -> bool:
+    if not settings.mars_image_client_trigger_enabled or not rid:
+        return False
+    now = time.monotonic()
+    cooldown = max(0.0, float(settings.mars_image_trigger_cooldown))
+    with _trigger_lock:
+        last = _triggered_at.get(rid, 0.0)
+        if now - last < cooldown:
+            return False
+        # 先占冷却位,避免同群并发图片同时切客户端。
+        _triggered_at[rid] = now
+    try:
+        from .local_send import trigger_conversation_load
+
+        ok, error = trigger_conversation_load(rid, lid)
+    except Exception as e:
+        log.warning("触发企微加载群 %s 图片失败: %s", rid, e)
+        return False
+    if not ok:
+        log.warning("触发企微加载群 %s 图片失败: %s", rid, error)
+    return ok
+
+
+def ensure_local(content, settings: Settings, rid=0, lid: int = 0) -> str:
+    """确保图片可读:本地命中 → BigCDN TCP → 触发企微客户端。"""
+    loc = locate(content, settings)
+    if loc.hits:
+        return loc.best()
+    if not loc.known or loc.url:
+        return ""
+
+    if settings.mars_image_tcp_enabled and loc.md5:
+        try:
+            data, ext = media_tcp.download(content, settings)
+            return _cache_download(data, ext, loc.md5, settings)
+        except (media_tcp.MediaTCPError, OSError) as e:
+            log.info("BigCDN TCP 拉图失败(%s),改用客户端触发: %s", loc.md5, e)
+
+    # 切会话和等文件必须处在同一次 UI 独占里。只锁 ``open -g`` 那一瞬间的话,
+    # 并发的发消息/开群会马上把企微切走,下载就会随机中断。嵌套调用里的
+    # trigger_conversation_load() 会识别本执行流已经持锁,不会自己撞自己。
+    from .uilock import ClientBusy, ui_reserve
+
+    try:
+        # 用 ui_reserve 而不是裸 ui_session:前者会把本次占用写进 ContextVar,
+        # trigger_conversation_load() 里嵌套的 ui_session 才能确认「还是同一条
+        # 调用链」并放行。裸 ui_session 虽然拿到了物理锁,却没有这个标记,
+        # 内层会把自己误判成并发请求并立即抛 ClientBusy。
+        with ui_reserve("加载会话图片"):
+            if not _trigger_client(int(rid or 0), int(lid or 0), settings):
+                return locate(content, settings).best()
+
+            wait = max(0.0, float(settings.mars_image_client_wait))
+            poll = max(0.05, float(settings.mars_image_client_poll))
+            deadline = time.monotonic() + wait
+            while True:
+                current = locate(content, settings)
+                if path := current.original():
+                    return path
+                if time.monotonic() >= deadline:
+                    # 原图一直没到时才接受已存在的渲染件,保持旧的“有图比没图强”策略。
+                    return current.best()
+                time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+    except ClientBusy as e:
+        log.info("企微客户端正忙,本轮不触发群 %s 加载图片: %s", rid, e)
+        return locate(content, settings).best()
+
+
+def pending(content, settings: Settings) -> bool:
+    """图还没落到本地,但**还有希望** —— 正文里认得出这张图,缓存里还没有它。
+
+    企微收到图片消息时只写消息行,图片文件要等你真的点开那个会话才下载,
+    实测能晚上几十秒到几小时。所以「认得出、没文件」的含义是「还没到」,
+    值得等一会儿再推(见 mars_sync._ready_count)。
+
+    反过来,正文里既没有 md5 也没有文件名就等不到任何东西,不算 pending ——
+    否则每条这样的消息都要白等一个完整的等待窗口。
+    有 CDN 直链的也不算:那条路当场就能取到图,不需要等。
+    """
+    if not settings.kodo_enabled:
+        return False
+    loc = locate(content, settings)
+    return loc.known and not loc.url and not loc.hits
+
+
+def resolve(content, settings: Settings, rid="", send_time: int = 0, lid: int = 0) -> str:
     """消息正文 → 图片公网 URL。任何一步不成都返回空串,由调用方退回占位符。
+
+    两条取图路径,本地缓存优先:缓存里那份是发送方原始字节,比 CDN 直链可靠。
+
+    `rid`/`send_time` 只决定对象 key 的落点(见 `_object_key`),取哪张图完全不看它们。
 
     这里刻意不抛:一张图传不上去,不该让整条消息、整轮同步失败。
     """
     if not settings.kodo_enabled:
         return ""
-    filename = extract_filename(content)
-    if not filename:
-        return ""
-    path = find_local(filename)
-    if not path:
-        log.debug("本地缓存里没有 %s(可能已被企微清理)", filename)
-        return ""
+
+    loc = locate(content, settings)
     try:
-        return upload(path, settings)
+        path = ensure_local(content, settings, rid, lid)
+        if path:
+            return upload(path, settings, rid, send_time, md5=loc.md5)
+        if loc.url:
+            data, ext = download(loc.url, settings.kodo_timeout)
+            return upload_bytes(data, ext, settings, rid, send_time)
     except (MediaError, OSError) as e:
-        log.warning("上传 %s 失败,退回占位符: %s", filename, e)
+        log.warning("取图/上传失败(%s),退回占位符: %s",
+                    loc.filename or loc.md5 or "CDN 直链", e)
         return ""
+
+    if loc.known:
+        log.debug("本地缓存里还没有 %s(企微要等你点开会话才下载)", loc.filename or loc.md5)
+    return ""

@@ -1,0 +1,175 @@
+import base64
+import contextlib
+import hashlib
+import json
+from types import SimpleNamespace
+
+import pytest
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+from wecom_svr import local_send, media_tcp
+from wecom_svr.settings import Settings
+
+
+def _varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def _bytes_field(number: int, value: bytes) -> bytes:
+    return _varint(number << 3 | 2) + _varint(len(value)) + value
+
+
+def _int_field(number: int, value: int) -> bytes:
+    return _varint(number << 3) + _varint(value)
+
+
+def _content(data: bytes, key: bytes = b"0123456789abcdef") -> bytes:
+    return b"".join([
+        _bytes_field(1, b"signed-file-id"),
+        _int_field(4, len(data)),
+        _bytes_field(8, key.hex().encode()),
+        _bytes_field(10, hashlib.md5(data).hexdigest().encode()),
+    ])
+
+
+def _encrypted(data: bytes, key: bytes = b"0123456789abcdef") -> bytes:
+    pad = 16 - len(data) % 16
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return encryptor.update(data + bytes([pad]) * pad) + encryptor.finalize()
+
+
+def _settings(tmp_path) -> Settings:
+    return Settings(
+        data_dir=tmp_path,
+        mars_image_tcp_config=tmp_path / "media_tcp.json",
+    )
+
+
+def _write_config(settings: Settings) -> None:
+    raw = {
+        "version": 1,
+        "host": "203.0.113.8",
+        "port": 80,
+        "auth_header": base64.b64encode(b"A" * 20).decode(),
+        "download_header": base64.b64encode(b"D" * 20).decode(),
+        "common_fields": [
+            [key, base64.b64encode(value).decode()]
+            for key, value in (
+                ("ver", b"1"), ("weixinnum", b"100"),
+                ("clientversion", b"200"), ("clientostype", b"mac"),
+                ("corpid", b"300"), ("authkey", b"secret-session"),
+                ("nettype", b"1"), ("acceptdupack", b"1"),
+            )
+        ],
+    }
+    settings.mars_image_tcp_config.write_text(json.dumps(raw), encoding="utf-8")
+
+
+def test_image_ticket_reads_download_and_decryption_fields():
+    data = b"\x89PNG\r\n\x1a\nhello"
+    ticket = media_tcp.image_ticket(_content(data))
+
+    assert ticket.fileid == b"signed-file-id"
+    assert ticket.aes_key == b"0123456789abcdef"
+    assert ticket.size == len(data)
+    assert ticket.md5 == hashlib.md5(data).hexdigest()
+
+
+def test_decrypt_filedata_requires_valid_padding_size_and_md5():
+    data = b"\x89PNG\r\n\x1a\nhello"
+    ticket = media_tcp.image_ticket(_content(data))
+
+    assert media_tcp.decrypt_filedata(_encrypted(data), ticket) == data
+    with pytest.raises(media_tcp.MediaTCPError, match="padding"):
+        media_tcp.decrypt_filedata(_encrypted(data)[:-1] + b"x", ticket)
+
+
+class _Socket:
+    def __init__(self, response: bytes):
+        self.response = bytearray(response)
+        self.sent = b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def settimeout(self, _timeout):
+        return None
+
+    def sendall(self, data):
+        self.sent += data
+
+    def recv(self, size):
+        chunk = bytes(self.response[:size])
+        del self.response[:size]
+        return chunk
+
+
+def test_download_builds_hd_request_and_validates_the_response(tmp_path, monkeypatch):
+    data = b"\x89PNG\r\n\x1a\n" + b"image" * 20
+    settings = _settings(tmp_path)
+    _write_config(settings)
+    auth = media_tcp._frame(b"R" * 20, [(b"retcode", b"0")])
+    image = media_tcp._frame(
+        b"I" * 20,
+        [(b"retcode", b"0"), (b"filedata", _encrypted(data))],
+    )
+    fake = _Socket(auth + image)
+    monkeypatch.setattr(media_tcp.socket, "create_connection", lambda *_a, **_kw: fake)
+
+    downloaded, ext = media_tcp.download(_content(data), settings)
+
+    assert downloaded == data
+    assert ext == ".png"
+    frames = media_tcp._split_frames(fake.sent)
+    assert len(frames) == 2
+    request = dict(media_tcp._parse_field_list(frames[1]))
+    assert request[b"fileid"] == b"signed-file-id"
+    assert request[b"filetype"] == b"1"
+    assert b"downpicformat" not in request
+
+
+def test_download_rejects_a_nonzero_retcode(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    _write_config(settings)
+    fake = _Socket(media_tcp._frame(b"R" * 20, [(b"retcode", b"7")]))
+    monkeypatch.setattr(media_tcp.socket, "create_connection", lambda *_a, **_kw: fake)
+
+    with pytest.raises(media_tcp.MediaTCPError, match="鉴权失败"):
+        media_tcp.download(_content(b"image"), settings)
+
+
+def test_missing_config_is_a_normal_tcp_failure(tmp_path):
+    settings = _settings(tmp_path)
+    with pytest.raises(media_tcp.MediaTCPError, match="配置不存在"):
+        media_tcp.download(_content(b"image"), settings)
+
+
+def test_client_trigger_uses_background_url_scheme_with_message_id(monkeypatch):
+    seen = []
+    monkeypatch.setattr(local_send, "ensure_macos", lambda: None)
+    monkeypatch.setattr(
+        local_send, "get_conversation_by_rid",
+        lambda rid: {"rid": rid, "type": 1, "fw_id": 0, "name": "group"},
+    )
+    monkeypatch.setattr(local_send, "ui_session", lambda *_a: contextlib.nullcontext())
+    monkeypatch.setattr(
+        local_send.subprocess, "run",
+        lambda args, **kwargs: seen.append((args, kwargs)) or SimpleNamespace(
+            returncode=0, stdout="", stderr="",
+        ),
+    )
+
+    ok, url = local_send.trigger_conversation_load(1688, 99)
+
+    assert ok is True
+    assert seen[0][0] == ["open", "-g", url]
+    assert "roomid=1688" in url and "msgid=99" in url

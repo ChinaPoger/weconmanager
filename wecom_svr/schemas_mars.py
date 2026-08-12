@@ -16,7 +16,11 @@ class WatermarkRequest(BaseModel):
     send_time: int | None = Field(None, ge=0, description="unix 秒;精确定位用")
     lid: int | None = Field(None, ge=0, description="同秒内的次级序,配合 send_time")
     backfill_seconds: int | None = Field(
-        None, ge=0, le=30 * 24 * 3600, description="往回补多少秒的历史(重推,下游幂等)"
+        None, ge=0, le=30 * 24 * 3600, description="往回补多少秒的历史(会重放下游副作用)"
+    )
+    rid: int | None = Field(None, ge=0, description="只重设这个群;不填表示所有活动群")
+    resume_from_tombstone: bool = Field(
+        False, description="从群重新加入前保存的旧水位追赶;必须同时指定 rid"
     )
 
 

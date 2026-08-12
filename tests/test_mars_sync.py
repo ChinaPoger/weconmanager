@@ -4,13 +4,15 @@
 (httpx)都整体打桩,测的是「映射对不对、顺序对不对、断点续传对不对」。
 """
 import asyncio
+import sqlite3
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from wecom_svr import mars_sync, messages
 from wecom_svr.main import create_app
-from wecom_svr.mars_sync import Cursor, MarsSyncError, State
+from wecom_svr.mars_sync import Cursor, GroupState, MarsStateError, MarsSyncError, State
 from wecom_svr.settings import Settings, get_agent_home, get_settings
 
 
@@ -62,19 +64,34 @@ def local(monkeypatch):
     """本地库打桩:一个群、一批固定消息。"""
     store = {"messages": [], "refreshed": 0}
 
-    def fetch_since(cursor, rids=None, limit=500, include_skipped=False):
-        rid_set = set(rids) if rids is not None else None
-        rows = [
-            m for m in store["messages"]
-            if (m["send_time"], m["lid"]) > (cursor.send_time, cursor.lid)
-            and (rid_set is None or m["rid"] in rid_set)
-        ]
+    def fetch_since(cursors, limit=500, include_skipped=False, offset=0):
+        selected, next_offset = messages._quotas(list(cursors), limit, offset)
+        rows = []
+        for rid, quota in selected:
+            cursor = cursors[rid]
+            group_rows = [
+                m for m in store["messages"]
+                if m["rid"] == rid
+                and (m["send_time"], m["lid"]) > (cursor.send_time, cursor.lid)
+            ]
+            group_rows.sort(key=lambda m: (m["send_time"], m["lid"]))
+            rows.extend(group_rows[:quota])
         rows.sort(key=lambda m: (m["send_time"], m["lid"]))
-        rows = rows[:limit]
         # 真实实现里 LIMIT 在过滤之前生效,skipped 的行照样占额度并推进扫描位置
         kept = [m for m in rows if include_skipped or not m["skipped"]]
-        end = Cursor(rows[-1]["send_time"], rows[-1]["lid"]) if rows else cursor
-        return messages.Batch(messages=kept, cursor=end, scanned=len(rows))
+        scan_end = {}
+        scan_counts = {}
+        for row in rows:
+            rid = row["rid"]
+            scan_end[rid] = Cursor(row["send_time"], row["lid"])
+            scan_counts[rid] = scan_counts.get(rid, 0) + 1
+        return messages.Batch(
+            messages=kept,
+            scan_end=scan_end,
+            scan_counts=scan_counts,
+            selected_rids=[rid for rid, _quota in selected],
+            next_offset=next_offset,
+        )
 
     def refresh(force=False):
         store["refreshed"] += 1
@@ -82,8 +99,19 @@ def local(monkeypatch):
 
     monkeypatch.setattr(messages, "refresh", refresh)
     monkeypatch.setattr(messages, "fetch_since", fetch_since)
-    monkeypatch.setattr(messages, "list_groups", lambda search="": [GROUP, GROUP2])
-    monkeypatch.setattr(messages, "latest_cursor", lambda: Cursor(9000, 9))
+    monkeypatch.setattr(messages, "list_groups", lambda search="", **kw: [GROUP, GROUP2])
+    monkeypatch.setattr(messages, "latest_cursor", lambda rid=None: Cursor(9000, 9))
+    monkeypatch.setattr(
+        messages,
+        "count_since",
+        lambda cursors: {
+            rid: sum(
+                (m["send_time"], m["lid"]) > (cursor.send_time, cursor.lid)
+                for m in store["messages"] if m["rid"] == rid
+            )
+            for rid, cursor in cursors.items()
+        },
+    )
     return store
 
 
@@ -178,7 +206,7 @@ KODO = {"kodo_ak": "AK", "kodo_sk": "SK", "kodo_bucket": "b", "kodo_domain": "ht
 def kodo(settings, monkeypatch):
     """把 media.resolve 打桩:自己的图和引用里的图给不同 URL。"""
     urls = {b"own": "https://cdn.x/own.png", b"quote": "https://cdn.x/quote.png"}
-    monkeypatch.setattr(mars_sync.media, "resolve", lambda raw, s: urls.get(raw, ""))
+    monkeypatch.setattr(mars_sync.media, "resolve", lambda raw, s, *a: urls.get(raw, ""))
     return settings.model_copy(update=KODO)
 
 
@@ -226,10 +254,228 @@ def test_quoting_the_same_image_is_deduped_by_url(kodo):
 
 def test_media_is_skipped_entirely_when_kodo_is_off(settings, monkeypatch):
     monkeypatch.setattr(
-        mars_sync.media, "resolve", lambda raw, s: pytest.fail("没配 kodo 不该去传图")
+        mars_sync.media, "resolve", lambda raw, s, *a: pytest.fail("没配 kodo 不该去传图")
     )
     msg = {**_msg(1, 1, "[图片]"), "raw": b"own"}
     assert mars_sync.to_hook(msg, settings)["message"] == "[图片]"
+
+
+# ─── 等图:图还没下载下来时按住水位 ──────────────────────────────────────
+
+@pytest.fixture
+def waiting(settings, monkeypatch):
+    """把 media.pending 打桩:raw 是 b"late" 的那张图还没落到本地。"""
+    monkeypatch.setattr(mars_sync.media, "pending", lambda raw, s: raw == b"late")
+    monkeypatch.setattr(mars_sync.media, "resolve", lambda raw, s, *a: "")
+    monkeypatch.setattr(mars_sync.time, "time", lambda: 1000.0)
+    return settings.model_copy(update={**KODO, "mars_image_wait": 60})
+
+
+def _late(lid: int, send_time: int, **kw) -> dict:
+    return {**_msg(lid, send_time, "[图片]"), "type": "图片", "raw": b"late", **kw}
+
+
+def test_a_freshly_arrived_image_is_held_for_the_next_round(waiting, local, pushed):
+    """企微要等你点开会话才下载图片,这时推出去的只会是个占位符。"""
+    local["messages"] = [_msg(1, 900, "先说句话"), _late(2, 980)]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), waiting)
+
+    result = run(mars_sync.sync_once(waiting))
+    assert result.pushed == 1 and result.held == 1
+    assert [h["message"] for h in pushed["sent"]] == ["先说句话"]
+    # 水位停在图片那条**之前**,下一轮才能重新读到它
+    assert mars_sync.load_state(waiting).cursor == Cursor(900, 1)
+
+
+def test_the_held_image_goes_out_once_the_file_lands(waiting, local, pushed, monkeypatch):
+    local["messages"] = [_late(1, 980)]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), waiting)
+    assert run(mars_sync.sync_once(waiting)).held == 1
+
+    monkeypatch.setattr(mars_sync.media, "pending", lambda raw, s: False)
+    monkeypatch.setattr(mars_sync.media, "resolve", lambda raw, s, *a: "https://cdn.x/late.png")
+    result = run(mars_sync.sync_once(waiting))
+
+    assert result.pushed == 1 and result.held == 0
+    assert [h["message"] for h in pushed["sent"]] == ["https://cdn.x/late.png"]
+
+
+def test_ready_count_actively_fetches_before_holding_the_group(waiting, monkeypatch):
+    state = {"pending": True}
+    calls: list[tuple[bytes, int, int]] = []
+    monkeypatch.setattr(mars_sync.media, "pending", lambda raw, s: state["pending"])
+
+    def fetched(raw, settings, rid, lid):
+        calls.append((raw, rid, lid))
+        state["pending"] = False
+        return "/tmp/original.png"
+
+    monkeypatch.setattr(mars_sync.media, "ensure_local", fetched)
+    msg = _late(7, 980)
+
+    assert mars_sync._ready_count([msg], waiting) == 1
+    assert calls == [(b"late", GROUP["rid"], 7)]
+
+
+def test_waiting_gives_up_after_the_deadline(waiting, local, pushed):
+    """等不到就带着占位符推走 —— 一张永远不会下载的图不能卡死整条同步链。"""
+    local["messages"] = [_late(1, 900)]              # now=1000,已经等满 60s
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), waiting)
+
+    result = run(mars_sync.sync_once(waiting))
+    assert result.pushed == 1 and result.held == 0
+    assert [h["message"] for h in pushed["sent"]] == ["[图片]"]
+
+
+def test_messages_after_a_held_image_wait_their_turn(waiting, local, pushed):
+    """保序是硬要求:mars 的 SetTimeline 按入库顺序切问题,不能跳过去先推后面的。"""
+    local["messages"] = [_late(1, 980), _msg(2, 990, "后面这句")]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), waiting)
+
+    result = run(mars_sync.sync_once(waiting))
+    assert result.pushed == 0 and result.held == 2
+    assert pushed["sent"] == []
+    assert mars_sync.load_state(waiting).cursor == Cursor(800, 0)
+
+
+def test_a_held_batch_does_not_let_the_watermark_jump_to_the_scan_end(waiting, local, pushed):
+    """批尾有被过滤掉的系统消息时,水位本来会跳到扫描位置 —— 那会吃掉被扣下的那条。"""
+    local["messages"] = [_late(1, 980), {**_msg(2, 990, "撤回了一条消息"), "skipped": True}]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), waiting)
+
+    run(mars_sync.sync_once(waiting))
+    assert mars_sync.load_state(waiting).cursor == Cursor(800, 0)
+
+
+def test_an_image_with_nothing_to_wait_for_is_not_held(waiting, local, pushed):
+    """手机端发的图正文里连文件名都没有,等一个窗口纯属白等。"""
+    local["messages"] = [{**_msg(1, 980, "[图片]"), "type": "图片", "raw": b"no-name"}]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), waiting)
+
+    result = run(mars_sync.sync_once(waiting))
+    assert result.pushed == 1 and result.held == 0
+
+
+def test_a_quoted_image_can_hold_the_batch_too(waiting, local, pushed):
+    msg = {**_msg(1, 980, "这个", quote_text="[图片]"), "quote_raw": b"late"}
+    local["messages"] = [msg]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), waiting)
+
+    assert run(mars_sync.sync_once(waiting)).held == 1
+
+
+def test_waiting_can_be_switched_off(waiting, local, pushed):
+    s = waiting.model_copy(update={"mars_image_wait": 0})
+    local["messages"] = [_late(1, 980)]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), s)
+
+    result = run(mars_sync.sync_once(s))
+    assert result.pushed == 1 and result.held == 0
+
+
+def test_waiting_is_off_when_there_is_nowhere_to_upload(settings, local, pushed, monkeypatch):
+    """没配 kodo 就永远换不出 URL,等下去毫无意义。"""
+    monkeypatch.setattr(mars_sync.media, "pending", lambda raw, s, *a: pytest.fail("不该去看缓存"))
+    local["messages"] = [_late(1, 980)]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), settings)
+
+    assert run(mars_sync.sync_once(settings)).pushed == 1
+
+
+def test_a_held_group_does_not_delay_another_group(waiting, local, pushed):
+    """本次设计的核心:A 群等图时,B 群仍在同一轮推出并提交自己的水位。"""
+    s = waiting.model_copy(update={"mars_sync_groups": "客户群A,kodo-alert-p1"})
+    second = {**_msg(3, 985, "B 正常"), "rid": GROUP2["rid"], "group_name": GROUP2["name"]}
+    local["messages"] = [_late(1, 980), second, _msg(2, 990, "A 后续")]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), s)
+
+    result = run(mars_sync.sync_once(s))
+
+    state = mars_sync.load_state(s)
+    assert [hook["message"] for hook in pushed["sent"]] == ["B 正常"]
+    assert result.held == 2
+    assert state.groups[str(GROUP["rid"])].cursor == Cursor(800, 0)
+    assert state.groups[str(GROUP2["rid"])].cursor == Cursor(985, 3)
+
+
+def test_a_failed_group_does_not_stop_another_group(settings, local, monkeypatch):
+    s = settings.model_copy(update={"mars_sync_groups": "客户群A,kodo-alert-p1"})
+    second = {**_msg(2, 950, "B 正常"), "rid": GROUP2["rid"], "group_name": GROUP2["name"]}
+    local["messages"] = [_msg(1, 900, "A 失败"), second]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), s)
+    sent = []
+
+    async def fail_a(_client, hook, _settings):
+        if hook["groupnumber"].endswith(str(GROUP["rid"])):
+            raise MarsSyncError("boom-a")
+        sent.append(hook)
+
+    monkeypatch.setattr(mars_sync, "push_one", fail_a)
+    result = run(mars_sync.sync_once(s))
+
+    assert [hook["message"] for hook in sent] == ["B 正常"]
+    assert result.partial is True and result.error == "boom-a"
+    assert result.group_results[str(GROUP["rid"])]["error"] == "boom-a"
+    state = mars_sync.load_state(s)
+    assert state.groups[str(GROUP["rid"])].cursor == Cursor(800, 0)
+    assert state.groups[str(GROUP2["rid"])].cursor == Cursor(950, 2)
+
+
+def test_fetch_since_applies_a_real_per_group_quota(monkeypatch):
+    """固化实施修正:深积压群不能吃完全局 LIMIT,并顺带执行真实 UNION SQL。"""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE MESSAGE (LID INTEGER, conv_id INTEGER, sender_id INTEGER, "
+        "content_type INTEGER, send_time INTEGER, content BLOB, extracontent BLOB)"
+    )
+    conn.execute("CREATE TABLE CONVERSATION (RID INTEGER, name TEXT, conversationtype INTEGER)")
+    conn.executemany(
+        "INSERT INTO CONVERSATION VALUES (?, ?, ?)",
+        [(1, "A", 1), (1, "同 RID 的单聊", 0), (2, "B", 1)],
+    )
+    conn.executemany(
+        "INSERT INTO MESSAGE VALUES (?, ?, 9, 1, ?, x'01', x'')",
+        [(lid, 1, 100 + lid) for lid in range(1, 11)] + [(20, 2, 105)],
+    )
+    monkeypatch.setattr(messages, "_rows", lambda sql, params=(): conn.execute(sql, params).fetchall())
+    monkeypatch.setattr(messages, "_load_senders", lambda: {})
+    monkeypatch.setattr(
+        messages,
+        "_vendor",
+        lambda: SimpleNamespace(export=SimpleNamespace(fmt_time=str, resolve_sender=lambda *_: "")),
+    )
+    monkeypatch.setattr(messages, "_type_name", lambda _ctype: "文本")
+    monkeypatch.setattr(messages, "_render", lambda *_args: "正文")
+    monkeypatch.setattr(messages, "_quote_payload", lambda _raw: None)
+    monkeypatch.setattr(messages, "_quote_summary", lambda _raw: "")
+
+    batch = messages.fetch_since({1: Cursor(), 2: Cursor()}, limit=4)
+
+    assert batch.scan_counts == {1: 2, 2: 1}
+    assert [(msg["rid"], msg["lid"]) for msg in batch.messages] == [(1, 1), (1, 2), (2, 20)]
+    conn.close()
+
+
+def test_sync_once_calls_are_serialized_by_one_lock(monkeypatch):
+    active = 0
+    peak = 0
+
+    async def fake_once(*_args):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return mars_sync.SyncResult()
+
+    monkeypatch.setattr(mars_sync, "_sync_once", fake_once)
+
+    async def both():
+        await asyncio.gather(mars_sync.sync_once(), mars_sync.sync_once())
+
+    run(both())
+    assert peak == 1
 
 
 def test_hook_url(settings):
@@ -351,7 +597,7 @@ def test_sync_all_groups_ignores_white_list(local, pushed, tmp_path, monkeypatch
         mars_sync_groups="",
         mars_sync_all_groups=True,
     )
-    monkeypatch.setattr(messages, "list_groups", lambda search="": [GROUP, GROUP2])
+    monkeypatch.setattr(messages, "list_groups", lambda search="", **kw: [GROUP, GROUP2])
     second = {**_msg(2, 1000, "b"), "rid": GROUP2["rid"], "group_name": GROUP2["name"]}
     local["messages"] = [_msg(1, 900, "a"), second]
     mars_sync.save_state(State(cursor=Cursor(800, 0)), s)
@@ -375,10 +621,58 @@ def test_state_round_trips(settings):
     assert (got.cursor, got.pushed, got.last_error) == (Cursor(5, 6), 7, "x")
 
 
-def test_corrupt_state_falls_back_to_zero_instead_of_crashing(settings):
+def test_v1_cursor_is_copied_to_each_group_before_sync(settings, local, pushed):
+    s = settings.model_copy(update={"mars_sync_groups": "客户群A,kodo-alert-p1"})
+    s.mars_state_file.write_text(
+        '{"cursor":{"send_time":800,"lid":7},"pushed":3}', encoding="utf-8"
+    )
+
+    run(mars_sync.sync_once(s))
+
+    state = mars_sync.load_state(s)
+    assert state.version == 2
+    assert {group.cursor for group in state.groups.values()} == {Cursor(800, 7)}
+    assert s.mars_state_file.with_name(f"{s.mars_state_file.name}.v1.bak").exists()
+
+
+def test_dry_run_does_not_persist_v1_migration(settings, local, pushed):
+    settings.mars_state_file.write_text(
+        '{"cursor":{"send_time":800,"lid":7}}', encoding="utf-8"
+    )
+
+    run(mars_sync.sync_once(settings, dry_run=True))
+
+    assert '"version"' not in settings.mars_state_file.read_text(encoding="utf-8")
+
+
+def test_reactivated_group_keeps_an_explicit_gap_pointer(settings, local):
+    rid = GROUP["rid"]
+    state = State(
+        version=2,
+        groups={str(rid): GroupState(cursor=Cursor(800, 0), active=False)},
+    )
+    local["messages"] = [_msg(1, 900, "离开期间")]
+
+    got = mars_sync.reconcile_state(state, [rid], settings, persist=False)
+
+    group = got.groups[str(rid)]
+    assert group.active is True
+    assert group.cursor == Cursor(9000, 9)
+    assert group.gap_from == Cursor(800, 0)
+    assert group.gap_messages == 1
+
+
+def test_state_write_failure_is_not_silently_ignored(settings, monkeypatch):
+    monkeypatch.setattr(mars_sync.os, "replace", lambda *_: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(MarsStateError, match="disk full"):
+        mars_sync.save_state(State(version=2), settings)
+
+
+def test_corrupt_state_fails_closed_instead_of_skipping_backlog(settings):
     settings.mars_state_file.parent.mkdir(parents=True, exist_ok=True)
     settings.mars_state_file.write_text("{ not json", encoding="utf-8")
-    assert mars_sync.load_state(settings) == State()
+    with pytest.raises(MarsStateError):
+        mars_sync.load_state(settings)
 
 
 # ─── HTTP 接口 ──────────────────────────────────────────────────────────
@@ -398,6 +692,15 @@ def test_status_reports_config_and_watermark(client, local):
     assert body["config"]["hook_url"] == "https://ts.qiniu.io/api/qq/hook/v2/message"
     assert body["config"]["groups"] == ["客户群A"]
     assert body["running"] is False
+
+
+def test_status_exposes_corrupt_state_without_skipping_it(client, local):
+    settings = get_settings()
+    settings.mars_state_file.write_text("{ broken", encoding="utf-8")
+    r = client.get("/api/v1/mars/sync/status")
+    assert r.status_code == 200
+    assert "损坏" in r.json()["state_error"]
+    assert r.json()["state"] is None
 
 
 def test_groups_marks_the_selected_ones(client, local):
@@ -448,6 +751,31 @@ def test_watermark_backfill(client, local, monkeypatch):
     monkeypatch.setattr(mars_sync.time, "time", lambda: 10000.0)
     r = client.post("/api/v1/mars/sync/watermark", json={"backfill_seconds": 600})
     assert r.json()["cursor"] == {"send_time": 9400, "lid": 0}
+
+
+def test_watermark_can_resume_the_saved_tombstone_gap(client, local):
+    settings = get_settings()
+    rid = GROUP["rid"]
+    state = State(
+        version=2,
+        groups={
+            str(rid): GroupState(
+                cursor=Cursor(9000, 9), active=True, gap_from=Cursor(800, 0), gap_messages=3
+            )
+        },
+    )
+    state.refresh_shadow_cursor()
+    mars_sync.save_state(state, settings)
+
+    r = client.post(
+        "/api/v1/mars/sync/watermark",
+        json={"rid": rid, "resume_from_tombstone": True},
+    )
+
+    assert r.status_code == 200
+    assert r.json()["changes"][str(rid)]["new"] == {"send_time": 800, "lid": 0}
+    group = mars_sync.load_state(settings).groups[str(rid)]
+    assert group.cursor == Cursor(800, 0) and group.gap_from is None
 
 
 def test_preview_shows_the_exact_hook_body(client, local):

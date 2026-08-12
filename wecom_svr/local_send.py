@@ -303,6 +303,35 @@ def _open_conversation_by_scheme(conv: dict, wait: float = 1.2) -> tuple[bool, s
     return True, url
 
 
+def trigger_conversation_load(rid: int, msgid: int = 0) -> tuple[bool, str]:
+    """后台切到目标会话,让最新消息气泡进入渲染窗口并触发图片下载。
+
+    ``open -g`` 不抢走当前应用焦点,但企微内部仍会选中目标会话。实测 URL Scheme
+    会忽略 msgid,所以它只能可靠覆盖会话末尾的实时图片;更深的历史图片由调用方
+    继续保持 pending/超时降级。
+    """
+    ensure_macos()
+    try:
+        rid = int(rid)
+        msgid = int(msgid or 0)
+    except (TypeError, ValueError):
+        return False, f"非法 RID/msgid: {rid!r}/{msgid!r}"
+    conv = get_conversation_by_rid(rid)
+    if not conv:
+        return False, f"未找到 RID={rid} 的对话"
+    try:
+        url = _conversation_jump_url(conv, msgid=msgid)
+        with ui_session("触发会话图片加载"):
+            result = subprocess.run(
+                ["open", "-g", url], capture_output=True, text=True, timeout=5,
+            )
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        return False, str(e)
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout).strip() or "打开会话失败"
+    return True, url
+
+
 def open_conversation_by_rid(rid: int) -> dict:
     """按 RID 打开企业微信会话,不发送消息。"""
     ensure_macos()
