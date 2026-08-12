@@ -3,11 +3,12 @@
 服务的本地能力依赖三类机器状态,它们都不能跟着代码仓库复制:
 
 * 当前登录 profile 的数据库 key
-* 解密后的 Info.db / Session.db
+* 解密后的 Info.db(消息与会话,硬门禁)
+* 解密后的 Session.db(通讯录,软门禁 —— 见 _check_contacts)
 * macOS 辅助功能授权与企业微信窗口布局
 
-默认在 FastAPI lifespan 启动阶段完成检查。任何一步失败都会让 Uvicorn 启动失败,
-避免端口已经监听、健康检查却说 ok,直到第一条真实任务才暴露环境没准备好。
+默认在 FastAPI lifespan 启动阶段完成检查。硬门禁任何一步失败都会让 Uvicorn 启动
+失败,避免端口已经监听、健康检查却说 ok,直到第一条真实任务才暴露环境没准备好。
 """
 import logging
 import re
@@ -15,7 +16,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 
-from . import local_group, messages
+from . import local_group, localdb, messages
 from .localdb import LocalDataError
 from .settings import Settings, get_agent_home
 
@@ -30,6 +31,7 @@ class StartupPreflightError(RuntimeError):
 class PreflightResult:
     database_ready: bool
     key_discovered: bool
+    contacts_ready: bool
     ui_ready: bool
 
     def to_dict(self) -> dict[str, bool]:
@@ -96,6 +98,23 @@ def _prepare_database(settings: Settings) -> bool:
     return discovered
 
 
+def _check_contacts() -> bool:
+    """确认解密后的 Session.db 通讯录能查 —— 查不到只降级,不挡启动。
+
+    messages.refresh() 对 Session.db 是**故意**只记一条 warning 就放过的(它挡不住
+    收消息)。但 directory.py 靠这张 USER 表把名字翻成 userid,官方建群和通讯录搜索
+    没它就用不了,所以这里单独探一次,把结论摆进 /health,而不是等第一个请求 503。
+
+    不做硬门禁: 纯发消息/纯采集的部署本来就用不到通讯录,不该因此起不来。
+    """
+    try:
+        localdb.query("Session.db", "SELECT RID FROM USER LIMIT 1")
+    except Exception as e:
+        log.warning("通讯录(Session.db USER)不可用,按名字查人/官方建群会失败: %s", e)
+        return False
+    return True
+
+
 def run(settings: Settings) -> PreflightResult:
     """完成启动门禁。返回结果只用于健康状态与日志,失败直接抛异常。"""
     if not settings.startup_preflight_enabled:
@@ -103,7 +122,9 @@ def run(settings: Settings) -> PreflightResult:
             "已关闭本机启动预检(WECOM_SVR_STARTUP_PREFLIGHT_ENABLED=false);"
             "本地数据库与客户端 UI 能力可能到首个请求才报错"
         )
-        return PreflightResult(database_ready=False, key_discovered=False, ui_ready=False)
+        return PreflightResult(
+            database_ready=False, key_discovered=False, contacts_ready=False, ui_ready=False
+        )
 
     try:
         discovered = _prepare_database(settings)
@@ -113,6 +134,8 @@ def run(settings: Settings) -> PreflightResult:
         raise StartupPreflightError(f"企业微信数据库初始化失败: {e}") from e
     except Exception as e:
         raise StartupPreflightError(f"企业微信数据库预检异常: {e}") from e
+
+    contacts_ready = _check_contacts()
 
     ui_ready = False
     if settings.startup_ui_check:
@@ -129,12 +152,14 @@ def run(settings: Settings) -> PreflightResult:
     result = PreflightResult(
         database_ready=True,
         key_discovered=discovered,
+        contacts_ready=contacts_ready,
         ui_ready=ui_ready,
     )
     log.info(
-        "启动预检通过: database_ready=%s key_discovered=%s ui_ready=%s",
+        "启动预检通过: database_ready=%s key_discovered=%s contacts_ready=%s ui_ready=%s",
         result.database_ready,
         result.key_discovered,
+        result.contacts_ready,
         result.ui_ready,
     )
     return result
