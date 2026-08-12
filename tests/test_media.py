@@ -10,6 +10,7 @@ import os
 import time
 
 import pytest
+from PIL import Image
 
 from wecom_svr import media, uilock
 from wecom_svr.settings import Settings
@@ -28,6 +29,73 @@ def settings(tmp_path) -> Settings:
 def _pb_str(s: bytes) -> bytes:
     """protobuf 里的字符串 = 单字节长度前缀 + 内容(短串场景)。"""
     return bytes([len(s)]) + s
+
+
+def _varint(n: int) -> bytes:
+    out = b""
+    while True:
+        byte, n = n & 0x7F, n >> 7
+        out += bytes([byte | (0x80 if n else 0)])
+        if not n:
+            return out
+
+
+def _pb(field: int, payload: bytes) -> bytes:
+    """protobuf 长度分隔字段 = tag varint + 长度 varint + 内容。"""
+    return _varint(field << 3 | 2) + _varint(len(payload)) + payload
+
+
+def _pb_field1(payload: bytes) -> bytes:
+    return _pb(1, payload)
+
+
+def _ticket(
+    data: bytes, name: bytes = b"shot.png", key: bytes | None = None,
+    fileid: bytes | None = b"file-id",
+) -> bytes:
+    """一张图的媒体票据:1=fileid、2=文件名、4=size、8=aeskey(hex)、10=md5(hex)。
+
+    `key=b""` 造附件(没有 aeskey);`fileid=None` 留着字段 1 给调用方自己填
+    (`_image_body` 要在那儿放 ASN.1 正文)。
+    """
+    key = key if key is not None else bytes.hex(b"0123456789abcdef").encode()
+    return b"".join([
+        _pb(1, fileid) if fileid is not None else b"",
+        _pb(2, name),
+        _varint(4 << 3 | 0) + _varint(len(data)),          # size 是 varint,不是长度分隔
+        _pb(8, key),
+        _pb(10, hashlib.md5(data).hexdigest().encode()),
+    ])
+
+
+# ─── 递归媒体抽取 ───────────────────────────────────────────────────────
+
+def test_collect_finds_nested_images_in_canonical_order_and_dedupes():
+    first = _ticket(b"one", b"one.png")
+    second = _ticket(b"two", b"two.jpg")
+    body = _pb(107, _pb(1, second) + _pb(1, first) + _pb(1, second))
+
+    items = media.collect(body)
+
+    assert [(item.filename, item.kind) for item in items] == [
+        ("two.jpg", "image"), ("one.png", "image"),
+    ]
+    assert all(item.ticket is not None for item in items)
+
+
+def test_collect_classifies_empty_aes_key_as_file():
+    items = media.collect(_ticket(b"zip", b"archive.zip", key=b""))
+    assert len(items) == 1
+    assert items[0].kind == "file" and items[0].ticket is None
+
+
+def test_collect_upgrades_a_duplicate_file_to_downloadable_image():
+    data = b"same"
+    body = _pb(1, _ticket(data, b"first.png", key=b"")) + _pb(1, _ticket(data, b"second.png"))
+    item = media.collect(body)[0]
+    assert item.kind == "image"
+    assert item.filename == "first.png"
+    assert item.ticket is not None
 
 
 # ─── 文件名解析 ─────────────────────────────────────────────────────────
@@ -61,25 +129,6 @@ def test_qq_relayed_images_have_no_filename():
 # ─── CDN 直链解析 ───────────────────────────────────────────────────────
 
 CDN = b"https://wework.qpic.cn/wwpic/393399_B-z8XhrZQ0iNrFM_1605166359/0"
-
-
-def _pb_field1(v: bytes) -> bytes:
-    """protobuf 字段 1(wire type 2)= 0x0A + 长度 varint + 内容。"""
-    n, out = len(v), b""
-    while True:
-        byte, n = n & 0x7F, n >> 7
-        out += bytes([byte | (0x80 if n else 0)])
-        if not n:
-            return b"\x0a" + out + v
-
-
-def _varint(n: int) -> bytes:
-    out = b""
-    while True:
-        byte, n = n & 0x7F, n >> 7
-        out += bytes([byte | (0x80 if n else 0)])
-        if not n:
-            return out
 
 
 def test_url_is_read_from_the_first_protobuf_field():
@@ -137,14 +186,7 @@ def _asn1(md5: str = MD5, name: bytes = b"f1d9f413-0917-40be-89bd-b5e8f7699d98")
 
 def _image_body(data: bytes, name: bytes = b"shot.png") -> bytes:
     """能同时被 media 定位器和 BigCDN 票据解析器识别的真实字段子集。"""
-    digest = hashlib.md5(data).hexdigest().encode()
-    return b"".join([
-        _asn1(digest.decode()),
-        b"\x12" + _varint(len(name)) + name,
-        b"\x20" + _varint(len(data)),
-        b"\x42\x20" + b"30313233343536373839616263646566",
-        b"\x52\x20" + digest,
-    ])
+    return _asn1(hashlib.md5(data).hexdigest()) + _ticket(data, name, fileid=None)
 
 
 def test_media_md5_is_read_from_the_nested_der():
@@ -381,6 +423,37 @@ def test_already_uploaded_is_not_sent_again(tmp_path, settings, monkeypatch):
     monkeypatch.setattr(media, "_exists", lambda url, t: True)
     monkeypatch.setattr(media, "_post_form", lambda *a: pytest.fail("不该重传"))
     assert media.upload(str(f), settings).endswith(".png")
+
+
+def test_unknown_extension_is_transcoded_to_jpeg_before_upload(tmp_path, settings, posted):
+    image = tmp_path / "camera.bin"
+    Image.new("RGB", (2, 2), "red").save(image, format="PNG")
+    url = media.upload(str(image), settings, rid=1, send_time=TS, md5="a" * 32)
+
+    assert url.endswith("-aaaaaaaa.jpg")
+    assert posted[0].endswith("-aaaaaaaa.jpg")
+
+
+def test_transparency_survives_as_png(tmp_path, settings, posted):
+    image = tmp_path / "sticker.bin"
+    Image.new("RGBA", (2, 2), (255, 0, 0, 128)).save(image, format="PNG")
+    assert media.upload(str(image), settings, rid=1, send_time=TS, md5="a" * 32).endswith(".png")
+
+
+def test_undecodable_bytes_fall_back_to_the_placeholder(tmp_path, settings):
+    blob = tmp_path / "attachment.bin"
+    blob.write_bytes(b"PK\x03\x04 not an image")
+    with pytest.raises(media.MediaError):
+        media.upload(str(blob), settings, rid=1, send_time=TS, md5="a" * 32)
+
+
+def test_a_decompression_bomb_does_not_escape_as_a_bare_exception(tmp_path, settings, monkeypatch):
+    """Pillow 的 DecompressionBombError 不是 OSError —— 漏出去会每轮炸同一条消息。"""
+    image = tmp_path / "bomb.bin"
+    Image.new("RGB", (2, 2), "red").save(image, format="PNG")
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1)
+    with pytest.raises(media.MediaError):
+        media.upload(str(image), settings, rid=1, send_time=TS, md5="a" * 32)
 
 
 def test_upload_without_config_is_refused(tmp_path):

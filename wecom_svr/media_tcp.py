@@ -80,7 +80,7 @@ def _next_seq() -> bytes:
         return f"{_seq:04d}".encode("ascii")
 
 
-def _read_varint(buf: bytes, offset: int) -> tuple[int, int]:
+def read_varint(buf: bytes, offset: int) -> tuple[int, int]:
     value = shift = 0
     while offset < len(buf) and shift <= 63:
         byte = buf[offset]
@@ -96,17 +96,17 @@ def _protobuf_fields(buf: bytes) -> dict[int, list[bytes | int]]:
     out: dict[int, list[bytes | int]] = {}
     offset = 0
     while offset < len(buf):
-        key, offset = _read_varint(buf, offset)
+        key, offset = read_varint(buf, offset)
         field, wire = key >> 3, key & 7
         if wire == 2:
-            size, offset = _read_varint(buf, offset)
+            size, offset = read_varint(buf, offset)
             end = offset + size
             if end > len(buf):
                 raise MediaTCPError("图片消息 protobuf 字段截断")
             out.setdefault(field, []).append(buf[offset:end])
             offset = end
         elif wire == 0:
-            value, offset = _read_varint(buf, offset)
+            value, offset = read_varint(buf, offset)
             out.setdefault(field, []).append(value)
         elif wire == 1:
             offset += 8
@@ -475,6 +475,12 @@ def decrypt_filedata(ciphertext: bytes, ticket: ImageTicket) -> bytes:
     return data
 
 
+#: `_extension` 可能返回的全部扩展名。加一种魔数就得同步这里 —— media 的缓存探测
+#: 按它逐个 lexists(而不是 glob 一个通配),漏一个那类图就会永远「找不到」。
+#: `test_every_magic_extension_is_declared` 盯着这条对应关系。
+EXTENSIONS = (".png", ".jpg", ".gif", ".webp", ".bmp", ".bin")
+
+
 def _extension(data: bytes) -> str:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return ".png"
@@ -511,26 +517,44 @@ def _fetch(
     return image_response.get(b"filedata") or b"", _retcode(image_response)
 
 
-def download(content, settings: Settings) -> tuple[bytes, str]:
-    """走 BigCDN TCP 拉原图,返回 ``(bytes, ext)``。"""
+def download_ticket(
+    ticket: ImageTicket, settings: Settings, *, deadline: float | None = None,
+) -> tuple[bytes, str]:
+    """用已经从消息树中抽出的票据走 BigCDN TCP 拉原图。
+
+    `deadline` 是整条消息共享的取图预算。**每次尝试**都重算剩余时间 —— HD 被拒后
+    还有一次 FULL 重试,拿进来时算好的那个数到那时已经过期了。
+    """
     if not settings.mars_image_tcp_enabled:
         raise MediaTCPError("TCP 图片下载已关闭")
-    ticket = image_ticket(content)
     config = load_config(settings)
     timeout = float(settings.mars_image_tcp_timeout)
 
-    ciphertext, retcode = _fetch(config, ticket, FILETYPE_HD, timeout)
+    def remaining() -> float:
+        if deadline is None:
+            return timeout
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise MediaTCPError("整条消息的取图预算已耗尽")
+        return min(timeout, left)
+
+    ciphertext, retcode = _fetch(config, ticket, FILETYPE_HD, remaining())
     if retcode != "0":
         # 见 FILETYPE_FULL:HD 被拒不代表图没了,更可能是这张只有原件。
         log.debug("BigCDN 拒了 %s 的 HD 分身(retcode=%s),改要原件",
                   ticket.md5, retcode)
-        ciphertext, retcode = _fetch(config, ticket, FILETYPE_FULL, timeout)
+        ciphertext, retcode = _fetch(config, ticket, FILETYPE_FULL, remaining())
     if retcode != "0":
         raise MediaTCPError(f"BigCDN 下载失败 retcode={retcode!r}")
     if not ciphertext:
         raise MediaTCPError("BigCDN 响应缺少 filedata")
     data = decrypt_filedata(ciphertext, ticket)
     return data, _extension(data)
+
+
+def download(content, settings: Settings) -> tuple[bytes, str]:
+    """走 BigCDN TCP 拉原图,返回 ``(bytes, ext)``。"""
+    return download_ticket(image_ticket(content), settings)
 
 
 def main() -> None:

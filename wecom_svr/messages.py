@@ -28,7 +28,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from types import ModuleType
 
-from . import wal
+from . import media, wal
 from .localdb import NOT_SYNCED, LocalDataError
 from .settings import get_agent_home
 
@@ -54,7 +54,8 @@ TYPE_OVERRIDES = {14: "图片", 16: "语音"}
 # IMAGE_PLACEHOLDER 单拎出来是因为下游要拿它做「换成图片 URL」的锚点,
 # 两边各写一个字面量就会在改动时无声失配。
 IMAGE_PLACEHOLDER = "[图片]"
-MEDIA_PLACEHOLDER = {"图片": IMAGE_PLACEHOLDER, "语音": "[语音]", "文件": "[文件]"}
+FILE_PLACEHOLDER = "[文件]"
+MEDIA_PLACEHOLDER = {"图片": IMAGE_PLACEHOLDER, "语音": "[语音]", "文件": FILE_PLACEHOLDER}
 
 # 哪些 content_type 要去缓存里找原图。和 TYPE_OVERRIDES 放一起不是随意:
 # 14 之所以算图片,正是因为上面那张表把它从「语音」改回了「图片」——
@@ -403,6 +404,17 @@ def media_payloads(msg: dict) -> list:
     return [msg.get(f) for f in MEDIA_FIELDS]
 
 
+def _media_placeholder(items: list) -> str:
+    """认出了媒体但上游没给正文时用的占位符。
+
+    **必须按媒体种类选**: 一律给 `[图片]` 的话,只带附件的消息会渲染成
+    「[图片] + [文件] xxx.zip」—— 一个根本不存在的图片占位符挂在附件名前面。
+    """
+    if any(item.kind == "image" for item in items):
+        return IMAGE_PLACEHOLDER
+    return FILE_PLACEHOLDER if items else ""
+
+
 def _pb_fields(buf: bytes) -> dict[int, list[bytes]]:
     """扫 protobuf 顶层字段 → {字段号: [长度分隔型的载荷]}。
 
@@ -642,12 +654,21 @@ def fetch_since(
         ctype = r["content_type"]
         rich_image = _rich_image_text(ctype, r["content"])
         label = "图片" if rich_image else _type_name(ctype)
+        if label in SKIP_TYPE_LABELS and not include_skipped:
+            continue                       # 系统消息占比不小,别为它走一遍媒体树
         text = (rich_image or _render(ctype, r["content"], label)).strip()
 
         # 引用回复:被引内容不在 content 列里,得单独解出来 —— 不带上的话
         # 「103会议室」这种回复到了下游没头没尾,看不出在回谁
         quote_payload = _quote_payload(r["extracontent"])
         quote_text = _quote_summary(quote_payload)
+
+        # 媒体可能藏在任意嵌套层,不能再由旧类型表/扩展名摘要决定是否把载荷交给下游。
+        # 两段仍保持独立,由 media.collect 各自抽取并去重。
+        raw_media = media.collect(r["content"])
+        quote_media = media.collect(quote_payload)
+        text = text or _media_placeholder(raw_media)
+        quote_text = quote_text or _media_placeholder(quote_media)
 
         skipped = label in SKIP_TYPE_LABELS or not (text or quote_text)
         if skipped and not include_skipped:
@@ -671,12 +692,9 @@ def fetch_since(
             "text": text,
             "quote_text": quote_text,
             "skipped": skipped,
-            # 图片类保留原始正文,推送前由 media 解析出文件名去缓存里找原图。
-            # 只对图片带,别的类型没必要把二进制拖着走。
-            "raw": r["content"] if ctype in IMAGE_TYPES or rich_image else None,
-            # 引用里那张图同样要能点开 —— 被引图的文件名在引用字段的载荷里,
-            # 和本条消息自己的图走同一套解析
-            "quote_raw": quote_payload if quote_text == IMAGE_PLACEHOLDER else None,
+            # 类型表不是媒体存在性的可靠判据:合并转发/引用里的票据会藏在任意深度。
+            "raw": r["content"] if ctype in IMAGE_TYPES or rich_image or raw_media else None,
+            "quote_raw": quote_payload if quote_media else None,
         })
     return Batch(
         messages=out,

@@ -22,6 +22,11 @@ class WatermarkRequest(BaseModel):
     resume_from_tombstone: bool = Field(
         False, description="从群重新加入前保存的旧水位追赶;必须同时指定 rid"
     )
+    force: bool = Field(
+        False,
+        description="允许回放到多媒体切换点之前。那之前的消息按旧规则推过,"
+                    "重算 Content 会在 mars 里留下重复行 —— 明知故犯才加这个",
+    )
 
 
 class TaskRunRequest(BaseModel):

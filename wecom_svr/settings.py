@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     mars_image_client_wait: float = 8.0
     mars_image_client_poll: float = 0.25
     mars_image_trigger_cooldown: float = 15.0
+    # 单条消息最多展示多少张图。多出的图不下载,正文给出明确的省略提示。
+    mars_image_max_per_message: int = 9
     # 白名单:群名或会话 RID,逗号分隔。**留空 = 一条都不同步**
     mars_sync_groups: str = ""
     # 显式开启后忽略白名单,同步本地所有群。默认关闭,避免误把全部历史消息推到 Mars。
@@ -148,6 +150,10 @@ class Settings(BaseSettings):
     @property
     def mars_tasks_state_file(self) -> Path:
         return self.data_dir / "mars_tasks_state.json"
+
+    @property
+    def mars_outbox_dir(self) -> Path:
+        return self.data_dir / "mars_outbox"
 
     @property
     def ui_offsets_file(self) -> Path:

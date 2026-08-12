@@ -210,6 +210,32 @@ def kodo(settings, monkeypatch):
     return settings.model_copy(update=KODO)
 
 
+def _image(n, kind: str = "image") -> "mars_sync.media.MediaItem":
+    return mars_sync.media.MediaItem(str(n) * 32, 1, f"{n}.png", kind, None)
+
+
+@pytest.fixture
+def tree(settings, monkeypatch):
+    """把媒体树打桩:`collect` 按载荷给项,`resolve_item` 按文件名给 URL。
+
+    返回 `setup(items_by_payload, **overrides) -> Settings`,三个多图测试只在
+    「树里有什么」和「断言什么」上不同,建桩这一段没必要各写一遍。
+    """
+    def setup(items, **overrides):
+        by_payload = items if isinstance(items, dict) else {None: items}
+        monkeypatch.setattr(
+            mars_sync.media, "collect",
+            lambda raw: by_payload.get(raw, by_payload.get(None, [])),
+        )
+        monkeypatch.setattr(
+            mars_sync.media, "resolve_item",
+            lambda item, *_args: f"https://cdn.x/{item.filename}",
+        )
+        return settings.model_copy(update={**KODO, **overrides})
+
+    return setup
+
+
 def test_image_placeholder_is_replaced_by_the_url(kodo):
     """图渲染出来之后,再留一个「[图片]」在图上方纯属噪音。"""
     msg = {**_msg(1, 1, "[图片]"), "raw": b"own"}
@@ -252,12 +278,139 @@ def test_quoting_the_same_image_is_deduped_by_url(kodo):
     assert mars_sync.to_hook(monkey, kodo)["message"] == "https://cdn.x/own.png"
 
 
+def test_multiple_images_are_rendered_one_url_per_line(tree):
+    s = tree([_image(i) for i in (1, 2, 3)])
+    msg = {**_msg(1, 1, "[图片]"), "raw": b"tree"}
+    assert mars_sync.message_body(msg, s) == (
+        "https://cdn.x/1.png\nhttps://cdn.x/2.png\nhttps://cdn.x/3.png"
+    )
+
+
+def test_image_limit_and_file_names_are_rendered_deterministically(tree):
+    attachment = mars_sync.media.MediaItem("a" * 32, 20, "notes.md", "file", None)
+    s = tree([*(_image(i) for i in (1, 2, 3)), attachment], mars_image_max_per_message=2)
+    msg = {**_msg(1, 1, "[图片]"), "raw": b"tree"}
+    assert mars_sync.message_body(msg, s) == (
+        "https://cdn.x/1.png\nhttps://cdn.x/2.png\n[文件] notes.md\n(另有 1 张未展示)"
+    )
+
+
 def test_media_is_skipped_entirely_when_kodo_is_off(settings, monkeypatch):
     monkeypatch.setattr(
         mars_sync.media, "resolve", lambda raw, s, *a: pytest.fail("没配 kodo 不该去传图")
     )
     msg = {**_msg(1, 1, "[图片]"), "raw": b"own"}
     assert mars_sync.to_hook(msg, settings)["message"] == "[图片]"
+
+
+def test_image_limit_is_shared_by_body_and_quote(tree):
+    own = mars_sync.media.MediaItem("1" * 32, 1, "own.png", "image", None)
+    quoted = [mars_sync.media.MediaItem(str(i) * 32, 1, f"q{i}.png", "image", None)
+              for i in (2, 3)]
+    s = tree({b"own": [own], b"quote": quoted}, mars_image_max_per_message=2)
+    msg = {
+        **_msg(1, 1, "[图片]", quote_text="[图片]"),
+        "raw": b"own", "quote_raw": b"quote",
+    }
+    assert mars_sync.message_body(msg, s) == (
+        "https://cdn.x/own.png\n> 引用: https://cdn.x/q2.png\n(另有 1 张未展示)"
+    )
+
+
+def test_an_attachment_only_message_does_not_claim_to_carry_an_image(tree):
+    """`[图片]\\n[文件] x.zip` 是错的:那条消息里根本没有图。"""
+    attachment = mars_sync.media.MediaItem("a" * 32, 20, "tstest.zip", "file", None)
+    s = tree([attachment])
+
+    # 占位符由 messages 按种类选,渲染再把它换成文件名行 —— 两半必须对上。
+    assert messages._media_placeholder([attachment]) == "[文件]"
+    msg = {**_msg(1, 1, messages._media_placeholder([attachment])), "raw": b"tree"}
+    assert mars_sync.message_body(msg, s) == "[文件] tstest.zip"
+
+
+def test_an_absent_payload_does_not_eat_an_image_slot(tree):
+    """`_ready_count` 和 `message_body` 必须分到同一份配额。
+
+    以前 `quote_raw is None` 也会被当成一个「旧式单图载荷」扣掉一格,于是等图那侧
+    只预取 8 张、排版那侧却去解第 9 张 —— 等的不是要排的那张。
+    """
+    s = tree([_image(i) for i in range(9)])
+
+    body, quote = mars_sync.media_plan({"raw": None, "quote_raw": b"tree"}, s)
+    assert (body.images, body.legacy, body.omitted) == ([], False, 0)
+    assert len(quote.images) == 9 and quote.omitted == 0
+
+
+def test_outbox_reuses_the_first_hook_when_media_resolution_changes(settings, monkeypatch):
+    msg = {**_msg(7, 100, "[图片]"), "raw": b"tree"}
+    calls = iter(["https://cdn.x/first.png", "https://cdn.x/later.png"])
+    monkeypatch.setattr(mars_sync, "to_hook", lambda _msg, _settings: {"message": next(calls)})
+
+    first = mars_sync.outbox_hook(msg, settings)
+    second = mars_sync.outbox_hook(msg, settings)
+
+    assert first == second == {"message": "https://cdn.x/first.png"}
+    assert len(list(settings.mars_outbox_dir.rglob("*.json"))) == 1
+    assert mars_sync.peek_outbox(msg, settings) == first
+
+
+def test_a_message_without_media_is_not_written_to_the_outbox(settings):
+    """没有媒体的 Content 已经是消息的纯函数,不值得为它付一次 fsync。"""
+    mars_sync.outbox_hook(_msg(1, 100, "就一句话"), settings)
+    assert not list(settings.mars_outbox_dir.rglob("*.json"))
+
+
+def test_the_outbox_is_reclaimed_once_the_watermark_passes(settings, monkeypatch):
+    monkeypatch.setattr(mars_sync, "to_hook", lambda _msg, _s: {"message": "x"})
+    delivered = {**_msg(1, 100, "[图片]"), "raw": b"tree"}
+    in_flight = {**_msg(2, 300, "[图片]"), "raw": b"tree"}
+    mars_sync.outbox_hook(delivered, settings)
+    mars_sync.outbox_hook(in_flight, settings)
+
+    mars_sync.prune_outbox({str(GROUP["rid"]): Cursor(100, 1)}, settings)
+
+    assert mars_sync.peek_outbox(delivered, settings) is None
+    assert mars_sync.peek_outbox(in_flight, settings) is not None
+
+
+def test_watermark_cannot_cross_the_media_cutover(client, local):
+    settings = get_settings()
+    rid = GROUP["rid"]
+    state = State(
+        version=3,
+        groups={str(rid): GroupState(cursor=Cursor(900, 1), media_cutover=Cursor(850, 1))},
+    )
+    state.refresh_shadow_cursor()
+    mars_sync.save_state(state, settings)
+
+    response = client.post(
+        "/api/v1/mars/sync/watermark", json={"rid": rid, "send_time": 800, "lid": 0},
+    )
+
+    assert response.status_code == 400
+    assert "禁止跨点回放" in response.json()["errmsg"]
+
+    forced = client.post(
+        "/api/v1/mars/sync/watermark",
+        json={"rid": rid, "send_time": 800, "lid": 0, "force": True},
+    )
+    assert forced.status_code == 200
+    assert mars_sync.load_state(settings).groups[str(rid)].cursor == Cursor(800, 0)
+
+
+def test_the_media_cutover_also_covers_groups_outside_the_current_scope(settings, local, pushed):
+    """升级那一刻不在白名单里的群,回来之后同样不许跨点回放。"""
+    other = str(GROUP2["rid"])
+    state = State(version=2, groups={
+        str(GROUP["rid"]): GroupState(cursor=Cursor(800, 7)),
+        other: GroupState(cursor=Cursor(700, 3), active=False),
+    })
+    mars_sync.save_state(state, settings)
+
+    run(mars_sync.sync_once(settings))
+
+    groups = mars_sync.load_state(settings).groups
+    assert groups[other].media_cutover == Cursor(700, 3)
 
 
 # ─── 等图:图还没下载下来时按住水位 ──────────────────────────────────────
@@ -632,8 +785,9 @@ def test_v1_cursor_is_copied_to_each_group_before_sync(settings, local, pushed):
     run(mars_sync.sync_once(s))
 
     state = mars_sync.load_state(s)
-    assert state.version == 2
+    assert state.version == 3
     assert {group.cursor for group in state.groups.values()} == {Cursor(800, 7)}
+    assert all(group.media_cutover == Cursor(800, 7) for group in state.groups.values())
     assert s.mars_state_file.with_name(f"{s.mars_state_file.name}.v1.bak").exists()
 
 
@@ -759,10 +913,11 @@ def test_watermark_can_resume_the_saved_tombstone_gap(client, local):
     settings = get_settings()
     rid = GROUP["rid"]
     state = State(
-        version=2,
+        version=3,
         groups={
             str(rid): GroupState(
-                cursor=Cursor(9000, 9), active=True, gap_from=Cursor(800, 0), gap_messages=3
+                cursor=Cursor(9000, 9), media_cutover=Cursor(800, 0), active=True,
+                gap_from=Cursor(800, 0), gap_messages=3,
             )
         },
     )
@@ -789,6 +944,20 @@ def test_preview_shows_the_exact_hook_body(client, local):
     assert len(pending) == 1
     assert pending[0]["hook"]["message"] == "待推"
     assert pending[0]["hook"]["groupnumber"] == "wework-20614687431404"
+
+
+def test_preview_shows_the_frozen_hook_not_a_fresh_one(client, local, monkeypatch):
+    """preview 的意义就是「下一轮会推什么」。落过 outbox 的推的是冻结的那份。"""
+    settings = get_settings()
+    msg = {**_msg(1, 9500, "[图片]"), "raw": b"tree"}
+    local["messages"] = [msg]
+    mars_sync.save_state(State(cursor=Cursor(9000, 0)), settings)
+    monkeypatch.setattr(mars_sync, "to_hook", lambda _m, _s: {"message": "冻结前"})
+    mars_sync.outbox_hook(msg, settings)
+    monkeypatch.setattr(mars_sync, "to_hook", lambda _m, _s: {"message": "重算后"})
+
+    pending = client.post("/api/v1/mars/sync/preview").json()["pending"]
+    assert [p["hook"]["message"] for p in pending] == ["冻结前"]
 
 
 def test_start_stop_toggle_the_loop(client, local):
