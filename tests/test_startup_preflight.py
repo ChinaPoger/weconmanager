@@ -9,6 +9,13 @@ from wecom_svr.messages import LocalKeyError
 from wecom_svr.settings import Settings
 
 
+def _raise(exc):
+    """monkeypatch 的替身里要抛异常时用它 —— 比 `(_ for _ in ()).throw(...)` 好读。"""
+    def fail(*args, **kwargs):
+        raise exc
+    return fail
+
+
 def _settings(tmp_path, **updates) -> Settings:
     values = {
         "data_dir": tmp_path,
@@ -65,9 +72,7 @@ def test_missing_key_is_discovered_then_revalidated(tmp_path, monkeypatch):
 
 def test_missing_key_blocks_when_auto_init_is_disabled(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        startup_preflight.messages,
-        "refresh",
-        lambda force=False: (_ for _ in ()).throw(LocalKeyError("no key")),
+        startup_preflight.messages, "refresh", _raise(LocalKeyError("no key"))
     )
 
     with pytest.raises(startup_preflight.StartupPreflightError, match="no key"):
@@ -100,9 +105,7 @@ def test_key_discovery_failure_is_actionable_and_redacts_keys(tmp_path, monkeypa
 def test_ui_failure_blocks_readiness(tmp_path, monkeypatch):
     monkeypatch.setattr(startup_preflight.messages, "refresh", lambda force=False: None)
     monkeypatch.setattr(
-        startup_preflight.local_group,
-        "calibrate_ui",
-        lambda: (_ for _ in ()).throw(RuntimeError("no accessibility")),
+        startup_preflight.local_group, "calibrate_ui", _raise(RuntimeError("no accessibility"))
     )
 
     with pytest.raises(startup_preflight.StartupPreflightError, match="辅助功能"):
@@ -145,9 +148,7 @@ def test_unusable_contacts_degrade_instead_of_blocking_startup(tmp_path, monkeyp
     monkeypatch.setattr(startup_preflight.messages, "refresh", lambda force=False: None)
     monkeypatch.setattr(startup_preflight.local_group, "calibrate_ui", lambda: None)
     monkeypatch.setattr(
-        startup_preflight.localdb,
-        "query",
-        lambda *a, **kw: (_ for _ in ()).throw(LocalDataError("没有解密后的 Session.db")),
+        startup_preflight.localdb, "query", _raise(LocalDataError("没有解密后的 Session.db"))
     )
 
     result = startup_preflight.run(_settings(tmp_path))

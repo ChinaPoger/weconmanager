@@ -77,16 +77,14 @@ def _discover_key(settings: Settings) -> None:
 
 def _prepare_database(settings: Settings) -> bool:
     """验证 key 并刷新明文库。返回本轮是否执行过 key discovery。"""
-    discovered = False
     try:
         messages.refresh(force=True)
-        return discovered
+        return False
     except messages.LocalKeyError as first_error:
         if not settings.startup_auto_init:
             raise StartupPreflightError(str(first_error)) from first_error
 
     _discover_key(settings)
-    discovered = True
     try:
         messages.refresh(force=True)
     except messages.LocalKeyError as e:
@@ -95,7 +93,7 @@ def _prepare_database(settings: Settings) -> bool:
         ) from e
     except LocalDataError as e:
         raise StartupPreflightError(f"自动获取 key 后解密数据库失败: {e}") from e
-    return discovered
+    return True
 
 
 def _check_contacts() -> bool:
@@ -130,10 +128,8 @@ def run(settings: Settings) -> PreflightResult:
         discovered = _prepare_database(settings)
     except StartupPreflightError:
         raise
-    except LocalDataError as e:
-        raise StartupPreflightError(f"企业微信数据库初始化失败: {e}") from e
     except Exception as e:
-        raise StartupPreflightError(f"企业微信数据库预检异常: {e}") from e
+        raise StartupPreflightError(f"企业微信数据库初始化失败: {e}") from e
 
     contacts_ready = _check_contacts()
 
