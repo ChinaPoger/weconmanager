@@ -25,7 +25,13 @@ import time
 
 from . import local_send, messages, ui_offsets
 from .group import MAX_NAME_LEN
-from .local_send import _get_clipboard, _run_applescript, _set_clipboard, ensure_macos
+from .local_send import (
+    _escape,
+    _get_clipboard,
+    _run_applescript,
+    _set_clipboard,
+    ensure_macos,
+)
 from .localdb import LocalSendError
 
 # 和发消息共用同一把 UI 闸门: 操控的是同一个客户端界面,必须串行,
@@ -53,7 +59,9 @@ COUNT_SETTLE_DELAY = 0.7
 # 企业微信建群后写入 Info.db/WAL 可能有几十秒延迟。只等 2 秒会把已经
 # 建好的群误报成「新增 0 个」,进而跳过改名。
 GROUP_APPEAR_TIMEOUT = 90.0
+# 轮询间隔逐次翻倍到上限: 每一轮都是一次全量重解密,密集轮询换不来更早的答案。
 GROUP_APPEAR_POLL = 1.0
+GROUP_APPEAR_POLL_MAX = 8.0
 # 看到第一个新会话后还要再等一会儿才下结论: 这段等待期里落库的会话会一起进差集,
 # 「同时冒出来两个」就能被识别成不唯一而放弃改名,而不是抓到谁就改谁。
 GROUP_APPEAR_SETTLE = 4.0
@@ -107,10 +115,6 @@ def _osa(body: str, timeout: int = 20) -> str:
             raise LocalGroupError("「发起群聊」面板不在了(可能被手动关闭)")
         raise LocalGroupError(f"操控客户端失败: {out}")
     return out
-
-
-def _escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _real_click(x: int, y: int) -> None:
@@ -439,20 +443,17 @@ def calibrate_ui() -> dict:
     窗口布局的 "+" 偏移已经验证并记入 ui_offsets.json。
     """
     ensure_macos()
-    opened = False
     with ui_session("启动 UI 预检"):
         _activate()
-        try:
-            _open_picker()
-            opened = True
-        finally:
-            if opened:
-                _close_picker()
-                if _sheet_open():
-                    raise LocalGroupError(
-                        "启动 UI 预检打开了「发起群聊」面板,但取消后面板仍未关闭。"
-                        "请手动关闭该面板后重启服务。"
-                    )
+        # 面板没打开就没有要收拾的东西,所以这里不需要 try/finally:
+        # _open_picker() 抛错时唯一正确的动作就是让错误直接冒上去。
+        _open_picker()
+        _close_picker()
+        if _sheet_open():
+            raise LocalGroupError(
+                "启动 UI 预检打开了「发起群聊」面板,但取消后面板仍未关闭。"
+                "请手动关闭该面板后重启服务。"
+            )
     point = ui_offsets.primary("plus")
     return {"success": True, "plus_offset": f"{point[0]},{point[1]}"}
 
@@ -737,6 +738,7 @@ def _wait_new_group_rids(before: set[int]) -> list[int]:
     (见 _looks_like_a_just_created_group)。
     """
     deadline = time.monotonic() + GROUP_APPEAR_TIMEOUT
+    poll = GROUP_APPEAR_POLL
     while True:
         new_rids = sorted(set(_group_names()) - before)
         if new_rids:
@@ -744,7 +746,10 @@ def _wait_new_group_rids(before: set[int]) -> list[int]:
             return sorted(set(_group_names()) - before)
         if time.monotonic() >= deadline:
             return []
-        time.sleep(GROUP_APPEAR_POLL)
+        time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+        # 每轮 _group_names() 都可能触发一次全量重解密,而整个循环跑在 ui_session
+        # 里 —— 空等期间每多问一次就多占一次 UI 闸门。等满一分半只要十来轮就够。
+        poll = min(poll * 2, GROUP_APPEAR_POLL_MAX)
 
 
 def _cancel_edit_box() -> None:
