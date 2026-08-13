@@ -5,10 +5,12 @@ from wecom_svr import local_send
 
 @pytest.fixture
 def script(monkeypatch):
-    """截住 osascript,返回一个装着最后一次脚本的 dict。"""
-    seen = {}
+    """截住 osascript,记录每次生成的脚本。"""
+    seen = {"scripts": [], "timeouts": []}
 
     def fake(script, timeout=15):
+        seen["scripts"].append(script)
+        seen["timeouts"].append(timeout)
         seen["script"] = script
         seen["timeout"] = timeout
         return True, ""
@@ -19,27 +21,48 @@ def script(monkeypatch):
 
 def test_paste_and_send_requires_foreground_chat_input(script):
     assert local_send._paste_and_send_current() == (True, "ok")
-    assert 'set frontmost to true' in script["script"]
-    assert 'AXFocusedUIElement' in script["script"]
-    assert 'roleBefore is not "AXTextArea"' in script["script"]
-    assert 'set inputPasted to value of attribute "AXFocusedUIElement"' not in script["script"]
-    assert "key code 36" in script["script"]
-    assert 'perform action "AXConfirm"' not in script["script"]
+    input_script, submit_script = script["scripts"]
+    assert 'set frontmost to true' in input_script
+    assert 'AXFocusedUIElement' in input_script
+    assert 'roleBefore is not "AXTextArea"' in input_script
+    assert "keystroke return" not in input_script
+    assert "keystroke return" in submit_script
+    assert "key code 36" not in submit_script
+    assert 'perform action "AXConfirm"' not in input_script
+    assert script["timeouts"] == [15, 3]
 
 
 def test_paste_and_send_text_uses_ax_value(script):
     assert local_send._paste_and_send_current(text='你好 "企业微信"\n') == (True, "ok")
-    assert 'set value of inputBefore to "你好 \\"企业微信\\"\\n"' in script["script"]
-    assert 'keystroke "v" using command down' not in script["script"]
-    assert 'AX 写入后输入框内容不匹配' in script["script"]
+    input_script = script["scripts"][0]
+    assert 'set value of inputBefore to "你好 \\"企业微信\\"\\n"' in input_script
+    assert 'keystroke "v" using command down' not in input_script
+    assert 'set inputPasted to value of attribute "AXFocusedUIElement"' not in input_script
 
 
 def test_paste_and_send_image_does_not_read_ax_value_after_paste(script):
     assert local_send._paste_and_send_current(paste_delay=0.8) == (True, "ok")
-    assert 'keystroke "v" using command down' in script["script"]
-    assert "delay 1.60" in script["script"]   # 粘贴生效 + 缩略图渲染,各一份 paste_delay
-    assert 'set inputPasted to value of attribute "AXFocusedUIElement"' not in script["script"]
-    assert "key code 36" in script["script"]
+    input_script, submit_script = script["scripts"]
+    assert 'keystroke "v" using command down' in input_script
+    assert "delay 1.60" in input_script   # 粘贴生效 + 缩略图渲染,各一份 paste_delay
+    assert 'set inputPasted to value of attribute "AXFocusedUIElement"' not in input_script
+    assert "keystroke return" in submit_script
+
+
+def test_paste_and_send_surfaces_submit_failure(monkeypatch):
+    calls = 0
+
+    def fake(script, timeout=15):
+        nonlocal calls
+        calls += 1
+        return (True, "") if calls == 1 else (False, "提交按键超时")
+
+    monkeypatch.setattr(local_send, "_run_applescript", fake)
+
+    ok, error = local_send._paste_and_send_current(text="hello")
+
+    assert ok is False
+    assert error == "粘贴/发送失败: 提交按键超时"
 
 
 def test_paste_and_send_surfaces_accessibility_failure(monkeypatch):

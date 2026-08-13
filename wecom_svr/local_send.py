@@ -266,8 +266,9 @@ def _paste_and_send_current(
 
     osascript 零退出码只说明按键事件发出去了,不代表企业微信真的收到了。服务在
     后台运行时前台应用可能是终端/浏览器,旧实现会把 Cmd+V 和回车发给它们,然后
-    仍返回 success=true。这里通过 AXFocusedUIElement 守住三个可观察事实:
-    企业微信在前台、焦点是聊天输入框、输入和回车都让输入框内容发生了变化。
+    仍返回 success=true。这里通过 AXFocusedUIElement 确认企业微信在前台,焦点
+    是聊天输入框。AXValue 写入后不再读取控件值,因为企业微信的 CEF 输入框
+    可能在内容变化后阻塞辅助功能查询,让脚本永远走不到 Return。
 
     企业微信新版的 CEF 输入区会忽略 System Events 发出的 Cmd+V,但接受 AXValue
     写入。因此文本消息优先走 AX 直接写入; text=None 时保留剪贴板粘贴路径供图片使用。
@@ -278,23 +279,6 @@ def _paste_and_send_current(
         input_action = f'''
             set value of inputBefore to "{escaped_text}"
             delay {delay:.2f}
-
-            set inputPasted to value of attribute "AXFocusedUIElement"
-            if inputPasted is missing value then error "粘贴后聊天输入框失去焦点"
-            set rolePasted to role of inputPasted
-            if rolePasted is not "AXTextArea" and rolePasted is not "AXTextField" then
-                error "粘贴后焦点不是聊天输入框: " & rolePasted
-            end if
-            set valuePasted to missing value
-            try
-                set valuePasted to value of inputPasted as text
-            end try
-            if valuePasted is not "{escaped_text}" then
-                error "AX 写入后输入框内容不匹配"
-            end if
-            if valueBefore is not missing value and valuePasted is not missing value then
-                if valuePasted is valueBefore then error "粘贴后输入框内容未变化"
-            end if
         '''
     else:
         # 图片粘贴后 AXValue 不是文本, 读取/转换它可能让 AppleScript 卡住。
@@ -319,21 +303,23 @@ def _paste_and_send_current(
             if roleBefore is not "AXTextArea" and roleBefore is not "AXTextField" then
                 error "当前焦点不是聊天输入框: " & roleBefore
             end if
-            set valueBefore to missing value
-            try
-                set valueBefore to value of inputBefore as text
-            end try
-
             {input_action}
-
-            -- 企业微信聊天输入区需要真实的 Return 键事件才会发送。
-            -- AXConfirm 在此控件上可能零错误返回,但只保留草稿不提交。
-            key code 36
-            delay 0.4
         end tell
     end tell
     '''
     ok, err = _run_applescript(script_send)
+    if not ok:
+        return False, f"粘贴/发送失败: {err}"
+
+    # AXValue 写入和按键放在同一个 process tell 块时,企业微信可能在内容变化后
+    # 卡住 AX 查询,导致脚本走不到提交键。独立的全局按键事件能立即投递给前台企微。
+    script_submit = '''
+    tell application "System Events"
+        keystroke return
+        delay 0.4
+    end tell
+    '''
+    ok, err = _run_applescript(script_submit, timeout=3)
     if not ok:
         return False, f"粘贴/发送失败: {err}"
     return True, "ok"
