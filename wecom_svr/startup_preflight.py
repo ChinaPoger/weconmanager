@@ -7,8 +7,8 @@
 * 解密后的 Session.db(通讯录,软门禁 —— 见 _check_contacts)
 * macOS 辅助功能授权与企业微信窗口布局
 
-默认在 FastAPI lifespan 启动阶段完成检查。硬门禁任何一步失败都会让 Uvicorn 启动
-失败,避免端口已经监听、健康检查却说 ok,直到第一条真实任务才暴露环境没准备好。
+默认在 FastAPI lifespan 启动阶段完成检查。数据库初始化是硬门禁,失败会让 Uvicorn
+启动失败;客户端 UI 校准是软门禁,失败只会让依赖本地 UI 的接口在实际调用时报错。
 """
 import logging
 import re
@@ -114,7 +114,7 @@ def _check_contacts() -> bool:
 
 
 def run(settings: Settings) -> PreflightResult:
-    """完成启动门禁。返回结果只用于健康状态与日志,失败直接抛异常。"""
+    """完成启动预检;数据库失败阻止启动,UI 失败则降级并继续启动。"""
     if not settings.startup_preflight_enabled:
         log.warning(
             "已关闭本机启动预检(WECOM_SVR_STARTUP_PREFLIGHT_ENABLED=false);"
@@ -138,12 +138,14 @@ def run(settings: Settings) -> PreflightResult:
         try:
             local_group.calibrate_ui()
         except Exception as e:
-            raise StartupPreflightError(
-                "企业微信 UI 预检/校准失败: "
-                f"{e}。请确认客户端已运行并登录、主窗口可见,且服务宿主已获得"
-                "“辅助功能”和“自动化”权限。"
-            ) from e
-        ui_ready = True
+            log.warning(
+                "企业微信 UI 预检/校准失败,服务继续启动;本地 UI 接口调用时将报错: %s。"
+                "请确认客户端已运行并登录、主窗口可见,且服务宿主已获得"
+                "“辅助功能”和“自动化”权限。",
+                e,
+            )
+        else:
+            ui_ready = True
 
     result = PreflightResult(
         database_ready=True,

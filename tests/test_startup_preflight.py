@@ -102,14 +102,18 @@ def test_key_discovery_failure_is_actionable_and_redacts_keys(tmp_path, monkeypa
     assert "<redacted-key>" in message
 
 
-def test_ui_failure_blocks_readiness(tmp_path, monkeypatch):
+def test_ui_failure_degrades_readiness_without_blocking_startup(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(startup_preflight.messages, "refresh", lambda force=False: None)
     monkeypatch.setattr(
         startup_preflight.local_group, "calibrate_ui", _raise(RuntimeError("no accessibility"))
     )
 
-    with pytest.raises(startup_preflight.StartupPreflightError, match="辅助功能"):
-        startup_preflight.run(_settings(tmp_path))
+    result = startup_preflight.run(_settings(tmp_path))
+
+    assert result.database_ready is True
+    assert result.ui_ready is False
+    assert "UI 预检/校准失败" in caplog.text
+    assert "服务继续启动" in caplog.text
 
 
 def test_collect_only_mode_skips_ui_but_keeps_database_gate(tmp_path, monkeypatch):
@@ -171,16 +175,30 @@ def _preflight(**flags) -> startup_preflight.PreflightResult:
     return startup_preflight.PreflightResult(**values)
 
 
-def test_failed_preflight_stops_the_server_from_starting(monkeypatch):
-    """预检失败必须让启动失败 —— 端口一旦监听上,失败就只能靠人去看日志了。"""
+def test_database_preflight_failure_stops_the_server_from_starting(monkeypatch):
+    """数据库预检失败仍必须让启动失败。"""
     def boom(settings):
-        raise startup_preflight.StartupPreflightError("辅助功能没授权")
+        raise startup_preflight.StartupPreflightError("Info.db 无法解密")
 
     monkeypatch.setattr(main, "run_startup_preflight", boom)
 
-    with pytest.raises(startup_preflight.StartupPreflightError, match="辅助功能"):
+    with pytest.raises(startup_preflight.StartupPreflightError, match=r"Info\.db"):
         with TestClient(main.create_app()):
             pass
+
+
+def test_ui_preflight_failure_keeps_health_endpoint_available(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "run_startup_preflight",
+        lambda settings: _preflight(ui_ready=False),
+    )
+
+    with TestClient(main.create_app()) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["startup_preflight"]["ui_ready"] is False
 
 
 def test_successful_preflight_is_published_through_health(monkeypatch):

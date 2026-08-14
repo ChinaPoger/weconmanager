@@ -204,10 +204,45 @@ def test_needs_two_others_after_ignoring_self(fake, monkeypatch):
     assert fake.plus_clicked is False
 
 
-def test_refuses_when_a_panel_is_already_open(fake):
+def test_closes_a_panel_before_opening_picker(fake):
     fake.sheet_open = True
-    with pytest.raises(local_group.LocalGroupError, match="已经有一个弹出面板"):
-        local_group.create_group(["陈涛", "陈挺"])
+
+    result = local_group.create_group(["陈涛", "陈挺"])
+
+    assert result["success"] is True
+    assert fake.confirmed is True
+    assert fake.sheet_open is False
+
+
+def test_ui_preflight_recovers_a_stale_picker(fake):
+    fake.sheet_open = True
+
+    result = local_group.calibrate_ui()
+
+    assert result["success"] is True
+    assert fake.plus_clicked is True
+    assert fake.sheet_open is False
+    assert any('button "Cancel"' in script for script in fake.scripts)
+
+
+def test_ui_preflight_recovers_an_unknown_sheet(monkeypatch):
+    class UnknownSheet(FakeClient):
+        def __call__(self, script, timeout=15):
+            if "splitter group 1 of sh)" in script:
+                if not self.sheet_open:
+                    return True, "0"
+                return True, "1" if self.plus_clicked else "2"
+            return super().__call__(script, timeout)
+
+    client = UnknownSheet(DIRECTORY)
+    client.sheet_open = True
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+
+    result = local_group.calibrate_ui()
+
+    assert result["success"] is True
+    assert any("key code 53" in script for script in client.scripts)
+    assert client.sheet_open is False
 
 
 def test_missing_panel_after_plus_is_a_clear_error(monkeypatch):

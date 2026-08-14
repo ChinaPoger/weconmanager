@@ -73,8 +73,14 @@ wecom-svr --port 8090 --reload
 3. 打开并立即取消“发起群聊”面板,验证辅助功能/自动化权限并校准本机 `+` 偏移;
    首次成功后生成 `.data/ui_offsets.json`。
 
-第 3 步不会选择联系人或创建群。任一步失败都会终止启动,避免服务看起来在线、
-直到首个真实请求才发现新机器未初始化。自动取 key 仍要求企业微信正在运行且已登录;
+如果企业微信上残留了上一次操作留下的弹出面板,启动预检和后续发起群聊会先自动
+取消它;已知的选人面板点击“取消”,其它面板发送一次 Escape 并确认已经关闭。
+无法确认关闭时仍会停止,避免把按键发到错误的窗口。
+
+第 3 步不会选择联系人或创建群。数据库初始化失败会终止启动；UI 校准失败则只记
+warning，服务仍会继续监听，`/health` 中的 `ui_ready` 会是 `false`，真正调用本地
+UI 接口时再返回错误。这样不会因为 macOS 权限或客户端窗口暂时不可用而让整个服务退出。
+自动取 key 仍要求企业微信正在运行且已登录;
 若系统报 `task_for_pid` 权限错误,需按 wecom-agent 文档正确重签客户端后再启动,
 服务不会自动执行重签。
 
@@ -98,7 +104,7 @@ wecom-svr --port 8090 --reload
 | `WECOM_AGENT_HOME` | `vendor/wecom-agent` | wecom-agent checkout 路径 |
 | `WECOM_SVR_HOST` / `WECOM_SVR_PORT` | `127.0.0.1` / `8090` | 监听地址 |
 | `WECOM_SVR_API_TOKEN` | 空 | 留空则**不鉴权**(仅本地,勿暴露公网) |
-| `WECOM_SVR_STARTUP_PREFLIGHT_ENABLED` | `true` | 启动前检查本地数据库和客户端 UI;失败阻止 ready |
+| `WECOM_SVR_STARTUP_PREFLIGHT_ENABLED` | `true` | 启动前检查本地数据库和客户端 UI;数据库失败阻止启动,UI 失败降级 |
 | `WECOM_SVR_STARTUP_AUTO_INIT` | `true` | key 无效时自动运行 `find_key_fast.py` |
 | `WECOM_SVR_STARTUP_UI_CHECK` | `true` | 首次/每次启动无副作用校准 `+` 偏移;采集-only 可关闭 |
 | `WECOM_SVR_STARTUP_KEY_TIMEOUT` | `180` | 自动取 key 的超时秒数 |
