@@ -42,7 +42,8 @@ def _msg(lid: int, send_time: int, text: str, userid: str = "chenyi", **kw) -> d
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch, tmp_path):
     for k in ("WECOM_SVR_API_TOKEN", "WECOM_SVR_MARS_BASE_URL",
-              "WECOM_SVR_MARS_SYNC_GROUPS", "WECOM_SVR_MARS_SYNC_ENABLED"):
+              "WECOM_SVR_MARS_SYNC_GROUPS", "WECOM_SVR_MARS_SYNC_ENABLED",
+              "WECOM_SVR_MARS_GROUP_NAME_PREFIX"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("WECOM_SVR_DATA_DIR", str(tmp_path))
     get_settings.cache_clear()
@@ -139,7 +140,7 @@ def test_hook_shape_matches_mars_message_hook(settings):
     assert hook == {
         "uid": 0,
         "groupNumber": "wework-20614687431404",
-        "groupName": "work-客户群A",
+        "groupName": "客户群A",
         "senderNumber": "5629500548464930",
         "userid": "chenyi",
         "corpid": "1970325043038620",
@@ -154,19 +155,19 @@ def test_hook_shape_matches_mars_message_hook(settings):
     }
 
 
-def test_group_name_gets_the_work_prefix_mars_expects(settings):
-    """mars 靠群名认企微群,也靠它把这类群排除在客户未响应告警外。"""
-    assert mars_sync.to_hook(_msg(1, 1, "x"), settings)["groupName"] == "work-客户群A"
+def test_group_name_is_unchanged_by_default(settings):
+    assert mars_sync.to_hook(_msg(1, 1, "x"), settings)["groupName"] == "客户群A"
+
+
+def test_group_name_prefix_can_be_configured(settings):
+    s = settings.model_copy(update={"mars_group_name_prefix": "work-"})
+    assert mars_sync.to_hook(_msg(1, 1, "x"), s)["groupName"] == "work-客户群A"
 
 
 def test_group_name_prefix_is_not_doubled(settings):
+    s = settings.model_copy(update={"mars_group_name_prefix": "work-"})
     msg = {**_msg(1, 1, "x"), "group_name": "work-已经带前缀了"}
-    assert mars_sync.to_hook(msg, settings)["groupName"] == "work-已经带前缀了"
-
-
-def test_group_name_prefix_can_be_disabled(settings):
-    s = settings.model_copy(update={"mars_group_name_prefix": ""})
-    assert mars_sync.to_hook(_msg(1, 1, "x"), s)["groupName"] == "客户群A"
+    assert mars_sync.to_hook(msg, s)["groupName"] == "work-已经带前缀了"
 
 
 def test_group_number_is_prefixed_to_avoid_colliding_with_qq_groups(settings):

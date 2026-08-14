@@ -95,7 +95,7 @@ class MediaItem:
     filename: str
     kind: Literal["image", "file"]
     ticket: media_tcp.ImageTicket | None
-    source_url: str = ""       # 企微正文直接携带的临时图片地址
+    source_url: str = ""       # type101 首选图片 URL,仅用于身份和缓存目录推导
     md5_verified: bool = True  # False 表示 md5 只是 URL 去重键,不能拿来校验图片字节
     cache_keys: tuple[str, ...] = ()  # type101 客户端按下载 URL 的 md5 命名缓存目录
 
@@ -1021,22 +1021,6 @@ def ensure_item_local(
 
     fetches: list[tuple[str, Callable[[], str]]] = []
 
-    if item.source_url:
-
-        def fetch_url() -> str:
-            timeout = float(settings.kodo_timeout)
-            if deadline is not None:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    raise MediaError("整条消息的取图预算已耗尽")
-                timeout = min(timeout, left)
-            data, ext = download(item.source_url, timeout)
-            if item.md5_verified and hashlib.md5(data).hexdigest() != item.md5:
-                raise MediaError("临时地址返回的图片 MD5 不匹配")
-            return _cache_download(data, ext, item.md5, settings)
-
-        fetches.append(("临时 URL", fetch_url))
-
     if item.ticket is not None and settings.mars_image_tcp_enabled:
 
         def fetch_ticket() -> str:
@@ -1046,8 +1030,8 @@ def ensure_item_local(
 
         fetches.append(("BigCDN TCP", fetch_ticket))
 
-    # 没有协议 MD5 的 URL 兼容载荷使用 URL 摘要去重,客户端缓存里不可能出现
-    # 这个目录名;主动下载失败后继续切会话只会白等。
+    # type101 的 source_url 仅用于选择图片和计算客户端缓存别名。临时地址实测
+    # 即时请求也返回 400,不再用它主动下载;缓存未命中时直接让企微加载会话。
     return _ensure(
         lambda: locate_item(item, settings),
         fetches,
@@ -1055,7 +1039,7 @@ def ensure_item_local(
         rid,
         lid,
         deadline,
-        allow_client=item.md5_verified,
+        allow_client=item.md5_verified or bool(item.cache_keys),
     )
 
 

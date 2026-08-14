@@ -647,7 +647,7 @@ def test_cdn_download_failure_degrades_to_the_placeholder(cache, settings, monke
     assert media.resolve(_pb_field1(CDN), settings) == ""
 
 
-def test_type101_reuses_local_cache_when_temp_url_expired(settings, monkeypatch):
+def test_type101_reuses_local_cache_without_requesting_temp_url(settings, monkeypatch):
     data = b"cached image"
     digest = hashlib.md5(data).hexdigest()
     path = settings.data_dir / "media-cache" / f"{digest}.jpg"
@@ -657,37 +657,36 @@ def test_type101_reuses_local_cache_when_temp_url_expired(settings, monkeypatch)
         digest, 0, "image-1.jpg", "image", None, WEWORK_IMAGE_1.decode(),
     )
 
-    def expired(*args, **kwargs):
-        raise media.MediaError("400")
-
-    monkeypatch.setattr(media, "download", expired)
+    monkeypatch.setattr(
+        media, "download", lambda *_a: pytest.fail("type101 不应请求临时 URL"),
+    )
     monkeypatch.setattr(media, "upload", lambda *args, **kwargs: "https://cdn/cached.jpg")
 
     assert media.resolve_item(item, settings) == "https://cdn/cached.jpg"
 
 
-def test_type101_active_downloads_fall_back_to_client_cache(
+def test_type101_skips_temp_url_and_loads_client_cache(
     cache, settings, monkeypatch,
 ):
     data = b"\x89PNG\r\n\x1a\n" + b"type101-client"
     digest = hashlib.md5(data).hexdigest()
+    cache_key = hashlib.md5(WEWORK_IMAGE_1).hexdigest()
     item = media.MediaItem(
         digest, len(data), "image-1.jpg", "image", None, WEWORK_IMAGE_1.decode(),
+        cache_keys=(cache_key,),
     )
     order: list[str] = []
 
-    def url_fails(*_args):
-        order.append("url")
-        raise media.MediaError("400")
-
     def client_lands_original(rid, lid, _settings):
         order.append(f"client:{rid}:{lid}")
-        target = cache / "2026-08" / f"{digest}_HD" / "image-1.jpg"
+        target = cache / "2026-08" / cache_key / cache_key
         target.parent.mkdir(parents=True)
         target.write_bytes(data)
         return True
 
-    monkeypatch.setattr(media, "download", url_fails)
+    monkeypatch.setattr(
+        media, "download", lambda *_a: pytest.fail("type101 不应请求临时 URL"),
+    )
     monkeypatch.setattr(media, "_trigger_client", client_lands_original)
     configured = settings.model_copy(update={
         "mars_image_client_wait": 1.0,
@@ -696,7 +695,7 @@ def test_type101_active_downloads_fall_back_to_client_cache(
 
     path = media.ensure_item_local(item, configured, rid=1688, lid=99)
 
-    assert order == ["url", "client:1688:99"]
+    assert order == ["client:1688:99"]
     assert media.file_md5(path) == digest
 
 

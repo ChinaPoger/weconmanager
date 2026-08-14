@@ -71,8 +71,8 @@ class Settings(BaseSettings):
     # 占位符,而下游按 md5(群号+发送人+时间+正文) 去重,事后补推只会多出一条。
     # 所以只能在推之前等。水位按群独立,等待只阻塞本群;0 = 不等,退回旧行为。
     mars_image_wait: float = 60.0
-    # 普通图片主动获取顺序:BigCDN TCP → 触发企微客户端渲染。type101 会先试正文
-    # 临时 URL,再按 URL 摘要找客户端缓存。TCP 会话凭据只放在 gitignored 的
+    # 普通图片主动获取顺序:BigCDN TCP → 触发企微客户端渲染。type101 不请求正文
+    # 下载 URL,仅用它的摘要定位客户端缓存。TCP 会话凭据只放在 gitignored 的
     # media_tcp.json,不进 .env/日志/状态接口。
     mars_image_tcp_enabled: bool = True
     mars_image_tcp_config: Path | None = None
@@ -92,12 +92,10 @@ class Settings(BaseSettings):
     # 群号前缀。mars 的 qq_groups.qq 是全局唯一键,和真实 QQ 群号共用一张表,
     # 纯数字 RID 有撞号风险,必须带前缀隔离
     mars_group_prefix: str = "wework-"
-    # 群**名**前缀 —— 沿用 mars 自己的企微群约定,不是随便挑的:
+    # 可选的群**名**前缀,默认不改群名。需要沿用 mars 的企微群约定时配置 `work-`:
     #   models.Group.GroupIMCategory(): 名字含 "work-" → 认成 Wework 群
     #   groupmsg.LoadMsgs():   left(name,5) != 'work-' → 未响应告警不管这类群
-    # hook 建群时 group_type 会落到默认的 'customer',不带这个前缀的话,内部群
-    # 会被 deimos 的未响应告警引擎盯上并电话通知 TS 值班。置空可关掉。
-    mars_group_name_prefix: str = "work-"
+    mars_group_name_prefix: str = ""
     # mars 侧用 robot 号区分消息来源,并据此决定要不要转发到 mars_alert / 大数据
     mars_robot: str = "wecom-svr"
     mars_client_type: str = "Wework"
