@@ -395,6 +395,30 @@ def _rich_image_text(content_type: int, content) -> str:
     return "\n".join([IMAGE_PLACEHOLDER, *rendered])
 
 
+def _short_text(content) -> str:
+    """提取企微文本消息里被上游长度门槛漏掉的单字符正文。
+
+    普通文本的 protobuf 路径实测是 ``1 -> 2 -> 1``。上游 `_seg_text`
+    会过滤长度小于 2 的叶子, 因此 `1`, `好`, 单个 emoji 最终只渲染成
+    `[文本]`。这里只认这条明确的字段路径, 避免递归捞到一字符元数据。
+    """
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+    if not isinstance(content, bytes):
+        return ""
+
+    for envelope in _pb_fields(content).get(1, []):
+        for body in _pb_fields(envelope).get(2, []):
+            for payload in _pb_fields(body).get(1, []):
+                try:
+                    text = payload.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    continue
+                if len(text) == 1 and text.isprintable():
+                    return text
+    return ""
+
+
 def _render(content_type: int, content, label: str) -> str:
     """正文 —— 被修正过类型的走我们的占位符,其余交给上游。
 
@@ -405,7 +429,10 @@ def _render(content_type: int, content, label: str) -> str:
         return ph
     if rich := _rich_image_text(content_type, content):
         return rich
-    return _vendor().export.render(content_type, content) or ""
+    rendered = _vendor().export.render(content_type, content) or ""
+    if label == "文本" and (not rendered or rendered == "[文本]"):
+        return _short_text(content) or rendered
+    return rendered
 
 
 #: 一条消息里可能挂着图的原始载荷字段。产出在 `fetch_since`,消费在

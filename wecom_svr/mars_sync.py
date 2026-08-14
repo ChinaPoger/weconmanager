@@ -411,6 +411,11 @@ def peek_outbox(msg: dict, settings: Settings) -> dict | None:
         hook = json.loads(raw)
         if not isinstance(hook, dict) or not isinstance(hook.get("message"), str):
             raise TypeError("hook 格式无效")
+        # 早期 outbox 可能把 SQLite 的数字身份原样冻结下来。正文必须保持首次
+        # 决定，但身份字段只是 JSON 契约适配，重试时归一化不会改变消息去重键。
+        for field in ("userid", "corpid"):
+            if field in hook:
+                hook[field] = str(hook[field] or "")
         return hook
     except (json.JSONDecodeError, TypeError) as e:
         raise MarsStateError(f"mars outbox 损坏 {path}: {e}") from e
@@ -491,8 +496,8 @@ def to_hook(msg: dict, settings: Settings) -> dict:
     RID 对内部成员、外部联系人和机器人都存在,不会因为跨企业成员没有本企业
     userid 而和其他成员混淆。
     """
-    userid = msg.get("sender_userid") or ""
-    corpid = msg.get("sender_corpid") or ""
+    userid = str(msg.get("sender_userid") or "")
+    corpid = str(msg.get("sender_corpid") or "")
     sender_number = str(msg.get("sender_id") or "")
     name = msg.get("sender_name") or userid or sender_number
     return {
