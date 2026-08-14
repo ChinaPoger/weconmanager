@@ -162,6 +162,20 @@ def test_type101_dedupes_original_thumbnail_and_nested_reference():
     assert [(item.md5, item.source_url) for item in items] == [
         (digest.decode(), WEWORK_IMAGE_1.decode()),
     ]
+    assert items[0].size == 618840
+    assert items[0].ticket is None
+    assert items[0].md5_verified is True
+    assert items[0].cache_keys == tuple(
+        hashlib.md5(url).hexdigest()
+        for url in (WEWORK_IMAGE_1, WEWORK_IMAGE_2, WEWORK_IMAGE_3)
+    )
+
+
+def test_type101_without_protocol_md5_marks_the_url_digest_unverified():
+    item = media.collect(_pb(3, WEWORK_IMAGE_1))[0]
+
+    assert item.md5 == hashlib.md5(WEWORK_IMAGE_1).hexdigest()
+    assert item.md5_verified is False
 
 
 def test_non_wework_urls_are_not_treated_as_media_links():
@@ -650,6 +664,69 @@ def test_type101_reuses_local_cache_when_temp_url_expired(settings, monkeypatch)
     monkeypatch.setattr(media, "upload", lambda *args, **kwargs: "https://cdn/cached.jpg")
 
     assert media.resolve_item(item, settings) == "https://cdn/cached.jpg"
+
+
+def test_type101_active_downloads_fall_back_to_client_cache(
+    cache, settings, monkeypatch,
+):
+    data = b"\x89PNG\r\n\x1a\n" + b"type101-client"
+    digest = hashlib.md5(data).hexdigest()
+    item = media.MediaItem(
+        digest, len(data), "image-1.jpg", "image", None, WEWORK_IMAGE_1.decode(),
+    )
+    order: list[str] = []
+
+    def url_fails(*_args):
+        order.append("url")
+        raise media.MediaError("400")
+
+    def client_lands_original(rid, lid, _settings):
+        order.append(f"client:{rid}:{lid}")
+        target = cache / "2026-08" / f"{digest}_HD" / "image-1.jpg"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(data)
+        return True
+
+    monkeypatch.setattr(media, "download", url_fails)
+    monkeypatch.setattr(media, "_trigger_client", client_lands_original)
+    configured = settings.model_copy(update={
+        "mars_image_client_wait": 1.0,
+        "mars_image_client_poll": 0.01,
+    })
+
+    path = media.ensure_item_local(item, configured, rid=1688, lid=99)
+
+    assert order == ["url", "client:1688:99"]
+    assert media.file_md5(path) == digest
+
+
+def test_type101_finds_client_cache_by_download_url_hash(
+    cache, settings, monkeypatch,
+):
+    digest = "6e427950d012cee18d4c489ce3519cff"
+    body = b"".join([
+        _pb(3, WEWORK_IMAGE_1),
+        _varint(4 << 3 | 0) + _varint(59149),
+        _pb(8, digest.encode()),
+        _pb(10, bytes.hex(b"0123456789abcdef").encode()),
+        _pb(25, b"v1_type101-file-id"),
+        _pb(26, WEWORK_IMAGE_2),
+        _pb(31, digest.encode()),
+    ])
+    item = media.collect(body)[0]
+    cache_key = hashlib.md5(WEWORK_IMAGE_2).hexdigest()
+    rendered = cache / "2026-08" / cache_key / cache_key
+    rendered.parent.mkdir(parents=True)
+    rendered.write_bytes(b"\xff\xd8\xff\xe0rendered jpeg")
+    monkeypatch.setattr(
+        media, "download", lambda *_a: pytest.fail("本地缓存已存在,不应再请求临时 URL"),
+    )
+
+    located = media.locate_item(item, settings)
+
+    assert located.hits == [str(rendered)]
+    assert located.by_md5 is False
+    assert media.ensure_item_local(item, settings, rid=1688, lid=99) == str(rendered)
 
 
 # ─── pending: 「还没到」和「没有」是两回事 ──────────────────────────────

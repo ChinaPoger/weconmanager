@@ -96,6 +96,8 @@ class MediaItem:
     kind: Literal["image", "file"]
     ticket: media_tcp.ImageTicket | None
     source_url: str = ""       # 企微正文直接携带的临时图片地址
+    md5_verified: bool = True  # False 表示 md5 只是 URL 去重键,不能拿来校验图片字节
+    cache_keys: tuple[str, ...] = ()  # type101 客户端按下载 URL 的 md5 命名缓存目录
 
 
 def _scan_image_urls(content: bytes) -> list[str]:
@@ -129,7 +131,7 @@ def image_urls(content) -> list[str]:
         content = content.encode("utf-8", "surrogateescape")
     if not isinstance(content, bytes):
         return []
-    return [url for url, _digest in _image_links(content)]
+    return [url for url, _digest, _cache_keys in _image_links(content)]
 
 
 def _pb_nodes(buf: bytes) -> list[tuple[int, int, bytes | int]] | None:
@@ -169,8 +171,8 @@ def _pb_nodes(buf: bytes) -> list[tuple[int, int, bytes | int]] | None:
     return out
 
 
-def _image_links(content: bytes) -> list[tuple[str, str]]:
-    """返回 ``(临时地址, 图片 MD5)``;没有协议身份时退回 URL 去重。
+def _image_links(content: bytes) -> list[tuple[str, str, tuple[str, ...]]]:
+    """返回 ``(临时地址, 图片 MD5, 客户端缓存键)``;无协议身份时按 URL 去重。
 
     实测 type=101 的结构是:
 
@@ -206,8 +208,15 @@ def _image_links(content: bytes) -> list[tuple[str, str]]:
                 if field == 3 and wire == 2 and isinstance(value, bytes)
                 for url in _scan_image_urls(value)
             ]
-            return [(primary[0] if primary else urls[0], digest)]
-    return [(url, "") for url in urls]
+            # 个人微信发进企微群的 type101 图片不按图片 MD5 落本地缓存。抓包和
+            # 写盘对齐确认,目录名是 field 26 下载 URL 的 md5;不同客户端版本还
+            # 可能选 field 3/32,因此保留这一张图所有下载 URL 的摘要作为别名。
+            cache_keys = tuple(hashlib.md5(url.encode("ascii")).hexdigest() for url in urls)
+            return [(primary[0] if primary else urls[0], digest, cache_keys)]
+    return [
+        (url, "", (hashlib.md5(url.encode("ascii")).hexdigest(),))
+        for url in urls
+    ]
 
 
 def _item_at(nodes: list[tuple[int, int, bytes | int]]) -> MediaItem | None:
@@ -287,13 +296,30 @@ def collect(content) -> list[MediaItem]:
                 walk(child, len(value), depth + 1)
 
     walk(root, len(content), 0)
-    # type=101 的载荷没有标准 ImageTicket,但正文里有临时 tpdownloadmedia
-    # 地址。按协议里的图片 MD5 去重,避免一张图的原图/缩略图被排成两张。
-    for index, (url, media_digest) in enumerate(_image_links(content), 1):
+    # type=101 不走标准 ImageTicket 字段布局。字段 4 仍是原图声明大小;
+    # 同时按协议里的图片 MD5 去重,避免一张图的原图/缩略图被排成两张。
+    type101_size = next(
+        (
+            value
+            for field, wire, value in root
+            if field == 4 and wire == 0 and isinstance(value, int) and value > 0
+        ),
+        0,
+    )
+    for index, (url, media_digest, cache_keys) in enumerate(_image_links(content), 1):
         # 没有协议 MD5 的简化/兼容载荷只能用 URL 摘要做本条消息内的去重键;
         # 有协议 MD5 时则保留它,这样还能命中已经落地的本地缓存。
         digest = media_digest or hashlib.md5(url.encode("ascii")).hexdigest()
-        found.append(MediaItem(digest, 0, f"image-{index}.jpg", "image", None, url))
+        found.append(MediaItem(
+            digest,
+            type101_size if media_digest else 0,
+            f"image-{index}.jpg",
+            "image",
+            None,
+            url,
+            bool(media_digest),
+            cache_keys,
+        ))
 
     # 同 md5 后遇到 image 时把 file 就地升级,保留首次位置和首次文件名。
     # dict 保序,且替换已有 key 不会改变它的位置 —— 正好是要的语义。
@@ -305,7 +331,19 @@ def collect(content) -> list[MediaItem]:
         elif first.kind == "file" and item.kind == "image":
             out[item.md5] = MediaItem(
                 item.md5, item.size, first.filename or item.filename, "image", item.ticket,
+                first.source_url or item.source_url, first.md5_verified or item.md5_verified,
+                tuple(dict.fromkeys((*first.cache_keys, *item.cache_keys))),
+            )
+        elif first.kind == "image" and item.kind == "image":
+            out[item.md5] = MediaItem(
+                item.md5,
+                first.size or item.size,
+                first.filename or item.filename,
+                "image",
+                first.ticket or item.ticket,
                 first.source_url or item.source_url,
+                first.md5_verified or item.md5_verified,
+                tuple(dict.fromkeys((*first.cache_keys, *item.cache_keys))),
             )
     return list(out.values())
 
@@ -461,6 +499,7 @@ def _variant_rank(path: str) -> int:
 
 def _candidates(
     filename: str, md5: str, settings: Settings | None = None,
+    cache_keys: tuple[str, ...] = (),
 ) -> tuple[list[str], bool]:
     """缓存里所有可能是这张图的文件,以及「是不是按 md5 命中的」。
 
@@ -492,6 +531,20 @@ def _candidates(
         ]
         if hits:
             return hits, True
+
+    # type101 的个人微信图片由企微客户端按下载 URL 的 md5 落盘,而不是按
+    # 消息声明的原图 md5。这里命中的是客户端渲染件,所以 by_md5=False:
+    # `_best` 不会误把它当成字节 md5 已验证的原图,但仍可作为上传兜底。
+    for cache_key in dict.fromkeys(cache_keys):
+        if not _HEX32.fullmatch(cache_key.encode("ascii", "ignore")):
+            continue
+        hits = [
+            p for variant in (cache_key, f"{cache_key}_HD", f"{cache_key}_THUMB")
+            for p in glob.glob(os.path.join(root, "*", variant, "*"))
+            if os.path.isfile(p)
+        ]
+        if hits:
+            return hits, False
 
     if not filename:
         return [], False
@@ -728,7 +781,7 @@ _CDN_EXT = {
 }
 
 
-def download(url: str, timeout: int) -> tuple[bytes, str]:
+def download(url: str, timeout: float) -> tuple[bytes, str]:
     """从企微 CDN 取原图,返回 (内容, 扩展名)。"""
     try:
         resp = httpx.get(url, timeout=timeout, follow_redirects=True)
@@ -825,7 +878,7 @@ def locate(content, settings: Settings | None = None) -> Located:
 
 def locate_item(item: MediaItem, settings: Settings | None = None) -> Located:
     """一个已抽取媒体项 → 本地缓存位置。"""
-    hits, by_md5 = _candidates(item.filename, item.md5, settings)
+    hits, by_md5 = _candidates(item.filename, item.md5, settings, item.cache_keys)
     return Located(item.md5, item.filename, item.source_url, hits, by_md5)
 
 
@@ -881,10 +934,11 @@ def _trigger_client(rid: int, lid: int, settings: Settings) -> bool:
 
 
 def _ensure(
-    relocate: Callable[[], Located], fetch: Callable[[], str] | None,
+    relocate: Callable[[], Located], fetches: list[tuple[str, Callable[[], str]]],
     settings: Settings, rid=0, lid: int = 0, deadline: float | None = None,
+    *, allow_client: bool = True,
 ) -> str:
-    """本地命中 → `fetch()`(BigCDN TCP)→ 触发企微客户端等它自己下。
+    """本地命中 → 主动下载路径 → 触发企微客户端等它自己下。
 
     `relocate` 每次调用都重新 glob:等的就是「文件刚刚出现」。`deadline` 是**整条
     消息**共享的取图预算,给 None 表示只受本次 `mars_image_client_wait` 约束。
@@ -892,13 +946,15 @@ def _ensure(
     单图正文和媒体树里的项走的是同一段逻辑,差别只在怎么定位、怎么下载。分成两份
     抄的话,给其中一条加取图路径而忘了另一条,那些消息会被永远判定成「还在路上」。
     """
-    if fetch and settings.mars_image_tcp_enabled and (deadline is None or time.monotonic() < deadline):
+    for label, fetch in fetches:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         try:
             return fetch()
         except (media_tcp.MediaTCPError, MediaError, OSError) as e:
-            log.info("BigCDN TCP 拉图失败,改用客户端触发: %s", e)
+            log.info("%s拉图失败,继续回退: %s", label, e)
 
-    if deadline is not None and time.monotonic() >= deadline:
+    if not allow_client or (deadline is not None and time.monotonic() >= deadline):
         return ""
 
     # 切会话和等文件必须处在同一次 UI 独占里。只锁 ``open -g`` 那一瞬间的话,
@@ -944,8 +1000,8 @@ def ensure_local(content, settings: Settings, rid=0, lid: int = 0) -> str:
         data, ext = media_tcp.download(content, settings)
         return _cache_download(data, ext, loc.md5, settings)
 
-    return _ensure(lambda: locate(content, settings), fetch if loc.md5 else None,
-                   settings, rid, lid)
+    fetches = [("BigCDN TCP", fetch)] if loc.md5 and settings.mars_image_tcp_enabled else []
+    return _ensure(lambda: locate(content, settings), fetches, settings, rid, lid)
 
 
 def ensure_item_local(
@@ -957,18 +1013,50 @@ def ensure_item_local(
     `loc` 让调用方把自己刚 glob 出来的结果传进来 —— 这一趟 glob 不便宜
     (`_candidates` 的 docstring 记了实测数字),不该为同一个问题走两遍。
     """
-    if item.kind != "image" or item.ticket is None:
+    if item.kind != "image":
         return ""
     found = loc if loc is not None else locate_item(item, settings)
     if found.hits:
         return found.best()
 
-    def fetch() -> str:
-        assert item.ticket is not None
-        data, ext = media_tcp.download_ticket(item.ticket, settings, deadline=deadline)
-        return _cache_download(data, ext, item.md5, settings)
+    fetches: list[tuple[str, Callable[[], str]]] = []
 
-    return _ensure(lambda: locate_item(item, settings), fetch, settings, rid, lid, deadline)
+    if item.source_url:
+
+        def fetch_url() -> str:
+            timeout = float(settings.kodo_timeout)
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise MediaError("整条消息的取图预算已耗尽")
+                timeout = min(timeout, left)
+            data, ext = download(item.source_url, timeout)
+            if item.md5_verified and hashlib.md5(data).hexdigest() != item.md5:
+                raise MediaError("临时地址返回的图片 MD5 不匹配")
+            return _cache_download(data, ext, item.md5, settings)
+
+        fetches.append(("临时 URL", fetch_url))
+
+    if item.ticket is not None and settings.mars_image_tcp_enabled:
+
+        def fetch_ticket() -> str:
+            assert item.ticket is not None
+            data, ext = media_tcp.download_ticket(item.ticket, settings, deadline=deadline)
+            return _cache_download(data, ext, item.md5, settings)
+
+        fetches.append(("BigCDN TCP", fetch_ticket))
+
+    # 没有协议 MD5 的 URL 兼容载荷使用 URL 摘要去重,客户端缓存里不可能出现
+    # 这个目录名;主动下载失败后继续切会话只会白等。
+    return _ensure(
+        lambda: locate_item(item, settings),
+        fetches,
+        settings,
+        rid,
+        lid,
+        deadline,
+        allow_client=item.md5_verified,
+    )
 
 
 def resolve_item(
@@ -979,22 +1067,11 @@ def resolve_item(
     if not settings.kodo_enabled or item.kind != "image":
         return ""
     try:
-        if item.source_url:
-            # type=101 的临时 URL 经常已经过期,但企微缓存或服务自己的
-            # media-cache 里可能已有同一张原图。优先复用本地文件,避免再打
-            # 一个必然返回 400 的旧链接。
-            found = locate_item(item, settings)
-            if found.hits:
-                return upload(found.best(), settings, rid, send_time, md5=item.md5)
-            timeout = settings.kodo_timeout
-            if deadline is not None:
-                timeout = max(1, min(timeout, int(deadline - time.monotonic())))
-            data, ext = download(item.source_url, timeout)
-            return upload_bytes(data, ext, settings, rid, send_time)
         path = ensure_item_local(item, settings, rid, lid, deadline)
         if not path:
             return ""
-        return upload(path, settings, rid, send_time, md5=item.md5)
+        digest = item.md5 if item.md5_verified else ""
+        return upload(path, settings, rid, send_time, md5=digest)
     except (MediaError, OSError) as e:
         log.warning("取图/上传失败(%s),退回占位符: %s", item.filename or item.md5, e)
         return ""
