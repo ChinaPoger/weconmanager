@@ -310,10 +310,10 @@ _senders_cache: tuple[tuple[float, int], dict[int, dict]] | None = None
 
 
 def _load_senders() -> dict[int, dict]:
-    """Session.db USER: RID → {name, userid, avatar}。
+    """Session.db USER: RID → {name, userid, corpid, avatar}。
 
     userid 就是 acctid(官方 API 认的 userid);外部联系人和机器人没有 acctid,
-    留空由调用方决定怎么兜。
+    留空由调用方决定怎么兜。corpid 用来区分同名的跨企业成员。
 
     结果按 (mtime, size) 缓存: 同步循环每轮都要这张表,而通讯录几乎不变 ——
     默认 3s 间隔下不缓存就是每天两万多次全表扫描。
@@ -333,17 +333,33 @@ def _load_senders() -> dict[int, dict]:
     try:
         conn = sqlite3.connect(path)
         try:
-            rows = conn.execute("SELECT RID, name, acctid, avatarurl FROM USER").fetchall()
+            try:
+                rows = conn.execute(
+                    "SELECT RID, name, acctid, corpid, avatarurl FROM USER"
+                ).fetchall()
+                has_corpid = True
+            except sqlite3.OperationalError as e:
+                # 兼容旧版本地库:没有 corpid 时仍可同步消息,但字段留空。
+                if "no such column" not in str(e).lower() or "corpid" not in str(e).lower():
+                    raise
+                rows = conn.execute(
+                    "SELECT RID, name, acctid, avatarurl FROM USER"
+                ).fetchall()
+                has_corpid = False
         finally:
             conn.close()
     except sqlite3.Error as e:
         log.warning("读取 Session.db USER 失败: %s", e)
         return {}
 
-    senders = {
-        r[0]: {"name": r[1] or "", "userid": r[2] or "", "avatar": r[3] or ""}
-        for r in rows
-    }
+    senders = {}
+    for r in rows:
+        senders[r[0]] = {
+            "name": r[1] or "",
+            "userid": r[2] or "",
+            "corpid": (r[3] if has_corpid else "") or "",
+            "avatar": (r[4] if has_corpid else r[3]) or "",
+        }
     _senders_cache = (stamp, senders)
     return senders
 
@@ -684,6 +700,7 @@ def fetch_since(
             "sender_id": r["sender_id"],
             "sender_name": sender.get("name") or v.export.resolve_sender(r["sender_id"], names),
             "sender_userid": sender.get("userid", ""),
+            "sender_corpid": sender.get("corpid", ""),
             "avatar": sender.get("avatar", ""),
             "type": label,
             # 正文和引用分开给,**不在这里拼成一段字符串**: 拼了的话下游要把
