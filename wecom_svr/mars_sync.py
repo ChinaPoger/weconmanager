@@ -589,6 +589,10 @@ def _ready_count(msgs: list[dict], settings: Settings) -> int:
                 # 定位一次就把结果一路传下去 —— 每次 glob 都要扫遍缓存目录
                 # (`_candidates` 的 docstring 记了实测数字),同一个问题不问三遍。
                 loc = media.locate_item(item, settings)
+                # type=101 的图片已经带着企微临时下载地址,可以当场拉取,不需要
+                # 等本地 Images 缓存或触发客户端切会话。
+                if loc.url:
+                    continue
                 if not loc.hits:
                     got = media.ensure_item_local(item, settings, rid, lid, deadline, loc)
                     waiting = waiting or not got

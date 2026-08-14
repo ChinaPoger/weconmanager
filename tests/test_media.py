@@ -128,6 +128,24 @@ def test_qq_relayed_images_have_no_filename():
 # ─── CDN 直链解析 ───────────────────────────────────────────────────────
 
 CDN = b"https://wework.qpic.cn/wwpic/393399_B-z8XhrZQ0iNrFM_1605166359/0"
+WEWORK_IMAGE_1 = b"https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=v1_one"
+WEWORK_IMAGE_2 = b"https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=v1_two"
+WEWORK_IMAGE_3 = b"https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=v1_three"
+
+
+def test_type101_collects_all_embedded_wework_image_urls():
+    body = _pb(3, WEWORK_IMAGE_1) + _pb(26, WEWORK_IMAGE_2) + _pb(32, _pb(1, WEWORK_IMAGE_3))
+
+    items = media.collect(body)
+
+    assert [item.source_url for item in items] == [
+        WEWORK_IMAGE_1.decode(), WEWORK_IMAGE_2.decode(), WEWORK_IMAGE_3.decode(),
+    ]
+    assert all(item.kind == "image" and item.ticket is None for item in items)
+
+
+def test_non_wework_urls_are_not_treated_as_media_links():
+    assert media.image_urls(_pb(3, CDN)) == []
 
 
 def test_url_is_read_from_the_first_protobuf_field():

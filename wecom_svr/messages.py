@@ -427,6 +427,11 @@ def _render(content_type: int, content, label: str) -> str:
     """
     if content_type in TYPE_OVERRIDES and (ph := MEDIA_PLACEHOLDER.get(label)):
         return ph
+    # 企业微信的 type=101 多图消息把临时 tpdownloadmedia 地址直接塞进正文。
+    # 它们是图片载荷,不是应该展示给 Mars 用户的文本链接;媒体同步层会逐张
+    # 下载并换成 Kodo URL。
+    if content_type == 101 and media.image_urls(content):
+        return IMAGE_PLACEHOLDER
     if rich := _rich_image_text(content_type, content):
         return rich
     rendered = _vendor().export.render(content_type, content) or ""

@@ -408,6 +408,11 @@ curl http://127.0.0.1:8090/api/v1/mars/sync/status
 取而不是全文搜 `http://` —— 合并转发的聊天记录里也有一堆链接,但那些是发言人头像
 (`wwhead`/`mmhead`),藏在嵌套消息里。
 
+企微机器人/应用发送的多图还可能被编码成 `content_type=101`,把多条
+`imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia` 临时地址放在不同的
+protobuf 字段里。这类地址同样不会直接推给 mars:同步器会按出现顺序逐张下载、上传
+到 Kodo,再把正文渲染成多个自有图片 URL。
+
 那条直链**不会直接推给 mars**:它是企微的资源,寿命和权限都不归我们管。
 
 #### 对象 key
