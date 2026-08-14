@@ -246,10 +246,12 @@ def _open_picker() -> None:
 
     点不中就按候选偏移再试(见 ui_offsets.py):"+" 不在 AX 树里,偏移是量出来的,
     而这里的成功信号又干净又便宜 —— 面板开没开一问就知道,正适合拿来自动校准。
-    试中了记下来,下次第一发就命中。
+    试中了记下来,下次第一发就命中。已有面板会先自动取消,避免上一次异常中断
+    把后续操作永久卡住。
     """
     if _sheet_open():
-        raise LocalGroupError("客户端上已经有一个弹出面板开着,请先关掉再试")
+        log.warning("打开「发起群聊」前发现残留面板,正在自动关闭")
+        _recover_open_sheet()
 
     tried: list[tuple[int, int]] = []
     for i, (dx, dy) in enumerate(ui_offsets.candidates("plus")):
@@ -318,6 +320,34 @@ def _close_picker() -> None:
         time.sleep(0.8)
     except LocalGroupError as e:
         log.warning("关闭「发起群聊」面板失败,客户端上可能残留一个面板: %s", e)
+
+
+def _recover_open_sheet() -> None:
+    """清理进入发起群聊流程前残留的客户端面板,并确认它真的关闭。
+
+    已知的发起群聊面板必须点「取消」,因为这个 sheet 对 Escape 不响应。其它
+    面板只发一次 Escape:它是通用的取消动作,不会点击未知控件。关不掉就失败,
+    继续校准会有把输入送进错误窗口的风险。
+    """
+    state = _sheet_state()
+    if state == _SHEET_NONE:
+        return
+
+    if state == _SHEET_PICKER:
+        log.warning("发现残留的「发起群聊」面板,正在自动取消")
+        _close_picker()
+    else:
+        log.warning("发现无法识别的企业微信弹出面板,正在尝试 Escape 关闭")
+        _osa(_MAIN_WINDOW + '''
+  set frontmost to true
+  key code 53
+  delay 0.5
+''')
+
+    if _sheet_state() != _SHEET_NONE:
+        raise LocalGroupError(
+            "客户端上的残留弹出面板无法自动关闭,请手动关闭后再试"
+        )
 
 
 # ─── 选人 ──────────────────────────────────────────────────────────────
@@ -475,8 +505,6 @@ def calibrate_ui() -> dict:
     ensure_macos()
     with ui_session("启动 UI 预检"):
         _activate()
-        # 面板没打开就没有要收拾的东西,所以这里不需要 try/finally:
-        # _open_picker() 抛错时唯一正确的动作就是让错误直接冒上去。
         _open_picker()
         _close_picker()
         if _sheet_open():
