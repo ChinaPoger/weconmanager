@@ -62,6 +62,13 @@ def test_unknown_type_falls_through_to_upstream():
     assert messages._type_name(9999) == "type9999"
 
 
+def test_type101_wework_image_links_become_an_image_placeholder():
+    url = b"https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=v1_one"
+    content = b"\x1a" + bytes([len(url)]) + url
+
+    assert messages._render(101, content, "type101") == "[图片]"
+
+
 # ─── 引用回复 ──────────────────────────────────────────────────────────
 
 def _pb(field: int, payload: bytes) -> bytes:

@@ -76,6 +76,10 @@ MEDIA_TREE_MAX_NODES = 4096
 MEDIA_TREE_MAX_BYTES = 16 * 1024 * 1024
 _MEDIA_CONTAINER_FIELDS = frozenset({1, 17, 103, 107, 1002})
 _MARS_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"})
+_WEWORK_IMAGE_URL = re.compile(
+    rb"https?://imunion\.weixin\.qq\.com/cgi-bin/mmae-bin/tpdownloadmedia\?param="
+    rb"[^\x00-\x20\x7f-\xff\"<>]+"
+)
 
 
 class MediaError(RuntimeError):
@@ -91,6 +95,36 @@ class MediaItem:
     filename: str
     kind: Literal["image", "file"]
     ticket: media_tcp.ImageTicket | None
+    source_url: str = ""       # 企微正文直接携带的临时图片地址
+
+
+def image_urls(content) -> list[str]:
+    """取正文里企微 ``tpdownloadmedia`` 图片地址,按出现顺序去重。
+
+    ``content_type=101`` 的多图消息不是普通图片票据:它把图片放在多个
+    protobuf 字段里,每张图只给一个临时下载地址。不能把这类 URL 当成最终
+    消息正文,但可以在本机及时下载后重新上传到 Kodo。
+
+    这里只认企微图片下载接口,不全文接管普通 ``http(s)`` 链接,避免把
+    链接卡片、聊天记录里的 URL 和头像误判成图片。
+    """
+    if not content:
+        return []
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+    if not isinstance(content, bytes):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _WEWORK_IMAGE_URL.finditer(content):
+        try:
+            url = match.group().decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
 
 
 def _pb_nodes(buf: bytes) -> list[tuple[int, int, bytes | int]] | None:
@@ -207,6 +241,15 @@ def collect(content) -> list[MediaItem]:
                 walk(child, len(value), depth + 1)
 
     walk(root, len(content), 0)
+    # type=101 的多图载荷没有标准 ImageTicket,但正文里每张图都有自己的
+    # tpdownloadmedia 地址。把它们也纳入同一个媒体计划,下游就能逐张下载、上传、
+    # 排版,而不是把临时地址原样推给 Mars。
+    for index, url in enumerate(image_urls(content), 1):
+        # 这里只用 URL 的摘要做本条消息内的去重键;上传对象的真正区分位仍由
+        # upload_bytes() 对下载后的图片字节计算,不会把临时 URL 当作图片身份。
+        digest = hashlib.md5(url.encode("ascii")).hexdigest()
+        found.append(MediaItem(digest, 0, f"image-{index}.jpg", "image", None, url))
+
     # 同 md5 后遇到 image 时把 file 就地升级,保留首次位置和首次文件名。
     # dict 保序,且替换已有 key 不会改变它的位置 —— 正好是要的语义。
     out: dict[str, MediaItem] = {}
@@ -217,6 +260,7 @@ def collect(content) -> list[MediaItem]:
         elif first.kind == "file" and item.kind == "image":
             out[item.md5] = MediaItem(
                 item.md5, item.size, first.filename or item.filename, "image", item.ticket,
+                first.source_url or item.source_url,
             )
     return list(out.values())
 
@@ -705,6 +749,8 @@ def locate(content, settings: Settings | None = None) -> Located:
 
 def locate_item(item: MediaItem, settings: Settings | None = None) -> Located:
     """一个已抽取媒体项 → 本地缓存位置。"""
+    if item.source_url:
+        return Located(item.md5, item.filename, item.source_url, [], False)
     hits, by_md5 = _candidates(item.filename, item.md5, settings)
     return Located(item.md5, item.filename, "", hits, by_md5)
 
@@ -859,6 +905,12 @@ def resolve_item(
     if not settings.kodo_enabled or item.kind != "image":
         return ""
     try:
+        if item.source_url:
+            timeout = settings.kodo_timeout
+            if deadline is not None:
+                timeout = max(1, min(timeout, int(deadline - time.monotonic())))
+            data, ext = download(item.source_url, timeout)
+            return upload_bytes(data, ext, settings, rid, send_time)
         path = ensure_item_local(item, settings, rid, lid, deadline)
         if not path:
             return ""
