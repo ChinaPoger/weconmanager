@@ -144,6 +144,26 @@ def test_type101_collects_all_embedded_wework_image_urls():
     assert all(item.kind == "image" and item.ticket is None for item in items)
 
 
+def test_type101_dedupes_original_thumbnail_and_nested_reference():
+    digest = b"c" * 32
+    body = b"".join([
+        _pb(3, WEWORK_IMAGE_1),
+        _varint(4 << 3 | 0) + _varint(618840),
+        _pb(8, digest),
+        _pb(26, WEWORK_IMAGE_2),
+        _varint(27 << 3 | 0) + _varint(3723),
+        _pb(31, digest),
+        _pb(32, _pb(1, WEWORK_IMAGE_3)),
+    ])
+
+    items = media.collect(body)
+
+    assert media.image_urls(body) == [WEWORK_IMAGE_1.decode()]
+    assert [(item.md5, item.source_url) for item in items] == [
+        (digest.decode(), WEWORK_IMAGE_1.decode()),
+    ]
+
+
 def test_non_wework_urls_are_not_treated_as_media_links():
     assert media.image_urls(_pb(3, CDN)) == []
 
@@ -611,6 +631,25 @@ def test_cdn_download_failure_degrades_to_the_placeholder(cache, settings, monke
     cache.mkdir(parents=True)
     monkeypatch.setattr(media, "download", boom)
     assert media.resolve(_pb_field1(CDN), settings) == ""
+
+
+def test_type101_reuses_local_cache_when_temp_url_expired(settings, monkeypatch):
+    data = b"cached image"
+    digest = hashlib.md5(data).hexdigest()
+    path = settings.data_dir / "media-cache" / f"{digest}.jpg"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(data)
+    item = media.MediaItem(
+        digest, 0, "image-1.jpg", "image", None, WEWORK_IMAGE_1.decode(),
+    )
+
+    def expired(*args, **kwargs):
+        raise media.MediaError("400")
+
+    monkeypatch.setattr(media, "download", expired)
+    monkeypatch.setattr(media, "upload", lambda *args, **kwargs: "https://cdn/cached.jpg")
+
+    assert media.resolve_item(item, settings) == "https://cdn/cached.jpg"
 
 
 # ─── pending: 「还没到」和「没有」是两回事 ──────────────────────────────
