@@ -98,22 +98,8 @@ class MediaItem:
     source_url: str = ""       # 企微正文直接携带的临时图片地址
 
 
-def image_urls(content) -> list[str]:
-    """取正文里企微 ``tpdownloadmedia`` 图片地址,按出现顺序去重。
-
-    ``content_type=101`` 的多图消息不是普通图片票据:它把图片放在多个
-    protobuf 字段里,每张图只给一个临时下载地址。不能把这类 URL 当成最终
-    消息正文,但可以在本机及时下载后重新上传到 Kodo。
-
-    这里只认企微图片下载接口,不全文接管普通 ``http(s)`` 链接,避免把
-    链接卡片、聊天记录里的 URL 和头像误判成图片。
-    """
-    if not content:
-        return []
-    if isinstance(content, str):
-        content = content.encode("utf-8", "surrogateescape")
-    if not isinstance(content, bytes):
-        return []
+def _scan_image_urls(content: bytes) -> list[str]:
+    """全文找企微图片地址,只做 URL 层面的去重。"""
     out: list[str] = []
     seen: set[str] = set()
     for match in _WEWORK_IMAGE_URL.finditer(content):
@@ -125,6 +111,25 @@ def image_urls(content) -> list[str]:
             seen.add(url)
             out.append(url)
     return out
+
+
+def image_urls(content) -> list[str]:
+    """取正文里企微图片地址,按**图片身份**去重。
+
+    ``content_type=101`` 的一张图会同时带原图、缩略图和嵌套引用,这些地址
+    的签名不同,不能按 URL 去重。``_image_links`` 会优先用协议里的图片
+    MD5 识别同一张图,并选字段 3 的原图地址。
+
+    这里只认企微图片下载接口,不全文接管普通 ``http(s)`` 链接,避免把
+    链接卡片、聊天记录里的 URL 和头像误判成图片。
+    """
+    if not content:
+        return []
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+    if not isinstance(content, bytes):
+        return []
+    return [url for url, _digest in _image_links(content)]
 
 
 def _pb_nodes(buf: bytes) -> list[tuple[int, int, bytes | int]] | None:
@@ -162,6 +167,47 @@ def _pb_nodes(buf: bytes) -> list[tuple[int, int, bytes | int]] | None:
     except media_tcp.MediaTCPError:
         return None
     return out
+
+
+def _image_links(content: bytes) -> list[tuple[str, str]]:
+    """返回 ``(临时地址, 图片 MD5)``;没有协议身份时退回 URL 去重。
+
+    实测 type=101 的结构是:
+
+    - field 3: 原图 URL, field 4/5/6: 原图大小和尺寸;
+    - field 8: 原图 MD5;
+    - field 26: 同一张图的缩略 URL, field 27/28/29: 缩略图大小和尺寸;
+    - field 31/32: 重复的 MD5/嵌套引用。
+
+    因此 field 3、26、32 里的 URL 不是三张图片。协议未带可识别 MD5
+    (例如单元测试里的简化载荷)时,才保留所有不同 URL。
+    """
+    urls = _scan_image_urls(content)
+    if not urls:
+        return []
+    root = _pb_nodes(content)
+    if root is not None:
+        digest = next(
+            (
+                value.decode("ascii").lower()
+                for field, wire, value in root
+                if field == 8
+                and wire == 2
+                and isinstance(value, bytes)
+                and _HEX32.fullmatch(value)
+            ),
+            "",
+        )
+        if digest:
+            # field 3 是原图 URL,比 field 26 的缩略图更适合落地。
+            primary = [
+                url
+                for field, wire, value in root
+                if field == 3 and wire == 2 and isinstance(value, bytes)
+                for url in _scan_image_urls(value)
+            ]
+            return [(primary[0] if primary else urls[0], digest)]
+    return [(url, "") for url in urls]
 
 
 def _item_at(nodes: list[tuple[int, int, bytes | int]]) -> MediaItem | None:
@@ -241,13 +287,12 @@ def collect(content) -> list[MediaItem]:
                 walk(child, len(value), depth + 1)
 
     walk(root, len(content), 0)
-    # type=101 的多图载荷没有标准 ImageTicket,但正文里每张图都有自己的
-    # tpdownloadmedia 地址。把它们也纳入同一个媒体计划,下游就能逐张下载、上传、
-    # 排版,而不是把临时地址原样推给 Mars。
-    for index, url in enumerate(image_urls(content), 1):
-        # 这里只用 URL 的摘要做本条消息内的去重键;上传对象的真正区分位仍由
-        # upload_bytes() 对下载后的图片字节计算,不会把临时 URL 当作图片身份。
-        digest = hashlib.md5(url.encode("ascii")).hexdigest()
+    # type=101 的载荷没有标准 ImageTicket,但正文里有临时 tpdownloadmedia
+    # 地址。按协议里的图片 MD5 去重,避免一张图的原图/缩略图被排成两张。
+    for index, (url, media_digest) in enumerate(_image_links(content), 1):
+        # 没有协议 MD5 的简化/兼容载荷只能用 URL 摘要做本条消息内的去重键;
+        # 有协议 MD5 时则保留它,这样还能命中已经落地的本地缓存。
+        digest = media_digest or hashlib.md5(url.encode("ascii")).hexdigest()
         found.append(MediaItem(digest, 0, f"image-{index}.jpg", "image", None, url))
 
     # 同 md5 后遇到 image 时把 file 就地升级,保留首次位置和首次文件名。
@@ -780,10 +825,8 @@ def locate(content, settings: Settings | None = None) -> Located:
 
 def locate_item(item: MediaItem, settings: Settings | None = None) -> Located:
     """一个已抽取媒体项 → 本地缓存位置。"""
-    if item.source_url:
-        return Located(item.md5, item.filename, item.source_url, [], False)
     hits, by_md5 = _candidates(item.filename, item.md5, settings)
-    return Located(item.md5, item.filename, "", hits, by_md5)
+    return Located(item.md5, item.filename, item.source_url, hits, by_md5)
 
 
 _trigger_lock = threading.Lock()
@@ -937,6 +980,12 @@ def resolve_item(
         return ""
     try:
         if item.source_url:
+            # type=101 的临时 URL 经常已经过期,但企微缓存或服务自己的
+            # media-cache 里可能已有同一张原图。优先复用本地文件,避免再打
+            # 一个必然返回 400 的旧链接。
+            found = locate_item(item, settings)
+            if found.hits:
+                return upload(found.best(), settings, rid, send_time, md5=item.md5)
             timeout = settings.kodo_timeout
             if deadline is not None:
                 timeout = max(1, min(timeout, int(deadline - time.monotonic())))
