@@ -412,7 +412,7 @@ def peek_outbox(msg: dict, settings: Settings) -> dict | None:
         if not isinstance(hook, dict) or not isinstance(hook.get("message"), str):
             raise TypeError("hook 格式无效")
         # 早期 outbox 可能把 SQLite 的数字身份原样冻结下来。正文必须保持首次
-        # 决定，但身份字段只是 JSON 契约适配，重试时归一化不会改变消息去重键。
+        # 决定,但身份字段只是 JSON 契约适配,重试时归一化不会改变消息去重键。
         for field in ("userid", "corpid"):
             if field in hook:
                 hook[field] = str(hook[field] or "")
