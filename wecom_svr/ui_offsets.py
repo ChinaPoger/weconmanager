@@ -1,10 +1,12 @@
 """只能靠坐标点的那几个界面位置,以及它们的自动校准。
 
 操控客户端的绝大部分动作走 AX 树:元素能按名字找、属性能回读,布局变了顶多报错,
-不会点错地方。只有两个位置没有对应的 AX 元素,只能按主窗口左上角取相对偏移去点:
+不会点错地方。当前只有 "+" 没有对应的 AX 元素,必须按主窗口左上角取相对偏移:
 
   - `plus`  —— 会话列表顶部的 "+",点它打开「发起群聊」面板
-  - `title` —— 会话标题,点它把标题变成改名输入框
+
+`title` 是旧版客户端的兼容项。企业微信 5.0.9 起标题是可写 AXTextField,主流程
+不再依赖坐标;只有检测不到该控件时才用 `title` 偏移点开改名输入框。
 
 量出来的常量在这里是**起点,不是唯一答案**:客户端改版、换布局,偏移就会变,
 而它的失败方式是「点了个寂寞」甚至「点到别的东西上」。所以每个位置都配一条
@@ -122,16 +124,19 @@ def candidates(name: str, settings: Settings | None = None) -> list[Point]:
 
 
 def remember(name: str, point: Point, settings: Settings | None = None) -> None:
-    """记住一个刚被验证过的偏移。和现在用的一样就不写盘。
+    """记住一个刚被验证过的偏移。
 
-    写失败只吼一嗓子:这个文件丢了无非是下次再校准一遍,为它中断一次已经成功的
-    操作不划算。
+    首次校准即使默认坐标直接命中也会落盘,让新机器明确生成自己的运行时配置。
+    已经保存过相同值时不重复写。写失败只吼一嗓子:这个文件丢了无非是下次再
+    校准一遍,为它中断一次已经成功的操作不划算。
     """
     s = _settings(settings)
-    if primary(_check(name), s) == tuple(point):
-        return
+    _check(name)
     if override(name, s) is not None:
         return  # 人配死了的位置不记忆,免得下次读到一个和配置打架的值
+    point = (int(point[0]), int(point[1]))
+    if learned(name, s) == point:
+        return
 
     path = _state_file(s)
     try:
@@ -140,7 +145,7 @@ def remember(name: str, point: Point, settings: Settings | None = None) -> None:
             data = {}
     except (OSError, json.JSONDecodeError):
         data = {}
-    data[name] = f"{int(point[0])},{int(point[1])}"
+    data[name] = f"{point[0]},{point[1]}"
 
     try:
         _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))

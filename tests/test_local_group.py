@@ -9,7 +9,7 @@ import re
 import pytest
 from fastapi.testclient import TestClient
 
-from wecom_svr import local_group, ui_offsets
+from wecom_svr import directory, local_group, local_send, ui_offsets
 from wecom_svr.main import create_app
 from wecom_svr.settings import get_agent_home, get_settings
 
@@ -96,6 +96,8 @@ def _fast_and_macos(monkeypatch, tmp_path):
     monkeypatch.setattr(local_group.time, "sleep", lambda _s: None)
     monkeypatch.setattr(local_group, "SHEET_TIMEOUT", 0.1)
     monkeypatch.setattr(local_group, "PROBE_TIMEOUT", 0.1)
+    monkeypatch.setattr(directory, "get_self", lambda: {"userid": "me"})
+    monkeypatch.setattr(directory, "resolve_member", lambda q: {"userid": q})
     yield
     get_settings.cache_clear()
     get_agent_home.cache_clear()
@@ -128,6 +130,29 @@ def test_dedups_and_trims_input(fake):
     r = local_group.create_group([" 陈涛 ", "陈挺", "陈涛", ""])
     assert r["success"] is True
     assert len(r["members"]) == 2
+
+
+def test_ignores_current_user_in_members(fake, monkeypatch):
+    monkeypatch.setattr(
+        directory,
+        "resolve_member",
+        lambda q: {"userid": "me" if q == "zixunguwen" else q},
+    )
+    r = local_group.create_group(["陈涛", "陈挺", "zixunguwen"])
+    assert r["success"] is True
+    assert [m["query"] for m in r["members"]] == ["陈涛", "陈挺"]
+    assert r["member_count"] == 3
+    assert "zixunguwen" not in fake.scripts
+
+
+def test_self_filter_degrades_when_directory_is_unavailable(fake, monkeypatch):
+    monkeypatch.setattr(
+        directory,
+        "get_self",
+        lambda: (_ for _ in ()).throw(local_group.LocalSendError("db unavailable")),
+    )
+    r = local_group.create_group(["陈涛", "陈挺"])
+    assert r["success"] is True
 
 
 def test_opens_picker_before_selecting(fake):
@@ -167,10 +192,57 @@ def test_needs_at_least_two_others(fake):
     assert fake.plus_clicked is False  # 参数不对就别去动客户端
 
 
-def test_refuses_when_a_panel_is_already_open(fake):
+def test_needs_two_others_after_ignoring_self(fake, monkeypatch):
+    monkeypatch.setattr(
+        directory,
+        "resolve_member",
+        lambda q: {"userid": "me" if q == "zixunguwen" else q},
+    )
+    r = local_group.create_group(["陈涛", "zixunguwen"])
+    assert r["success"] is False
+    assert "至少要 2 个人" in r["error"]
+    assert fake.plus_clicked is False
+
+
+def test_closes_a_panel_before_opening_picker(fake):
     fake.sheet_open = True
-    with pytest.raises(local_group.LocalGroupError, match="已经有一个弹出面板"):
-        local_group.create_group(["陈涛", "陈挺"])
+
+    result = local_group.create_group(["陈涛", "陈挺"])
+
+    assert result["success"] is True
+    assert fake.confirmed is True
+    assert fake.sheet_open is False
+
+
+def test_ui_preflight_recovers_a_stale_picker(fake):
+    fake.sheet_open = True
+
+    result = local_group.calibrate_ui()
+
+    assert result["success"] is True
+    assert fake.plus_clicked is True
+    assert fake.sheet_open is False
+    assert any('button "Cancel"' in script for script in fake.scripts)
+
+
+def test_ui_preflight_recovers_an_unknown_sheet(monkeypatch):
+    class UnknownSheet(FakeClient):
+        def __call__(self, script, timeout=15):
+            if "splitter group 1 of sh)" in script:
+                if not self.sheet_open:
+                    return True, "0"
+                return True, "1" if self.plus_clicked else "2"
+            return super().__call__(script, timeout)
+
+    client = UnknownSheet(DIRECTORY)
+    client.sheet_open = True
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+
+    result = local_group.calibrate_ui()
+
+    assert result["success"] is True
+    assert any("key code 53" in script for script in client.scripts)
+    assert client.sheet_open is False
 
 
 def test_missing_panel_after_plus_is_a_clear_error(monkeypatch):
@@ -188,8 +260,8 @@ def test_missing_panel_after_plus_is_a_clear_error(monkeypatch):
 
 # ─── 坐标自动校准 ──────────────────────────────────────────────────────
 #
-# "+" 和会话标题是仅有的两个没有 AX 元素、只能按坐标点的位置。量出来的常量迟早
-# 会被客户端改版打掉,所以点不中要能自己在附近找回来 —— 这几条守的就是那件事。
+# "+" 仍只能按坐标点;会话标题坐标是旧版客户端兼容路径。量出来的常量迟早会被
+# 客户端改版打掉,所以点不中要能自己在附近找回来 —— 这几条守的就是那件事。
 
 class OnlyAtOffset(FakeClient):
     """只有点在某个横向偏移上才会开面板,用来验校准真的在挪位置。"""
@@ -346,12 +418,14 @@ def test_overshoot_aborts_instead_of_compensating(fake, monkeypatch):
 @pytest.fixture
 def rename_env(monkeypatch, fake):
     """假的「点标题 → 输入框 → 回车 → 落库」链路。"""
-    state = {"names": {77: "陈挺、陈涛、任威风"}, "clicked": False, "typed": None}
+    state = {"names": {77: "陈挺、陈涛、任威风"}, "clicked": False, "typed": None, "escaped": False}
 
     monkeypatch.setattr(local_group.local_send, "get_conversation_by_rid",
                         lambda rid: {"name": "", "rid": rid, "lid": 1, "type": 1, "fw_id": 0})
     monkeypatch.setattr(local_group.local_send, "_open_conversation_by_scheme",
                         lambda conv, **kw: (True, "ok"))
+    # 这个 fixture 测旧版坐标兼容路径;新版 AX 路径单独在下方覆盖。
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: None)
     monkeypatch.setattr(local_group, "_window_point", lambda dx, dy: (100 + dx, 200 + dy))
     monkeypatch.setattr(local_group, "_group_names", lambda: dict(state["names"]))
 
@@ -368,6 +442,9 @@ def rename_env(monkeypatch, fake):
     orig_osa = local_group._osa
 
     def osa(body, timeout=20):
+        if "key code 53" in body:                      # Esc 退掉改名输入框
+            state["escaped"] = True
+            return ""
         if "command down" in body and '"v"' in body:   # 粘贴 + 回车
             state["typed"] = clip["v"]
             state["names"][77] = clip["v"]
@@ -385,6 +462,27 @@ def test_rename_verifies_against_the_database(rename_env):
     assert r["success"] is True
     assert r["old_name"] == "陈挺、陈涛、任威风"
     assert rename_env["names"][77] == "临时讨论组"
+
+
+def test_rename_prefers_writable_ax_title(rename_env, monkeypatch):
+    """5.0.9 的标题是可写 AXTextField,不应再走剪贴板和坐标探测。"""
+    def write_ax_title(name):
+        rename_env["names"][77] = name
+
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: rename_env["names"][77])
+    monkeypatch.setattr(local_group, "_write_ax_title", write_ax_title)
+    monkeypatch.setattr(
+        local_group,
+        "_open_edit_box_and_read_current",
+        lambda: pytest.fail("新版 AX 标题可用时不应走坐标兼容路径"),
+    )
+
+    r = local_group.rename_group(77, "临时讨论组")
+
+    assert r["success"] is True
+    assert r["old_name"] == "陈挺、陈涛、任威风"
+    assert rename_env["names"][77] == "临时讨论组"
+    assert rename_env["clicked"] is False
 
 
 def test_rename_aborts_when_no_edit_box_took_focus(rename_env, monkeypatch):
@@ -405,6 +503,31 @@ def test_rename_aborts_when_clipboard_looks_like_chat_history(rename_env, monkey
     assert rename_env["typed"] is None
 
 
+def test_clipboard_with_non_utf8_bytes_decodes_instead_of_raising(monkeypatch):
+    """剪贴板里可能是图片/富文本。解码异常穿透到 HTTP 层就是 500,而不是「不像群名」。
+
+    直接测 local_send 里的真身: 改名流程用的是 from-import 进来的同一个函数,
+    rename_env 会把它整个换掉,从那边测不到解码这一步。
+    """
+    monkeypatch.setattr(
+        local_send.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Result", (), {"stdout": b"\xc8\xff"})(),
+    )
+
+    assert local_send._get_clipboard() == "��"
+
+
+def test_a_probe_that_reads_undecodable_bytes_is_not_a_group_name(rename_env, monkeypatch):
+    """解码后的替换字符必须被判成「不像群名」,否则会把乱码当群名敲进去。"""
+    monkeypatch.setattr(local_group, "_real_click",
+                        lambda x, y: local_group._set_clipboard("��"))
+
+    with pytest.raises(local_group.LocalGroupError, match="不像群名"):
+        local_group.rename_group(77, "临时讨论组")
+    assert rename_env["typed"] is None
+
+
 def test_rename_reports_when_the_name_landed_on_another_group(rename_env, monkeypatch):
     """核验发现名字改到别的群上了 —— 必须说清楚是哪个,而不是笼统报失败。"""
     monkeypatch.setattr(local_group, "_group_names",
@@ -420,13 +543,24 @@ def test_rename_rejects_too_long_name(rename_env):
     assert "最多 50" in r["error"]
 
 
+def _snapshots(monkeypatch, *frames):
+    """按顺序吐出几帧「当前群列表」,最后一帧之后一直重复它。"""
+    seen = list(frames)
+
+    def next_frame():
+        return dict(seen.pop(0) if len(seen) > 1 else seen[0])
+
+    monkeypatch.setattr(local_group, "_group_names", next_frame)
+
+
 def test_create_with_name_locates_the_new_group_by_diff(fake, monkeypatch):
     names = {1: "旧群"}
     monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
     captured = {}
 
-    def fake_rename(rid, name):
-        captured["rid"], captured["name"] = rid, name
+    def fake_rename(rid, name, expect_members=None):
+        captured.update(rid=rid, name=name, expect_members=expect_members)
         return {"success": True}
 
     # 打桩打在不持锁的内部函数上 —— create_group 全程只拿一次 ui_session,
@@ -443,7 +577,88 @@ def test_create_with_name_locates_the_new_group_by_diff(fake, monkeypatch):
     r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组")
     assert r["success"] is True
     assert r["rid"] == 42 and r["name"] == "临时讨论组"
+    assert captured["rid"] == 42 and captured["name"] == "临时讨论组"
+    # 改名前要拿成员名核对归属,所以必须把选中的人传下去
+    assert captured["expect_members"] == ["陈涛(水淼淼)", "陈挺"]
+
+
+def test_create_with_name_waits_for_delayed_database_visibility(fake, monkeypatch):
+    _snapshots(monkeypatch, {1: "旧群"}, {1: "旧群"}, {1: "旧群", 42: ""})
+    captured = {}
+    monkeypatch.setattr(
+        local_group,
+        "_rename_locked",
+        lambda rid, name, expect_members=None: (
+            captured.update(rid=rid, name=name) or {"success": True}
+        ),
+    )
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_TIMEOUT", 5.0)
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
+
+    r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组")
+
+    assert r["success"] is True
+    assert r["rid"] == 42
+    assert r["name"] == "临时讨论组"
     assert captured == {"rid": 42, "name": "临时讨论组"}
+
+
+def test_a_second_conversation_landing_right_after_blocks_the_rename(fake, monkeypatch):
+    """看到一个新会话就立刻改名,会改到别人刚把你拉进的群上 —— 要多等一拍。"""
+    _snapshots(monkeypatch, {1: "旧群"}, {1: "旧群", 42: ""}, {1: "旧群", 42: "", 43: ""})
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
+    monkeypatch.setattr(
+        local_group,
+        "_rename_locked",
+        lambda *a, **kw: pytest.fail("新增会话不唯一时不该动任何一个群"),
+    )
+
+    r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组")
+
+    assert r["success"] is True          # 群确实建出来了
+    assert r["rid"] is None
+    assert "新增 2 个" in r["name_error"]
+
+
+def test_rename_refuses_a_conversation_that_is_not_the_new_group(rename_env):
+    """差集选中的会话标题不是这几个人拼出来的 —— 一个键都不能敲。"""
+    r = local_group._rename_locked(77, "临时讨论组", expect_members=["张三", "李四"])
+
+    assert r["success"] is False
+    assert r["unrelated"] is True
+    assert rename_env["typed"] is None
+    assert rename_env["names"][77] == "陈挺、陈涛、任威风"
+    assert rename_env["escaped"] is True          # 打开的输入框要原样退掉
+    assert "请手动改名" in r["error"]
+
+
+def test_rename_accepts_the_title_composed_from_the_picked_members(rename_env):
+    r = local_group._rename_locked(77, "临时讨论组", expect_members=["陈挺", "陈涛", "任威风"])
+
+    assert r["success"] is True
+    assert rename_env["names"][77] == "临时讨论组"
+
+
+@pytest.mark.parametrize(
+    "title, members, expected",
+    [
+        ("", ["陈挺", "陈涛"], True),                       # 新群可以没标题
+        ("陈挺、陈涛", ["陈挺", "陈涛"], True),
+        ("我、陈挺、陈涛", ["陈挺", "陈涛"], True),          # 自己也被拼进去
+        ("陈挺、陈涛…", ["陈挺", "陈涛"], True),            # 末段被截断
+        ("陈挺、陈涛(3)", ["陈挺", "陈涛"], True),          # 带人数后缀
+        # 选人面板给的是「陈涛(水淼淼)」,标题里只会出现其中一种写法
+        ("陈挺、陈涛", ["陈挺", "陈涛(水淼淼)"], True),
+        ("陈挺、水淼淼", ["陈挺", "陈涛(水淼淼)"], True),
+        ("售后支持群", ["陈挺", "陈涛"], False),            # 远端拉你进的是个有名字的群
+        ("陈挺、王五", ["陈挺", "陈涛"], False),            # 成员名单对不上
+        ("陈挺", ["陈挺", "陈涛"], False),                  # 只有一半人,认不出来就不改
+        ("陈挺、王五…", ["陈挺", "陈涛"], False),           # 截断的标题里冒出陌生人
+        ("王五", ["陈挺", "陈涛"], False),
+    ],
+)
+def test_auto_composed_title_recognition(title, members, expected):
+    assert local_group._looks_like_a_just_created_group(title, members) is expected
 
 
 # ─── HTTP 层 ───────────────────────────────────────────────────────────

@@ -394,22 +394,6 @@ def _outbox_path(msg: dict, settings: Settings) -> Path:
     return settings.mars_outbox_dir / str(rid) / f"{int(msg.get('send_time') or 0)}-{lid}.json"
 
 
-def _normalize_hook_for_mars(hook: dict) -> dict:
-    """兼容 corpid 修复前已经冻结在 outbox 里的 hook。
-
-    outbox 的正文必须冻结,但 JSON 类型修正不改变正文或 checksum。历史文件里
-    `corpid` 可能是数字字符串,发送到当前 Mars 会被严格 JSON 解码器拒绝。
-    """
-    if "corpid" not in hook:
-        return hook
-    raw = hook.get("corpid")
-    try:
-        hook["corpid"] = int(str(raw).strip()) if raw not in (None, "") else 0
-    except (TypeError, ValueError):
-        hook["corpid"] = 0
-    return hook
-
-
 def peek_outbox(msg: dict, settings: Settings) -> dict | None:
     """这条消息的 Content 已经定过了吗?定过就返回那一份,没有返回 None。
 
@@ -427,7 +411,12 @@ def peek_outbox(msg: dict, settings: Settings) -> dict | None:
         hook = json.loads(raw)
         if not isinstance(hook, dict) or not isinstance(hook.get("message"), str):
             raise TypeError("hook 格式无效")
-        return _normalize_hook_for_mars(hook)
+        # 早期 outbox 可能把 SQLite 的数字身份原样冻结下来。正文必须保持首次
+        # 决定,但身份字段只是 JSON 契约适配,重试时归一化不会改变消息去重键。
+        for field in ("userid", "corpid"):
+            if field in hook:
+                hook[field] = str(hook[field] or "")
+        return hook
     except (json.JSONDecodeError, TypeError) as e:
         raise MarsStateError(f"mars outbox 损坏 {path}: {e}") from e
 
@@ -507,16 +496,8 @@ def to_hook(msg: dict, settings: Settings) -> dict:
     RID 对内部成员、外部联系人和机器人都存在,不会因为跨企业成员没有本企业
     userid 而和其他成员混淆。
     """
-    userid = msg.get("sender_userid") or ""
-    raw_corpid = msg.get("sender_corpid")
-    try:
-        # Mars 的 MessageHook.corpid 是 number;Session.db 里这个字段有时以
-        # TEXT 返回,直接把它放进 JSON 会得到 400 "Field=corpid"。
-        corpid = int(str(raw_corpid).strip()) if raw_corpid not in (None, "") else 0
-    except (TypeError, ValueError):
-        # 外部联系人/旧库可能没有数字型企业 ID。0 表示未知,不能让单个发送者
-        # 的脏值阻塞整个群的水位推进。
-        corpid = 0
+    userid = str(msg.get("sender_userid") or "")
+    corpid = str(msg.get("sender_corpid") or "")
     sender_number = str(msg.get("sender_id") or "")
     name = msg.get("sender_name") or userid or sender_number
     return {

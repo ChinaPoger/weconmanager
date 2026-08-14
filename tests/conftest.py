@@ -11,6 +11,8 @@ CI 的工作区里没有 `.env`。
 `_env_file=None` 只能逐个构造点传,而 `Settings()` 在源码和测试里到处都有,
 所以直接改类级配置,一次盖住所有构造点。
 """
+import os
+
 import pytest
 
 from wecom_svr.settings import Settings
@@ -19,3 +21,17 @@ from wecom_svr.settings import Settings
 @pytest.fixture(autouse=True, scope="session")
 def _ignore_dotenv() -> None:
     Settings.model_config["env_file"] = None
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _disable_machine_preflight_in_unit_tests() -> None:
+    """单测不应读取真实企微进程/数据库;预检本身由专门测试覆盖。"""
+    old = os.environ.get("WECOM_SVR_STARTUP_PREFLIGHT_ENABLED")
+    os.environ["WECOM_SVR_STARTUP_PREFLIGHT_ENABLED"] = "false"
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("WECOM_SVR_STARTUP_PREFLIGHT_ENABLED", None)
+        else:
+            os.environ["WECOM_SVR_STARTUP_PREFLIGHT_ENABLED"] = old

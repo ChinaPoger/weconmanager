@@ -13,18 +13,25 @@ userid,外部/微信联系人塞不进去;而「创建客户群」官方压根�
     合成点击也打不进 CEF 自绘控件,回车是唯一可靠的选中方式)
   - 右侧标题里的「N contact(s) selected」能读出来,每步都能回读校验
 
-坐标依赖只剩两个不在 AX 树里的位置("+" 按钮和会话标题),按主窗口原点取相对
-偏移。它们都不是「点了就算」:点完必须看到成功信号(面板真的开了 / 输入框真的
-拿到了焦点),看不到就换一个候选偏移再试,试中了记下来 —— 见 ui_offsets.py。
+坐标依赖只剩不在 AX 树里的 "+" 按钮,按主窗口原点取相对偏移。新版客户端已把
+会话标题暴露成可写的 AXTextField,直接写值并 AXConfirm;旧版找不到该控件时才
+回退到坐标点击。坐标动作都不是「点了就算」,必须看到成功信号,看不到就换候选
+偏移再试,试中了记下来 —— 见 ui_offsets.py。
 """
 import logging
 import re
 import subprocess
 import time
 
-from . import local_send, messages, ui_offsets
+from . import directory, local_send, messages, ui_offsets
 from .group import MAX_NAME_LEN
-from .local_send import _get_clipboard, _run_applescript, _set_clipboard, ensure_macos
+from .local_send import (
+    _escape,
+    _get_clipboard,
+    _run_applescript,
+    _set_clipboard,
+    ensure_macos,
+)
 from .localdb import LocalSendError
 
 # 和发消息共用同一把 UI 闸门: 操控的是同一个客户端界面,必须串行,
@@ -49,6 +56,15 @@ DETAIL_ROWS = 8
 SELECT_ATTEMPTS = 3
 COUNT_SETTLE_TRIES = 3
 COUNT_SETTLE_DELAY = 0.7
+# 企业微信建群后写入 Info.db/WAL 可能有几十秒延迟。只等 2 秒会把已经
+# 建好的群误报成「新增 0 个」,进而跳过改名。
+GROUP_APPEAR_TIMEOUT = 90.0
+# 轮询间隔逐次翻倍到上限: 每一轮都是一次全量重解密,密集轮询换不来更早的答案。
+GROUP_APPEAR_POLL = 1.0
+GROUP_APPEAR_POLL_MAX = 8.0
+# 看到第一个新会话后还要再等一会儿才下结论: 这段等待期里落库的会话会一起进差集,
+# 「同时冒出来两个」就能被识别成不唯一而放弃改名,而不是抓到谁就改谁。
+GROUP_APPEAR_SETTLE = 4.0
 
 
 class LocalGroupError(LocalSendError):
@@ -57,6 +73,36 @@ class LocalGroupError(LocalSendError):
 
 class AmbiguousCandidate(LocalGroupError):
     """一个名字在客户端里搜出多条 —— 回车只会选中第一条,所以必须让调用方说清楚。"""
+
+
+def _without_self(members: list[str]) -> list[str]:
+    """尽力从成员列表剔除当前登录用户。
+
+    本人本来就自动在新群里。客户端允许搜索并勾选本人,但右侧的「已选联系人」
+    计数不会增加,会让后续的安全校验误判为选人失败。外部联系人不一定存在于
+    Session.db;解析不了时原样保留,继续交给客户端搜索。
+    """
+    try:
+        self_userid = str(directory.get_self().get("userid") or "").strip().lower()
+    except LocalSendError:
+        return members
+    if not self_userid:
+        return members
+
+    filtered: list[str] = []
+    with directory.batch():
+        for query in members:
+            try:
+                member = directory.resolve_member(query)
+            except LocalSendError:
+                filtered.append(query)
+                continue
+            userid = str(member.get("userid") or "").strip().lower()
+            if userid == self_userid:
+                log.info("拉群成员「%s」是当前登录用户,已忽略(本人会自动入群)", query)
+                continue
+            filtered.append(query)
+    return filtered
 
 
 # ─── AppleScript ───────────────────────────────────────────────────────
@@ -99,10 +145,6 @@ def _osa(body: str, timeout: int = 20) -> str:
             raise LocalGroupError("「发起群聊」面板不在了(可能被手动关闭)")
         raise LocalGroupError(f"操控客户端失败: {out}")
     return out
-
-
-def _escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _real_click(x: int, y: int) -> None:
@@ -204,10 +246,12 @@ def _open_picker() -> None:
 
     点不中就按候选偏移再试(见 ui_offsets.py):"+" 不在 AX 树里,偏移是量出来的,
     而这里的成功信号又干净又便宜 —— 面板开没开一问就知道,正适合拿来自动校准。
-    试中了记下来,下次第一发就命中。
+    试中了记下来,下次第一发就命中。已有面板会先自动取消,避免上一次异常中断
+    把后续操作永久卡住。
     """
     if _sheet_open():
-        raise LocalGroupError("客户端上已经有一个弹出面板开着,请先关掉再试")
+        log.warning("打开「发起群聊」前发现残留面板,正在自动关闭")
+        _recover_open_sheet()
 
     tried: list[tuple[int, int]] = []
     for i, (dx, dy) in enumerate(ui_offsets.candidates("plus")):
@@ -276,6 +320,34 @@ def _close_picker() -> None:
         time.sleep(0.8)
     except LocalGroupError as e:
         log.warning("关闭「发起群聊」面板失败,客户端上可能残留一个面板: %s", e)
+
+
+def _recover_open_sheet() -> None:
+    """清理进入发起群聊流程前残留的客户端面板,并确认它真的关闭。
+
+    已知的发起群聊面板必须点「取消」,因为这个 sheet 对 Escape 不响应。其它
+    面板只发一次 Escape:它是通用的取消动作,不会点击未知控件。关不掉就失败,
+    继续校准会有把输入送进错误窗口的风险。
+    """
+    state = _sheet_state()
+    if state == _SHEET_NONE:
+        return
+
+    if state == _SHEET_PICKER:
+        log.warning("发现残留的「发起群聊」面板,正在自动取消")
+        _close_picker()
+    else:
+        log.warning("发现无法识别的企业微信弹出面板,正在尝试 Escape 关闭")
+        _osa(_MAIN_WINDOW + '''
+  set frontmost to true
+  key code 53
+  delay 0.5
+''')
+
+    if _sheet_state() != _SHEET_NONE:
+        raise LocalGroupError(
+            "客户端上的残留弹出面板无法自动关闭,请手动关闭后再试"
+        )
 
 
 # ─── 选人 ──────────────────────────────────────────────────────────────
@@ -423,6 +495,27 @@ def _confirm() -> None:
 ''')
 
 
+def calibrate_ui() -> dict:
+    """无副作用验证客户端 UI,并校准本机的 "+" 坐标。
+
+    打开「发起群聊」面板后立即取消,不选择联系人、不创建群。能完成这一步说明:
+    企业微信正在运行且有主窗口、服务宿主拿到了辅助功能/自动化权限,并且当前
+    窗口布局的 "+" 偏移已经验证并记入 ui_offsets.json。
+    """
+    ensure_macos()
+    with ui_session("启动 UI 预检"):
+        _activate()
+        _open_picker()
+        _close_picker()
+        if _sheet_open():
+            raise LocalGroupError(
+                "启动 UI 预检打开了「发起群聊」面板,但取消后面板仍未关闭。"
+                "请手动关闭该面板后重启服务。"
+            )
+    point = ui_offsets.primary("plus")
+    return {"success": True, "plus_offset": f"{point[0]},{point[1]}"}
+
+
 # ─── 公开 API ──────────────────────────────────────────────────────────
 
 def create_group(members: list[str], name: str = "") -> dict:
@@ -446,6 +539,8 @@ def create_group(members: list[str], name: str = "") -> dict:
             seen.add(q)
             wanted.append(q)
 
+    wanted = _without_self(wanted)
+
     if len(wanted) < 2:
         return {
             "success": False,
@@ -458,9 +553,13 @@ def create_group(members: list[str], name: str = "") -> dict:
     if name and name.strip():
         wanted_name = _check_name(name)
 
-    # 快照 → 建群 → 差集 → 改名,全程一次持锁。差集是靠「新出现的群 RID」认新群
-    # (新群的 name 是空的,只能这么认),中间放开锁的话,另一个并发建群会让差集
-    # 出现两个新 RID —— 两边都只能放弃改名。
+    # 快照 → 建群 → 差集 → 核对标题 → 改名,全程一次持锁。差集是靠「新出现的群
+    # RID」认新群(新群的 name 是空的,只能这么认),中间放开锁的话,另一个并发
+    # 建群会让差集出现两个新 RID —— 两边都只能放弃改名。
+    #
+    # 但锁只管本机: 这期间别人也可能把你拉进一个群,那个会话同样是「新出现的
+    # RID」。所以差集选出来的候选还要再过一道标题核对(_rename_locked 的
+    # expect_members),对不上就不改名。
     with ui_session("拉群"):
         before = set(_group_names()) if wanted_name else set()
 
@@ -489,16 +588,20 @@ def create_group(members: list[str], name: str = "") -> dict:
         if not wanted_name:
             return result
 
-        new_rids = sorted(set(_group_names()) - before)
+        new_rids = _wait_new_group_rids(before)
         if len(new_rids) != 1:
             result["name_error"] = (
-                f"群建好了,但没能唯一定位新建的会话(新增 {len(new_rids)} 个),群名没改成。"
-                "请手动改名。"
+                "群建好了,等待本地会话落库后仍没能唯一定位新建的会话"
+                f"(新增 {len(new_rids)} 个),群名没改成。请手动改名。"
             )
             return result
 
-        result["rid"] = new_rids[0]
-        renamed = _rename_locked(new_rids[0], wanted_name)
+        renamed = _rename_locked(
+            new_rids[0], wanted_name, expect_members=[p["name"] for p in picked]
+        )
+        if not renamed.get("unrelated"):
+            # 归属没核对上的那个 RID 不是本次建的群,不能当成结果报回去
+            result["rid"] = new_rids[0]
         if renamed.get("success"):
             result["name"] = wanted_name
         else:
@@ -509,6 +612,101 @@ def create_group(members: list[str], name: str = "") -> dict:
 # ─── 改群名 ────────────────────────────────────────────────────────────
 
 _SENTINEL = "\x00wecom-svr-clipboard-probe\x00"
+_AX_TITLE_MISSING = "__WECOM_SVR_AX_TITLE_MISSING__"
+
+
+# 新版客户端把聊天区标题暴露成可写 AXTextField。标题框和左侧搜索框同属内容
+# splitter group,用聊天区 splitter 的左边界区分: 标题框在聊天区内,搜索框在
+# 会话列表内。读和写分成两步是为了「先看清是哪个会话,再决定改不改」——
+# 建群后认新群靠的就是改名前读回来的这个标题。
+_TITLE_FIELD = _MAIN_WINDOW + '''
+  set contentSplit to splitter group 1 of (splitter group 1 of mainWin)
+  set chatSplit to splitter group 1 of contentSplit
+  set chatPos to position of chatSplit
+  set chatX to item 1 of chatPos
+  set target to missing value
+  repeat with tf in (text fields of contentSplit)
+    set tp to position of tf
+    set ts to size of tf
+    if (item 1 of tp) ≥ chatX and (item 1 of ts) > 40 then
+      set target to contents of tf
+      exit repeat
+    end if
+  end repeat
+'''
+
+
+def _read_ax_title() -> str | None:
+    """读当前会话标题。旧版客户端没有这个可写控件时返回 None(走坐标兼容路径)。
+
+    注意和「标题是空串」区分开: 刚建出来的群标题可能就是空的,那是合法值。
+    """
+    out = _osa(_TITLE_FIELD + f'''
+  if target is missing value then return "{_AX_TITLE_MISSING}"
+  return value of target as text
+''')
+    value = out.strip().strip('"')
+    return None if value == _AX_TITLE_MISSING else value
+
+
+def _write_ax_title(new_name: str) -> None:
+    """把新群名写进标题 AXTextField 并确认。"""
+    out = _osa(_TITLE_FIELD + f'''
+  if target is missing value then return "{_AX_TITLE_MISSING}"
+  set value of attribute "AXFocused" of target to true
+  set value of target to "{_escape(new_name)}"
+  delay 0.4
+  try
+    perform action "AXConfirm" of target
+  on error
+    keystroke return
+  end try
+  return "ok"
+''')
+    if out.strip().strip('"') == _AX_TITLE_MISSING:
+        raise LocalGroupError("刚才还读到的会话标题不见了(界面被切走?),改名已中止")
+
+
+def _name_variants(name: str) -> set[str]:
+    """一个人在客户端里的几种写法。
+
+    选人面板给的是「陈涛(水淼淼)」这种带备注/别名的整串,而群标题里只会出现其中
+    一种。拆开括号,哪一种命中都算数。
+    """
+    raw = name.strip()
+    parts = (p.strip() for p in re.split(r"[()()\[\]【】]", raw))
+    return {raw} | {p for p in parts if p}
+
+
+def _looks_like_a_just_created_group(title: str, member_names: list[str]) -> bool:
+    """标题是不是「客户端拿这几个人的名字现拼出来的」。
+
+    这是建群流程认新群的**唯一实质证据**: 新群在库里没有名字,客户端显示的标题
+    是成员名用「、」拼的。远端在这期间把你拉进的群,要么带着它自己的名字,要么
+    拼的是别人的成员名单 —— 两种都过不了这一关。
+
+    判据是「每个选中的人都出现在标题里」而不是「标题的每一段都认识」: 有的版本会
+    把自己也拼进去,而自己的显示名这里拿不到。方向上宁可错杀 —— 认不出来只是不改
+    名(带着说明让人手动改),认错了却是把名字改到别人的群上。
+    """
+    text = (title or "").strip()
+    if not text:
+        return True                                   # 有的版本干脆不给标题
+    text = re.sub(r"[(\uff08]\s*\d+\s*[)\uff09]\s*$", "", text).strip()   # 去掉「(5)」这种人数后缀
+    wanted = [_name_variants(n) for n in member_names if n and n.strip()]
+    if not wanted:
+        return False
+
+    if not text.endswith(("…", "...")):
+        return all(any(v in text for v in variants) for variants in wanted)
+
+    # 人多时标题会被截断,只能核对露出来的部分: 每一段都得是这几个人之一
+    # (末段可能只露了半个名字,按前缀算)。陌生人一冒头就判负。
+    known = {v for variants in wanted for v in variants}
+    segments = [s.strip() for s in re.split(r"[、,,]", text.rstrip(".…").strip()) if s.strip()]
+    return bool(segments) and all(
+        any(name.startswith(seg) for name in known) for seg in segments
+    )
 
 
 def _window_point(dx: int, dy: int) -> tuple[int, int]:
@@ -546,7 +744,7 @@ def _probe_title(dx: int, dy: int) -> str:
     if got == _SENTINEL:
         raise LocalGroupError(f"点 {dx, dy} 后没有输入框拿到焦点")
     text = got.strip()
-    if not text or "\n" in text or len(text) > MAX_NAME_LEN * 2:
+    if not text or "\ufffd" in text or "\n" in text or len(text) > MAX_NAME_LEN * 2:
         raise LocalGroupError(f"点 {dx, dy} 复制回来的内容不像群名(可能选中的是聊天记录)")
     return text
 
@@ -590,8 +788,46 @@ def _group_names() -> dict[int, str]:
     return {g["rid"]: g["name"] for g in messages.list_groups(include_unnamed=True, limit=None)}
 
 
-def _rename_locked(rid: int, new_name: str) -> dict:
-    """改名的界面部分 —— **调用方必须已经持有 ui_session**(锁不可重入)。"""
+def _wait_new_group_rids(before: set[int]) -> list[int]:
+    """等待新建会话写入本地库,返回相对 before 新出现的 RID。
+
+    看到差集非空**不能立刻返回**: ui_session 只挡得住本机并发,挡不住「别人这会儿
+    正好把你拉进一个群」。抓到第一个就走,那个远端会话会被当成本次建的群。所以再
+    等 GROUP_APPEAR_SETTLE 重新取一次差集,两个一起冒出来时调用方就能看到「新增 2
+    个」而放弃改名。这只覆盖得住时间挨得近的情况,真正认群的证据在改名前那一步
+    (见 _looks_like_a_just_created_group)。
+    """
+    deadline = time.monotonic() + GROUP_APPEAR_TIMEOUT
+    poll = GROUP_APPEAR_POLL
+    while True:
+        new_rids = sorted(set(_group_names()) - before)
+        if new_rids:
+            time.sleep(GROUP_APPEAR_SETTLE)
+            return sorted(set(_group_names()) - before)
+        if time.monotonic() >= deadline:
+            return []
+        time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+        # 每轮 _group_names() 都可能触发一次全量重解密,而整个循环跑在 ui_session
+        # 里 —— 空等期间每多问一次就多占一次 UI 闸门。等满一分半只要十来轮就够。
+        poll = min(poll * 2, GROUP_APPEAR_POLL_MAX)
+
+
+def _cancel_edit_box() -> None:
+    """把已经打开、但还没打字的改名输入框原样退掉。"""
+    try:
+        _osa("  key code 53\n")
+    except LocalGroupError as e:
+        log.warning("退出改名输入框失败,客户端上可能留着一个打开的输入框: %s", e)
+
+
+def _rename_locked(rid: int, new_name: str, expect_members: list[str] | None = None) -> dict:
+    """改名的界面部分 —— **调用方必须已经持有 ui_session**(锁不可重入)。
+
+    expect_members 给了值就先核对归属: 打开的这个会话的标题必须是这些成员名拼出来
+    的,否则一个键都不敲就返回(带 unrelated 标记)。建群流程用它挡住「差集里那个
+    新会话其实是别人刚把你拉进的群」—— 那种情况下改名会改到别人的群上,而事后的
+    回库核验查的是同一个错 RID,兜不住。
+    """
     conv = local_send.get_conversation_by_rid(int(rid))
     if not conv:
         return {"success": False, "error": f"本地库里没有 RID={rid} 的会话"}
@@ -607,9 +843,32 @@ def _rename_locked(rid: int, new_name: str) -> dict:
         if not ok:
             raise LocalGroupError(f"打开会话失败: {msg}")
 
-        was = _open_edit_box_and_read_current()
-        _set_clipboard(new_name)
-        _osa('''
+        ax_title = _read_ax_title()
+        via_ax = ax_title is not None
+        # 旧版没有可写标题控件: 点开改名输入框把当前群名读回来。这一步只做
+        # 「选中 + 复制」,还没有任何改动落地,所以下面的归属核对仍然来得及。
+        was = ax_title if ax_title is not None else _open_edit_box_and_read_current()
+
+        if expect_members is not None and not _looks_like_a_just_created_group(was, expect_members):
+            if not via_ax:
+                _cancel_edit_box()
+            return {
+                "success": False,
+                "unrelated": True,
+                "rid": int(rid),
+                "old_name": was,
+                "error": (
+                    f"RID={rid} 的标题是 {was!r},不像刚用「{'、'.join(expect_members)}」"
+                    "建出来的新群(这期间可能有别人把你拉进了新群)—— "
+                    "一个字都没改,请手动改名。"
+                ),
+            }
+
+        if via_ax:
+            _write_ax_title(new_name)
+        else:
+            _set_clipboard(new_name)
+            _osa('''
   keystroke "a" using command down
   delay 0.2
   keystroke "v" using command down
