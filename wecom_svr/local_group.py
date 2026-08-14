@@ -23,7 +23,7 @@ import re
 import subprocess
 import time
 
-from . import local_send, messages, ui_offsets
+from . import directory, local_send, messages, ui_offsets
 from .group import MAX_NAME_LEN
 from .local_send import (
     _escape,
@@ -73,6 +73,36 @@ class LocalGroupError(LocalSendError):
 
 class AmbiguousCandidate(LocalGroupError):
     """一个名字在客户端里搜出多条 —— 回车只会选中第一条,所以必须让调用方说清楚。"""
+
+
+def _without_self(members: list[str]) -> list[str]:
+    """尽力从成员列表剔除当前登录用户。
+
+    本人本来就自动在新群里。客户端允许搜索并勾选本人,但右侧的「已选联系人」
+    计数不会增加,会让后续的安全校验误判为选人失败。外部联系人不一定存在于
+    Session.db;解析不了时原样保留,继续交给客户端搜索。
+    """
+    try:
+        self_userid = str(directory.get_self().get("userid") or "").strip().lower()
+    except LocalSendError:
+        return members
+    if not self_userid:
+        return members
+
+    filtered: list[str] = []
+    with directory.batch():
+        for query in members:
+            try:
+                member = directory.resolve_member(query)
+            except LocalSendError:
+                filtered.append(query)
+                continue
+            userid = str(member.get("userid") or "").strip().lower()
+            if userid == self_userid:
+                log.info("拉群成员「%s」是当前登录用户,已忽略(本人会自动入群)", query)
+                continue
+            filtered.append(query)
+    return filtered
 
 
 # ─── AppleScript ───────────────────────────────────────────────────────
@@ -480,6 +510,8 @@ def create_group(members: list[str], name: str = "") -> dict:
         if q and q not in seen:
             seen.add(q)
             wanted.append(q)
+
+    wanted = _without_self(wanted)
 
     if len(wanted) < 2:
         return {
