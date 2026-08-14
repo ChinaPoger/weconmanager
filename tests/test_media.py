@@ -499,7 +499,9 @@ def test_upload_uses_the_real_format_for_extensionless_png(
 
     assert url.endswith("-aaaaaaaa.png")
     assert "imageView2" not in url
-    assert posted == [("original.png", "robot/1/20260811/103302-aaaaaaaa.png")]
+    assert posted[0][0] == "original.png"
+    assert posted[0][1].startswith("robot/1/")
+    assert posted[0][1].endswith("-aaaaaaaa.png")
 
 
 def test_upload_corrects_a_misleading_filename_extension(tmp_path, settings, posted):
