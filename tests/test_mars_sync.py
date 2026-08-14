@@ -510,6 +510,37 @@ def test_ready_count_actively_fetches_before_holding_the_group(waiting, monkeypa
     assert calls == [(b"late", GROUP["rid"], 7)]
 
 
+def test_ready_count_does_not_treat_a_type101_source_url_as_ready(waiting, monkeypatch):
+    item = mars_sync.media.MediaItem(
+        "a" * 32,
+        100,
+        "image-1.jpg",
+        "image",
+        None,
+        "https://imunion.weixin.qq.com/cgi-bin/mmae-bin/tpdownloadmedia?param=expired",
+    )
+    msg = _late(7, 980, raw=b"type101")
+    calls = []
+
+    monkeypatch.setattr(mars_sync.media, "collect", lambda raw: [item])
+    monkeypatch.setattr(
+        mars_sync.media,
+        "locate_item",
+        lambda found, settings: mars_sync.media.Located(
+            found.md5, found.filename, found.source_url, [], True,
+        ),
+    )
+
+    def unavailable(found, settings, rid, lid, deadline, loc):
+        calls.append((found, rid, lid, loc.url))
+        return ""
+
+    monkeypatch.setattr(mars_sync.media, "ensure_item_local", unavailable)
+
+    assert mars_sync._ready_count([msg], waiting) == 0
+    assert calls == [(item, GROUP["rid"], 7, item.source_url)]
+
+
 def test_waiting_gives_up_after_the_deadline(waiting, local, pushed):
     """等不到就带着占位符推走 —— 一张永远不会下载的图不能卡死整条同步链。"""
     local["messages"] = [_late(1, 900)]              # now=1000,已经等满 60s
