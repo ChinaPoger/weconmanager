@@ -238,12 +238,9 @@ def _backup_v1_state(settings: Settings) -> None:
 # ─── 映射 ───────────────────────────────────────────────────────────────
 
 def group_name(name: str, settings: Settings) -> str:
-    """给群名加上 mars 的企微群前缀(默认 `work-`)。
+    """按配置给群名加上 mars 的企微群前缀;默认保持原名。
 
-    这不是装饰: mars 靠群名认企微群(`GroupIMCategory`),也靠群名把这类群排除
-    在客户未响应告警之外(`groupmsg.LoadMsgs` 的 `left(name,5) != 'work-'`)。
-    hook 建群时 group_type 落的是默认值 `customer`,不加前缀的话,一个内部群
-    会被 deimos 当成客户群盯着,超时没人回就电话叫 TS 值班 —— 那是打扰别人。
+    配成 `work-` 时,mars 可借此识别企微群并排除相关客户未响应告警。
     """
     prefix = settings.mars_group_name_prefix
     if not prefix or name.startswith(prefix):
