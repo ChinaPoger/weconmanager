@@ -482,6 +482,38 @@ def test_unknown_extension_uses_kodo_realtime_conversion(tmp_path, settings, pos
     assert posted[0].endswith("-aaaaaaaa.jpg")
 
 
+def test_upload_uses_the_real_format_for_extensionless_png(
+    tmp_path, settings, monkeypatch,
+):
+    image = tmp_path / "original"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nsource bytes")
+    posted: list[tuple[str, str]] = []
+    monkeypatch.setattr(media, "_exists", lambda url, t: False)
+    monkeypatch.setattr(
+        media,
+        "_post_form",
+        lambda _stream, name, key, _token, _timeout: posted.append((name, key)),
+    )
+
+    url = media.upload(str(image), settings, rid=1, send_time=TS, md5="a" * 32)
+
+    assert url.endswith("-aaaaaaaa.png")
+    assert "imageView2" not in url
+    assert posted[0][0] == "original.png"
+    assert posted[0][1].startswith("robot/1/")
+    assert posted[0][1].endswith("-aaaaaaaa.png")
+
+
+def test_upload_corrects_a_misleading_filename_extension(tmp_path, settings, posted):
+    image = tmp_path / "rendered.png"
+    image.write_bytes(b"\xff\xd8\xffsource bytes")
+
+    url = media.upload(str(image), settings, rid=1, send_time=TS, md5="a" * 32)
+
+    assert url.endswith("-aaaaaaaa.jpg")
+    assert posted[0].endswith("-aaaaaaaa.jpg")
+
+
 def test_upload_without_config_is_refused(tmp_path):
     with pytest.raises(media.MediaError):
         media.upload(str(tmp_path), Settings(data_dir=tmp_path))
