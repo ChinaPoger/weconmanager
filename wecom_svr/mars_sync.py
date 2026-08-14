@@ -487,18 +487,23 @@ def prune_outbox(cursors: dict[str, Cursor], settings: Settings) -> None:
 def to_hook(msg: dict, settings: Settings) -> dict:
     """本地消息 → mars models.MessageHook 的 JSON。
 
-    sendernumber 是 mars 判断「这条是不是我方客服回的」的唯一依据,所以优先用
-    acctid(企微 userid,跨设备稳定);外部联系人/机器人没有 acctid,退回会话内
-    的 vid 并加前缀,免得和 userid 混在一个命名空间里。
+    senderNumber 使用本地通讯录 RID,userid/corpid 单独传成员的企微身份。
+    RID 对内部成员、外部联系人和机器人都存在,不会因为跨企业成员没有本企业
+    userid 而和其他成员混淆。
     """
     userid = msg.get("sender_userid") or ""
-    sender_number = userid or f"{settings.mars_group_prefix}vid-{msg['sender_id']}"
-    name = msg.get("sender_name") or sender_number
+    corpid = msg.get("sender_corpid") or ""
+    sender_number = str(msg.get("sender_id") or "")
+    name = msg.get("sender_name") or userid or sender_number
     return {
         "message": message_body(msg, settings),
-        "groupnumber": f"{settings.mars_group_prefix}{msg['rid']}",
+        # 本地消息没有客户 UID 时保持 0,与 Mars MessageHook 的默认值一致。
+        "uid": int(msg.get("uid") or 0),
+        "groupNumber": f"{settings.mars_group_prefix}{msg['rid']}",
         "groupName": group_name(msg.get("group_name") or "", settings),
-        "sendernumber": sender_number,
+        "senderNumber": sender_number,
+        "userid": userid,
+        "corpid": corpid,
         "displayname": name,
         "nickname": name,
         "timestamp": int(msg.get("send_time") or 0),

@@ -31,7 +31,8 @@ def _msg(lid: int, send_time: int, text: str, userid: str = "chenyi", **kw) -> d
         "lid": lid, "rid": GROUP["rid"], "group_name": GROUP["name"],
         "send_time": send_time, "time": "2026-08-07 13:50:38",
         "sender_id": 5629500548464930, "sender_name": kw.get("name", "陈谊"),
-        "sender_userid": userid, "avatar": "https://x/avatar",
+        "sender_userid": userid, "sender_corpid": kw.get("corpid", "1970325043038620"),
+        "avatar": "https://x/avatar",
         "type": "文本", "text": text, "quote_text": kw.get("quote_text", ""),
         "skipped": False,
     }
@@ -135,9 +136,12 @@ def pushed(monkeypatch):
 def test_hook_shape_matches_mars_message_hook(settings):
     hook = mars_sync.to_hook(_msg(1, 1786081838, "并发限制"), settings)
     assert hook == {
-        "groupnumber": "wework-20614687431404",
+        "uid": 0,
+        "groupNumber": "wework-20614687431404",
         "groupName": "work-客户群A",
-        "sendernumber": "chenyi",
+        "senderNumber": "5629500548464930",
+        "userid": "chenyi",
+        "corpid": "1970325043038620",
         "displayname": "陈谊",
         "nickname": "陈谊",
         "message": "并发限制",
@@ -167,15 +171,24 @@ def test_group_name_prefix_can_be_disabled(settings):
 def test_group_number_is_prefixed_to_avoid_colliding_with_qq_groups(settings):
     """mars 的 qq_groups.qq 是全局唯一键,裸 RID 可能撞上真实 QQ 群号。"""
     hook = mars_sync.to_hook(_msg(1, 1, "x"), settings)
-    assert hook["groupnumber"].startswith("wework-")
-    assert "20614687431404" in hook["groupnumber"]
+    assert hook["groupNumber"].startswith("wework-")
+    assert "20614687431404" in hook["groupNumber"]
 
 
-def test_sender_without_userid_falls_back_to_vid(settings):
-    """外部联系人和机器人没有 acctid,不能让 sendernumber 变空。"""
+def test_sendernumber_uses_local_rid_even_when_userid_exists(settings):
     hook = mars_sync.to_hook(_msg(1, 1, "x", userid=""), settings)
-    assert hook["sendernumber"] == "wework-vid-5629500548464930"
+    assert hook["senderNumber"] == "5629500548464930"
+    assert hook["userid"] == ""
     assert hook["displayname"] == "陈谊"
+
+
+def test_hook_carries_member_userid_and_corpid(settings):
+    hook = mars_sync.to_hook(
+        _msg(1, 1, "x", userid="YuSunJie", corpid="1970325276990586"), settings
+    )
+    assert hook["senderNumber"] == "5629500548464930"
+    assert hook["userid"] == "YuSunJie"
+    assert hook["corpid"] == "1970325276990586"
 
 
 def test_card_placeholder_is_removed_but_type_is_kept(settings):
@@ -561,7 +574,7 @@ def test_a_failed_group_does_not_stop_another_group(settings, local, monkeypatch
     sent = []
 
     async def fail_a(_client, hook, _settings):
-        if hook["groupnumber"].endswith(str(GROUP["rid"])):
+        if hook["groupNumber"].endswith(str(GROUP["rid"])):
             raise MarsSyncError("boom-a")
         sent.append(hook)
 
@@ -943,7 +956,7 @@ def test_preview_shows_the_exact_hook_body(client, local):
     pending = r.json()["pending"]
     assert len(pending) == 1
     assert pending[0]["hook"]["message"] == "待推"
-    assert pending[0]["hook"]["groupnumber"] == "wework-20614687431404"
+    assert pending[0]["hook"]["groupNumber"] == "wework-20614687431404"
 
 
 def test_preview_shows_the_frozen_hook_not_a_fresh_one(client, local, monkeypatch):

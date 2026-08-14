@@ -9,7 +9,7 @@ import re
 import pytest
 from fastapi.testclient import TestClient
 
-from wecom_svr import local_group, local_send, ui_offsets
+from wecom_svr import directory, local_group, local_send, ui_offsets
 from wecom_svr.main import create_app
 from wecom_svr.settings import get_agent_home, get_settings
 
@@ -96,6 +96,8 @@ def _fast_and_macos(monkeypatch, tmp_path):
     monkeypatch.setattr(local_group.time, "sleep", lambda _s: None)
     monkeypatch.setattr(local_group, "SHEET_TIMEOUT", 0.1)
     monkeypatch.setattr(local_group, "PROBE_TIMEOUT", 0.1)
+    monkeypatch.setattr(directory, "get_self", lambda: {"userid": "me"})
+    monkeypatch.setattr(directory, "resolve_member", lambda q: {"userid": q})
     yield
     get_settings.cache_clear()
     get_agent_home.cache_clear()
@@ -128,6 +130,29 @@ def test_dedups_and_trims_input(fake):
     r = local_group.create_group([" 陈涛 ", "陈挺", "陈涛", ""])
     assert r["success"] is True
     assert len(r["members"]) == 2
+
+
+def test_ignores_current_user_in_members(fake, monkeypatch):
+    monkeypatch.setattr(
+        directory,
+        "resolve_member",
+        lambda q: {"userid": "me" if q == "zixunguwen" else q},
+    )
+    r = local_group.create_group(["陈涛", "陈挺", "zixunguwen"])
+    assert r["success"] is True
+    assert [m["query"] for m in r["members"]] == ["陈涛", "陈挺"]
+    assert r["member_count"] == 3
+    assert "zixunguwen" not in fake.scripts
+
+
+def test_self_filter_degrades_when_directory_is_unavailable(fake, monkeypatch):
+    monkeypatch.setattr(
+        directory,
+        "get_self",
+        lambda: (_ for _ in ()).throw(local_group.LocalSendError("db unavailable")),
+    )
+    r = local_group.create_group(["陈涛", "陈挺"])
+    assert r["success"] is True
 
 
 def test_opens_picker_before_selecting(fake):
@@ -165,6 +190,18 @@ def test_needs_at_least_two_others(fake):
     assert r["success"] is False
     assert "至少要 2 个人" in r["error"]
     assert fake.plus_clicked is False  # 参数不对就别去动客户端
+
+
+def test_needs_two_others_after_ignoring_self(fake, monkeypatch):
+    monkeypatch.setattr(
+        directory,
+        "resolve_member",
+        lambda q: {"userid": "me" if q == "zixunguwen" else q},
+    )
+    r = local_group.create_group(["陈涛", "zixunguwen"])
+    assert r["success"] is False
+    assert "至少要 2 个人" in r["error"]
+    assert fake.plus_clicked is False
 
 
 def test_refuses_when_a_panel_is_already_open(fake):
