@@ -541,6 +541,37 @@ def _require_kodo(settings: Settings) -> None:
         raise MediaError("未配置对象存储(kodo_ak/kodo_sk/kodo_bucket/kodo_domain)")
 
 
+def _magic_ext(data: bytes) -> str:
+    """从图片文件头识别扩展名,修正企微缓存中不可靠的文件名。"""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if data.startswith(b"BM"):
+        return ".bmp"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        if data[8:12] in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+            return ".heic"
+    return ""
+
+
+def _file_ext(path: str) -> str:
+    """优先使用真实文件格式,再退回路径扩展名。"""
+    with open(path, "rb") as stream:
+        detected = _magic_ext(stream.read(32))
+    return detected or os.path.splitext(path)[1].lower() or ".bin"
+
+
+def _upload_name(name: str, ext: str) -> str:
+    """让 multipart 文件名的 MIME 类型和实际字节保持一致。"""
+    stem, _ = os.path.splitext(name)
+    return f"{stem or 'image'}{ext}"
+
+
 def _put(open_stream, name: str, digest: str, ext: str,
          settings: Settings, rid, send_time: int, *, needs_conversion: bool = False) -> str:
     """算 key → 已存在就复用 → 否则直传。两条上传路径唯一的差别只是字节从哪来。
@@ -564,14 +595,14 @@ def upload(path: str, settings: Settings, rid="", send_time: int = 0, md5: str =
     这样本地只缓存到渲染件时,key 仍然认的是这张图的身份,不会一图两对象。
     """
     _require_kodo(settings)          # 先挡住,免得白读一遍文件算 md5
-    source_ext = os.path.splitext(path)[1].lower() or ".bin"
-    needs_conversion = source_ext not in _MARS_IMAGE_EXTS
-    ext = source_ext if not needs_conversion else ".jpg"
-    name = os.path.basename(path)
 
     def open_stream() -> io.IOBase:
         return open(path, "rb")
     try:
+        source_ext = _file_ext(path)
+        needs_conversion = source_ext not in _MARS_IMAGE_EXTS
+        ext = source_ext if not needs_conversion else ".jpg"
+        name = _upload_name(os.path.basename(path), ext)
         return _put(
             open_stream, name, md5 or file_md5(path), ext, settings, rid, send_time,
             needs_conversion=needs_conversion,
@@ -587,7 +618,7 @@ def upload_bytes(data: bytes, ext: str, settings: Settings, rid="", send_time: i
     它在这里只当区分位,不承担「认出这是同一张图」的职责。转码只换扩展名,
     区分位仍是**原始字节**的 md5,所以同一张图重推落在同一个 key 上。
     """
-    source_ext = ext.lower()
+    source_ext = _magic_ext(data) or ext.lower()
     needs_conversion = source_ext not in _MARS_IMAGE_EXTS
     ext = source_ext if not needs_conversion else ".jpg"
     digest = hashlib.md5(data).hexdigest()
@@ -595,7 +626,7 @@ def upload_bytes(data: bytes, ext: str, settings: Settings, rid="", send_time: i
     def open_stream() -> io.BytesIO:
         return io.BytesIO(data)
     return _put(
-        open_stream, f"image{source_ext}", digest, ext, settings, rid, send_time,
+        open_stream, _upload_name("image", ext), digest, ext, settings, rid, send_time,
         needs_conversion=needs_conversion,
     )
 
