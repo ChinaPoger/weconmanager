@@ -4,6 +4,7 @@
 (httpx)都整体打桩,测的是「映射对不对、顺序对不对、断点续传对不对」。
 """
 import asyncio
+import json
 import sqlite3
 from types import SimpleNamespace
 
@@ -197,6 +198,14 @@ def test_invalid_or_missing_corpid_is_sent_as_zero(settings):
         assert hook["corpid"] == 0
 
 
+def test_hook_normalizes_numeric_member_identity_fields(settings):
+    hook = mars_sync.to_hook(
+        _msg(1, 1, "x", userid=708781594, corpid=1970325276990586), settings
+    )
+    assert hook["userid"] == "708781594"
+    assert hook["corpid"] == "1970325276990586"
+
+
 def test_card_placeholder_is_removed_but_type_is_kept(settings):
     msg = {**_msg(1, 1, "[卡片] 708781594 https://work.weixin.qq.com/card"), "type": "卡片"}
     hook = mars_sync.to_hook(msg, settings)
@@ -373,15 +382,20 @@ def test_outbox_reuses_the_first_hook_when_media_resolution_changes(settings, mo
     assert mars_sync.peek_outbox(msg, settings) == first
 
 
-def test_old_outbox_corpid_string_is_normalized_on_read(settings):
+def test_old_outbox_normalizes_numeric_member_identity_fields(settings):
     msg = {**_msg(7, 100, "[图片]"), "raw": b"tree"}
     path = mars_sync._outbox_path(msg, settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('{"message":"frozen","corpid":"1970325043038620"}', encoding="utf-8")
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"message": "frozen", "userid": 708781594, "corpid": 1970325276990586}),
+        encoding="utf-8",
+    )
 
-    hook = mars_sync.peek_outbox(msg, settings)
-
-    assert hook == {"message": "frozen", "corpid": 1970325043038620}
+    assert mars_sync.peek_outbox(msg, settings) == {
+        "message": "frozen",
+        "userid": "708781594",
+        "corpid": "1970325276990586",
+    }
 
 
 def test_a_message_without_media_is_not_written_to_the_outbox(settings):

@@ -40,6 +40,11 @@ def test_decrypt_entrypoint_still_exists(home):
     assert (home.decrypt_dir / "macos" / "read_wecom.py").is_file()
 
 
+def test_key_discovery_script_still_exists(home):
+    """启动预检靠它在新机器上自动取 key —— 改名了会卡住服务 ready,不只是降级。"""
+    assert (home.decrypt_dir / "macos" / "find_key_fast.py").is_file()
+
+
 def test_categories_used_by_this_service_exist(wecom):
     assert {"contact", "message"} <= set(wecom.HANDLERS)
 

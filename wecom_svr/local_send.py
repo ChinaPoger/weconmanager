@@ -165,8 +165,24 @@ def _set_clipboard(text: str):
 
 
 def _get_clipboard() -> str:
-    r = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
-    return r.stdout
+    r = subprocess.run(["pbpaste"], capture_output=True, timeout=5)
+    # 剪贴板可能当前存的是图片/富文本等非 UTF-8 数据。按文本读取时不能
+    # 让解码异常穿透 HTTP 层;调用方会把替换后的内容识别为“不是群名”。
+    return r.stdout.decode("utf-8", errors="replace")
+
+
+def _escape(s: str) -> str:
+    """把字符串塞进 AppleScript 双引号字面量。
+
+    换行必须转义成 `\\n`:AppleScript 的字面量不能跨行,群名/消息里带一个回车
+    就会拼出语法不合法的脚本。
+    """
+    return (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
 
 
 def _normalize_file_path(path: str) -> str:
@@ -242,21 +258,68 @@ def _set_clipboard_image(path: str) -> tuple[bool, str]:
     return True, image_path
 
 
-def _paste_and_send_current(paste_delay: float = 0.25) -> tuple[bool, str]:
-    """在当前打开的会话输入框粘贴剪贴板内容并回车发送。"""
+def _paste_and_send_current(
+    paste_delay: float = 0.25,
+    text: str | None = None,
+) -> tuple[bool, str]:
+    """在当前打开的会话输入框粘贴剪贴板内容并回车发送。
+
+    osascript 零退出码只说明按键事件发出去了,不代表企业微信真的收到了。服务在
+    后台运行时前台应用可能是终端/浏览器,旧实现会把 Cmd+V 和回车发给它们,然后
+    仍返回 success=true。这里通过 AXFocusedUIElement 确认企业微信在前台,焦点
+    是聊天输入框。AXValue 写入后不再读取控件值,因为企业微信的 CEF 输入框
+    可能在内容变化后阻塞辅助功能查询,让脚本永远走不到 Return。
+
+    企业微信新版的 CEF 输入区会忽略 System Events 发出的 Cmd+V,但接受 AXValue
+    写入。因此文本消息优先走 AX 直接写入; text=None 时保留剪贴板粘贴路径供图片使用。
+    """
     delay = max(0.1, min(float(paste_delay), 3.0))
+    if text is not None:
+        escaped_text = _escape(text)
+        input_action = f'''
+            set value of inputBefore to "{escaped_text}"
+            delay {delay:.2f}
+        '''
+    else:
+        # 图片粘贴后 AXValue 不是文本, 读取/转换它可能让 AppleScript 卡住。
+        # 所以图片路径只保留发送前的焦点确认, 之后纯靠等: 一份等粘贴生效,
+        # 一份等缩略图渲染完, 渲染没完就回车会把图发丢。
+        input_action = f'''
+            keystroke "v" using command down
+            delay {delay * 2:.2f}
+        '''
+
     script_send = f'''
     tell application "System Events"
+        if not (exists process "企业微信") then error "企业微信进程不存在"
         tell process "企业微信"
-            delay 0.2
-            keystroke "v" using command down
-            delay {delay:.2f}
-            keystroke return
-            delay 0.2
+            if (count of windows) is 0 then error "找不到企业微信窗口"
+            set frontmost to true
+            delay 0.3
+
+            set inputBefore to value of attribute "AXFocusedUIElement"
+            if inputBefore is missing value then error "企业微信没有获得输入焦点"
+            set roleBefore to role of inputBefore
+            if roleBefore is not "AXTextArea" and roleBefore is not "AXTextField" then
+                error "当前焦点不是聊天输入框: " & roleBefore
+            end if
+            {input_action}
         end tell
     end tell
     '''
     ok, err = _run_applescript(script_send)
+    if not ok:
+        return False, f"粘贴/发送失败: {err}"
+
+    # AXValue 写入和按键放在同一个 process tell 块时,企业微信可能在内容变化后
+    # 卡住 AX 查询,导致脚本走不到提交键。独立的全局按键事件能立即投递给前台企微。
+    script_submit = '''
+    tell application "System Events"
+        keystroke return
+        delay 0.4
+    end tell
+    '''
+    ok, err = _run_applescript(script_submit, timeout=3)
     if not ok:
         return False, f"粘贴/发送失败: {err}"
     return True, "ok"
@@ -359,27 +422,15 @@ def open_conversation_by_rid(rid: int) -> dict:
 
 
 def _send_by_scheme(conv: dict, content: str) -> tuple[bool, str]:
-    """按数据库会话 ID 打开目标会话后发送消息。"""
-    old_clipboard = ""
-    try:
-        old_clipboard = _get_clipboard()
-    except Exception:
-        pass
+    """按数据库会话 ID 打开目标会话后发送消息。
 
-    try:
-        ok, msg = _open_conversation_by_scheme(conv)
-        if not ok:
-            return False, f"打开对话失败: {msg}"
+    文本走 AX 直接写入,全程不碰剪贴板 —— 所以这里也不需要备份/还原它。
+    """
+    ok, msg = _open_conversation_by_scheme(conv)
+    if not ok:
+        return False, f"打开对话失败: {msg}"
 
-        _set_clipboard(content)
-        return _paste_and_send_current()
-
-    finally:
-        if old_clipboard:
-            try:
-                _set_clipboard(old_clipboard)
-            except Exception:
-                pass
+    return _paste_and_send_current(text=content)
 
 
 def _send_image_by_scheme(conv: dict, image_path: str) -> tuple[bool, str]:
@@ -456,9 +507,8 @@ def _send_one(contact_name: str, content: str, skip_results: int = 0) -> tuple[b
         if not ok:
             return False, f"搜索/打开对话失败: {err}"
 
-        # Step 3: 复制消息内容 → 粘贴 → 发送
-        _set_clipboard(content)
-        ok, err = _paste_and_send_current()
+        # Step 3: AX 写入消息内容 → 发送(不经剪贴板)
+        ok, err = _paste_and_send_current(text=content)
         if not ok:
             return False, err
 

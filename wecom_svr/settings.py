@@ -45,6 +45,14 @@ class Settings(BaseSettings):
     data_dir: Path = REPO_ROOT / ".data"
     wecom_timeout: int = 30
 
+    # ── 新机器启动门禁 ─────────────────────────────────────────────────
+    # 默认在监听端口前验证/初始化本地数据库和客户端 UI。纯官方 API 部署可整体关闭;
+    # 只采集数据库、不操控界面的部署可只关 startup_ui_check。
+    startup_preflight_enabled: bool = True
+    startup_auto_init: bool = True
+    startup_ui_check: bool = True
+    startup_key_timeout: int = 180
+
     # online/ 文档表格能力依赖的外部 wecom-cli 二进制
     wecom_cli_path: str = "wecom-cli"
     online_timeout: int = 60
@@ -116,7 +124,8 @@ class Settings(BaseSettings):
     mars_tasks_actions: str = "app.message.send"
 
     # ── 界面坐标(仅本人身份操控 macOS 客户端时用得上)──────────────────
-    # 只有两个位置没有 AX 元素,只能按主窗口原点取偏移去点(见 ui_offsets.py)。
+    # "+" 没有 AX 元素,只能按主窗口原点取偏移去点(见 ui_offsets.py);
+    # title 只保留给旧版客户端的兼容路径。
     # 写成 "x,y" 可覆盖;**配了就只用它**,自动校准会因此关闭 —— 人给的指令
     # 不该被程序的猜测盖过去。
     ui_plus_offset: str = ""

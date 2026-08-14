@@ -8,6 +8,7 @@
     本人身份的那几条(local.LOCAL_PATHS) → {"success": false, "error": "..."}
     其它                                 → {"errcode": -1, "errmsg": "..."}
 """
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -32,6 +33,7 @@ from .paths import AgentHomeError
 from .routers import contact, doc, group, local, mars, mars_tasks, message, sheet, smartsheet
 from .schemas import HealthResponse
 from .settings import get_agent_home, get_settings
+from .startup_preflight import run as run_startup_preflight
 from .uilock import ClientBusy
 
 log = logging.getLogger(__name__)
@@ -98,12 +100,10 @@ def _first_validation_message(exc: RequestValidationError) -> str:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """按配置拉起两个常驻循环:群消息同步(推)、任务拉取(拉)。
-
-    循环内部自己吞异常(本地库没解密、企微没登录都是常态),所以这里不做预检:
-    服务不该因为「现在同步不了」而起不来。
-    """
+    """先完成新机器本地初始化,再拉起两个常驻循环。"""
     settings = get_settings()
+    preflight = await asyncio.to_thread(run_startup_preflight, settings)
+    app.state.startup_preflight = preflight.to_dict()
     if settings.mars_sync_enabled:
         mars_loop.start()
     if settings.mars_tasks_enabled:
@@ -165,6 +165,7 @@ def create_app() -> FastAPI:
     @app.get("/health", response_model=HealthResponse, tags=["meta"])
     async def health() -> HealthResponse:
         creds = bool(settings.corpid and settings.secret)
+        preflight = getattr(app.state, "startup_preflight", None)
         try:
             home = get_agent_home()
         except AgentHomeError as e:
@@ -172,6 +173,7 @@ def create_app() -> FastAPI:
                 status="degraded",
                 auth_enabled=settings.auth_enabled,
                 credentials_configured=creds,
+                startup_preflight=preflight,
                 detail=str(e),
             )
         return HealthResponse(
@@ -180,6 +182,7 @@ def create_app() -> FastAPI:
             wecom_cli=str(home.wecom_cli),
             auth_enabled=settings.auth_enabled,
             credentials_configured=creds,
+            startup_preflight=preflight,
             detail=None if creds else "缺少 corpid/secret,官方 API 调用会失败",
         )
 

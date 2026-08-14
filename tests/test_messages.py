@@ -84,7 +84,36 @@ def _pb(field: int, payload: bytes) -> bytes:
     return varint(field << 3 | 2) + varint(len(payload)) + payload
 
 
+def _text_message(payload: bytes) -> bytes:
+    """企微普通文本的实测 protobuf 外壳: field 1 -> field 2 -> field 1。"""
+    return _pb(1, b"\x08\x00" + _pb(2, _pb(1, payload)))
+
+
 LINK_PREVIEW = _pb(3045, b"meta") + _pb(1042, b"GitHub Issue #147")
+
+
+@pytest.mark.parametrize(("payload", "expected"), [
+    (b"1", "1"),
+    ("好".encode(), "好"),
+    ("😂".encode(), "😂"),
+])
+def test_single_character_text_survives_upstream_placeholder(monkeypatch, payload, expected):
+    """上游会把长度小于 2 的 protobuf 文本叶子过滤掉,不能只留下 `[文本]`。"""
+    class Export:
+        render = staticmethod(lambda _ct, _content: "[文本]")
+
+    monkeypatch.setattr(messages, "_vendor", lambda: type("V", (), {"export": Export()})())
+
+    assert messages._render(2, _text_message(payload), "文本") == expected
+
+
+def test_short_text_fallback_ignores_unrelated_one_character_fields(monkeypatch):
+    class Export:
+        render = staticmethod(lambda _ct, _content: "[文本]")
+
+    monkeypatch.setattr(messages, "_vendor", lambda: type("V", (), {"export": Export()})())
+
+    assert messages._render(2, _pb(9, b"1"), "文本") == "[文本]"
 
 
 def test_type_123_image_with_caption_keeps_both_parts():

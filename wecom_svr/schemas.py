@@ -152,4 +152,5 @@ class HealthResponse(BaseModel):
     wecom_cli: str | None = None
     auth_enabled: bool = False
     credentials_configured: bool = False
+    startup_preflight: dict[str, bool] | None = None
     detail: str | None = None

@@ -59,9 +59,20 @@ def test_candidates_start_at_the_current_point_and_do_not_repeat(settings):
     assert len(cands) == len(set(cands))
 
 
-def test_remembering_the_point_already_in_use_writes_nothing(settings, tmp_path):
+def test_first_calibration_persists_even_when_default_point_works(settings, tmp_path):
     ui_offsets.remember("plus", ui_offsets.DEFAULTS["plus"], settings)
-    assert not (tmp_path / "ui_offsets.json").exists()
+    saved = json.loads((tmp_path / "ui_offsets.json").read_text(encoding="utf-8"))
+    assert saved == {"plus": "295,29"}
+
+
+def test_remembering_an_already_saved_point_does_not_rewrite(settings, tmp_path):
+    path = tmp_path / "ui_offsets.json"
+    ui_offsets.remember("plus", (275, 29), settings)
+    first_mtime = path.stat().st_mtime_ns
+
+    ui_offsets.remember("plus", (275, 29), settings)
+
+    assert path.stat().st_mtime_ns == first_mtime
 
 
 def test_two_positions_are_remembered_independently(settings, tmp_path):
