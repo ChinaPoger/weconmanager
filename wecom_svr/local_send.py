@@ -33,6 +33,8 @@ from .uilock import ui_session
 log = logging.getLogger(__name__)
 
 _quartz_libraries = None
+_accessibility_libraries = None
+_wecom_ax_application: tuple[int, int] | None = None
 _chat_window_bounds: tuple[float, float, float, float] | None = None
 
 
@@ -356,8 +358,18 @@ def _post_key(keycode: int, flags: int = 0) -> tuple[bool, str]:
 
 
 def _post_return_key() -> tuple[bool, str]:
-    """提交聊天输入框;企微 5.0.x 需要 Quartz Return 才能稳定触发发送。"""
-    return _post_key(36)
+    """校验输入焦点后通过 System Events 提交消息。
+
+    原生 AX 负责快速校验;System Events 只投递一个 Return,实测约 0.15 秒。
+    不能改回 ``CGEventPost``:宿主缺少输入监控权限时它会静默丢事件。
+    """
+    ok, _element, err = _focused_chat_input()
+    if not ok:
+        return False, err
+    return _run_applescript(
+        'tell application "System Events" to tell process "企业微信" to key code 36',
+        timeout=2,
+    )
 
 
 def _post_mouse_click(x: float, y: float) -> tuple[bool, str]:
@@ -423,7 +435,7 @@ def _refresh_chat_window_bounds() -> tuple[bool, str]:
 
 
 def _focus_chat_input() -> tuple[bool, str]:
-    """置前企微窗口并用缓存的窗口相对坐标点击聊天输入区。"""
+    """使用预热的窗口位置点击聊天输入区;无缓存时再读取一次。"""
     if _chat_window_bounds is None:
         ok, err = _refresh_chat_window_bounds()
         if not ok:
@@ -457,6 +469,144 @@ def _clear_current_input() -> tuple[bool, str]:
     if ok:
         time.sleep(0.08)
     return ok, err
+
+
+def _load_accessibility_libraries():
+    """加载原生 Accessibility/CoreFoundation API;避免慢速 System Events 查询。"""
+    global _accessibility_libraries
+    if _accessibility_libraries is not None:
+        return _accessibility_libraries
+    ax = ctypes.CDLL(
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+    )
+    cf = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    ax.AXUIElementCreateApplication.argtypes = [ctypes.c_int]
+    ax.AXUIElementCreateApplication.restype = ctypes.c_void_p
+    ax.AXUIElementCopyAttributeValue.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ax.AXUIElementCopyAttributeValue.restype = ctypes.c_int32
+    ax.AXUIElementSetAttributeValue.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    ax.AXUIElementSetAttributeValue.restype = ctypes.c_int32
+    cf.CFStringCreateWithCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+    ]
+    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+    cf.CFStringGetCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+    ]
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFRelease.restype = None
+    _accessibility_libraries = ax, cf
+    return _accessibility_libraries
+
+
+def _cf_string(value: str) -> int:
+    _ax, cf = _load_accessibility_libraries()
+    # kCFStringEncodingUTF8
+    return int(cf.CFStringCreateWithCString(None, value.encode(), 0x08000100))
+
+
+def _cf_string_value(ref: int) -> str:
+    _ax, cf = _load_accessibility_libraries()
+    size = 256
+    while size <= 1 << 20:
+        buf = ctypes.create_string_buffer(size)
+        if cf.CFStringGetCString(ref, buf, size, 0x08000100):
+            return buf.value.decode("utf-8")
+        size *= 2
+    raise ValueError("Accessibility 文本超过 1 MiB")
+
+
+def _ax_application() -> tuple[bool, int, str]:
+    global _wecom_ax_application
+    if _wecom_ax_application is not None:
+        return True, _wecom_ax_application[1], "ok"
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "企业微信"], capture_output=True, text=True, timeout=1,
+        )
+        pid = int(result.stdout.splitlines()[0]) if result.returncode == 0 else 0
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        pid = 0
+    if not pid:
+        return False, 0, "企业微信进程不存在"
+    try:
+        ax, _cf = _load_accessibility_libraries()
+        app = int(ax.AXUIElementCreateApplication(pid))
+    except OSError as e:
+        return False, 0, f"加载 Accessibility 失败: {e}"
+    if not app:
+        return False, 0, "无法连接企业微信辅助功能"
+    _wecom_ax_application = pid, app
+    return True, app, "ok"
+
+
+def _ax_attribute(element: int, name: str) -> tuple[bool, int, str]:
+    ax, cf = _load_accessibility_libraries()
+    attribute = _cf_string(name)
+    value = ctypes.c_void_p()
+    try:
+        code = ax.AXUIElementCopyAttributeValue(element, attribute, ctypes.byref(value))
+    finally:
+        cf.CFRelease(attribute)
+    if code != 0 or not value.value:
+        return False, 0, f"读取 {name} 失败(AXError={code})"
+    return True, int(value.value), "ok"
+
+
+def _focused_chat_input() -> tuple[bool, int, str]:
+    ok, app, err = _ax_application()
+    if not ok:
+        return False, 0, err
+    ok, element, err = _ax_attribute(app, "AXFocusedUIElement")
+    if not ok:
+        return False, 0, f"企业微信没有获得输入焦点: {err}"
+    ok, role_ref, err = _ax_attribute(element, "AXRole")
+    if not ok:
+        return False, 0, err
+    _ax, cf = _load_accessibility_libraries()
+    try:
+        role = _cf_string_value(role_ref)
+    finally:
+        cf.CFRelease(role_ref)
+    if role not in {"AXTextArea", "AXTextField"}:
+        cf.CFRelease(element)
+        return False, 0, f"当前焦点不是聊天输入框: {role}"
+    return True, element, "ok"
+
+
+def _set_current_input(text: str) -> tuple[bool, str]:
+    """用原生 AX 写入并回读输入框;实测约 2ms。"""
+    ok, element, err = _focused_chat_input()
+    if not ok:
+        return False, err
+    ax, cf = _load_accessibility_libraries()
+    attribute = _cf_string("AXValue")
+    value = _cf_string(text)
+    try:
+        code = ax.AXUIElementSetAttributeValue(element, attribute, value)
+        if code != 0:
+            return False, f"写入企微输入框失败(AXError={code})"
+        ok, actual_ref, err = _ax_attribute(element, "AXValue")
+        if not ok:
+            return False, err
+        try:
+            actual = _cf_string_value(actual_ref)
+        finally:
+            cf.CFRelease(actual_ref)
+        if actual != text:
+            return False, "企微输入框未接受消息正文"
+        return True, "ok"
+    finally:
+        cf.CFRelease(value)
+        cf.CFRelease(attribute)
+        cf.CFRelease(element)
 
 
 def _post_unicode_text(text: str) -> tuple[bool, str]:
@@ -610,15 +760,14 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
         return False, f"聚焦聊天输入框失败: {err}"
     if not spans:
         clear_started = time.perf_counter()
-        ok, err = _select_current_input()
+        # 普通文本直接写 AXValue 并回读。CGEventPost 在缺少输入监控权限时会
+        # 静默丢弃 Unicode 事件,不能作为“输入成功”的依据。
+        ok, err = _set_current_input(content)
         clear_elapsed = time.perf_counter() - clear_started
+        input_elapsed = 0.0
         if not ok:
             return False, f"输入消息失败: {err}"
-        input_started = time.perf_counter()
-        ok, err = _post_unicode_text(content)
-        input_elapsed = time.perf_counter() - input_started
-        if not ok:
-            return False, f"输入消息失败: {err}"
+        time.sleep(0.08)
         submit_started = time.perf_counter()
         result = _submit_current_input()
         submit_elapsed = time.perf_counter() - submit_started
@@ -659,6 +808,7 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
         _clear_current_input()
         return False, str(e)
 
+    time.sleep(0.1)
     result = _submit_current_input()
     log.info(
         "本地 @ 消息发送完成: mentions=%d elapsed=%.3fs",
@@ -757,7 +907,7 @@ def _conversation_jump_url(conv: dict, msgid: int = 0) -> str:
     return f"wxwork://jump?{query}"
 
 
-def _open_conversation_by_scheme(conv: dict, wait: float = 0.25) -> tuple[bool, str]:
+def _open_conversation_by_scheme(conv: dict, wait: float = 0.45) -> tuple[bool, str]:
     """使用客户端 URL Scheme 按 RID/type/fw_id 精准打开会话。"""
     try:
         url = _conversation_jump_url(conv)

@@ -12,6 +12,7 @@ def script(monkeypatch):
         "return_calls": 0,
         "key_calls": [],
         "unicode_calls": [],
+        "input_calls": [],
         "focus_calls": 0,
     }
 
@@ -34,6 +35,10 @@ def script(monkeypatch):
         seen["unicode_calls"].append(text)
         return True, "ok"
 
+    def fake_input(text):
+        seen["input_calls"].append(text)
+        return True, "ok"
+
     def fake_focus():
         seen["focus_calls"] += 1
         return True, "ok"
@@ -42,6 +47,7 @@ def script(monkeypatch):
     monkeypatch.setattr(local_send, "_post_return_key", fake_return)
     monkeypatch.setattr(local_send, "_post_key", fake_key)
     monkeypatch.setattr(local_send, "_post_unicode_text", fake_unicode)
+    monkeypatch.setattr(local_send, "_set_current_input", fake_input)
     monkeypatch.setattr(local_send, "_focus_chat_input", fake_focus)
     return seen
 
@@ -116,8 +122,42 @@ def test_text_send_does_not_touch_the_clipboard(monkeypatch, script):
 
     assert local_send._send_by_scheme({"rid": 1}, "hi") == (True, "ok")
     assert script["focus_calls"] == 1
-    assert script["key_calls"] == [(0, 1 << 20)]
-    assert script["unicode_calls"] == ["hi"]
+    assert script["input_calls"] == ["hi"]
+    assert script["key_calls"] == []
+    assert script["unicode_calls"] == []
+
+
+def test_submit_checks_native_ax_focus_then_uses_system_events(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(local_send, "_focused_chat_input", lambda: (True, 123, "ok"))
+
+    def fake(script, timeout=15):
+        seen["script"] = script
+        seen["timeout"] = timeout
+        return True, "ok"
+
+    monkeypatch.setattr(local_send, "_run_applescript", fake)
+
+    assert local_send._post_return_key() == (True, "ok")
+    assert 'process "企业微信" to key code 36' in seen["script"]
+    assert seen["timeout"] == 2
+
+
+def test_submit_rejects_non_chat_focus_without_sending(monkeypatch):
+    monkeypatch.setattr(
+        local_send,
+        "_focused_chat_input",
+        lambda: (False, 0, "当前焦点不是聊天输入框: AXButton"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_run_applescript",
+        lambda *_args, **_kwargs: pytest.fail("焦点错误时不应发送 Return"),
+    )
+
+    assert local_send._post_return_key() == (
+        False, "当前焦点不是聊天输入框: AXButton",
+    )
 
 
 def test_select_current_input_uses_select_all(monkeypatch):
@@ -165,12 +205,12 @@ def test_focus_chat_input_uses_window_relative_quartz_click(monkeypatch):
 def test_focus_chat_input_reuses_cached_window_bounds(monkeypatch):
     seen = {}
     monkeypatch.setattr(
-        local_send, "_chat_window_bounds", (10.0, 20.0, 1000.0, 800.0)
+        local_send, "_chat_window_bounds", (1.0, 2.0, 500.0, 400.0)
     )
     monkeypatch.setattr(
         local_send,
         "_run_applescript",
-        lambda *_args, **_kwargs: pytest.fail("缓存命中时不应再启动 AppleScript"),
+        lambda *_args, **_kwargs: pytest.fail("缓存命中时不应启动 AppleScript"),
     )
     monkeypatch.setattr(
         local_send,
@@ -179,7 +219,7 @@ def test_focus_chat_input_reuses_cached_window_bounds(monkeypatch):
     )
 
     assert local_send._focus_chat_input() == (True, "ok")
-    assert seen == {"x": 730.0, "y": 775.0}
+    assert seen == {"x": 361.0, "y": 357.0}
 
 
 def test_focus_chat_input_rejects_invalid_window_geometry(monkeypatch):
@@ -229,7 +269,7 @@ def test_open_conversation_uses_short_settle_delay(monkeypatch):
     })
 
     assert ok is True
-    assert sleeps == [0.25]
+    assert sleeps == [0.45]
 
 
 def test_submit_current_input_has_no_default_settle_delay(monkeypatch):
@@ -269,6 +309,7 @@ def test_rich_message_selects_mentions_before_sending(monkeypatch):
     monkeypatch.setattr(local_send, "_clear_current_input", lambda: calls.append("clear") or (True, "ok"))
     monkeypatch.setattr(local_send, "_post_unicode_text", lambda text: calls.append(text) or (True, "ok"))
     monkeypatch.setattr(local_send, "_type_mention", lambda name: calls.append(("mention", name)))
+    monkeypatch.setattr(local_send.time, "sleep", lambda delay: calls.append(("sleep", delay)))
     monkeypatch.setattr(
         local_send,
         "_submit_current_input",
@@ -283,18 +324,23 @@ def test_rich_message_selects_mentions_before_sending(monkeypatch):
     assert local_send._type_rich_message("请 @abz 和 @任威风 测试", None) == (True, "ok")
     assert calls == [
         "focus", "clear", "请 ", ("mention", "abz"), " 和 ",
-        ("mention", "任威风"), " 测试", "submit",
+        ("mention", "任威风"), " 测试", ("sleep", 0.1), "submit",
     ]
 
 
-def test_plain_text_uses_quartz_without_accessibility_or_clipboard(monkeypatch):
+def test_plain_text_uses_verified_ax_input_without_clipboard(monkeypatch):
     calls = []
     monkeypatch.setattr(local_send, "_focus_chat_input", lambda: calls.append("focus") or (True, "ok"))
-    monkeypatch.setattr(local_send, "_select_current_input", lambda: calls.append("select") or (True, "ok"))
+    monkeypatch.setattr(
+        local_send,
+        "_set_current_input",
+        lambda text: calls.append(("text", text)) or (True, "ok"),
+    )
+    monkeypatch.setattr(local_send.time, "sleep", lambda delay: calls.append(("sleep", delay)))
     monkeypatch.setattr(
         local_send,
         "_post_unicode_text",
-        lambda text: calls.append(("text", text)) or (True, "ok"),
+        lambda _text: pytest.fail("普通文本不应使用无法校验的 Quartz Unicode 事件"),
     )
     monkeypatch.setattr(
         local_send,
@@ -303,14 +349,9 @@ def test_plain_text_uses_quartz_without_accessibility_or_clipboard(monkeypatch):
     )
     monkeypatch.setattr(
         local_send,
-        "_run_applescript",
-        lambda *_args, **_kwargs: pytest.fail("普通文本不应读取辅助功能输入框"),
-    )
-    monkeypatch.setattr(
-        local_send,
         "_paste_and_send_current",
         lambda **kwargs: pytest.fail("普通文本不应触发剪贴板粘贴"),
     )
 
     assert local_send._type_rich_message("test", None) == (True, "ok")
-    assert calls == ["focus", "select", ("text", "test"), "submit"]
+    assert calls == ["focus", ("text", "test"), ("sleep", 0.08), "submit"]
