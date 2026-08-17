@@ -93,3 +93,39 @@ def test_text_send_does_not_touch_the_clipboard(monkeypatch, script):
     )
 
     assert local_send._send_by_scheme({"rid": 1}, "hi") == (True, "ok")
+
+
+def test_mention_spans_are_inferred_and_ordered():
+    assert local_send._mention_spans("请 @abz 和 @任威风 测试", None) == [
+        (2, 6, "abz"),
+        (9, 13, "任威风"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("content", "mentions", "message"),
+    [
+        ("@abz", ["缺席"], "正文中必须恰好出现一次 @缺席"),
+        ("@abz @abz", ["abz"], "正文中必须恰好出现一次 @abz"),
+        ("@abz", ["abz", "abz"], "mentions 中姓名重复: abz"),
+    ],
+)
+def test_mention_spans_reject_invalid_declarations(content, mentions, message):
+    with pytest.raises(local_send.LocalSendError, match=message):
+        local_send._mention_spans(content, mentions)
+
+
+def test_rich_message_selects_mentions_before_sending(monkeypatch):
+    calls = []
+    monkeypatch.setattr(local_send, "_clear_chat_input", lambda: (True, "ok"))
+    monkeypatch.setattr(local_send, "_post_unicode_text", lambda text: calls.append(text) or (True, "ok"))
+    monkeypatch.setattr(local_send, "_type_mention", lambda name, selected: calls.append((name, selected)))
+    monkeypatch.setattr(local_send, "_mention_input_value", lambda: "\ufffc\ufffc")
+    monkeypatch.setattr(
+        local_send,
+        "_paste_and_send_current",
+        lambda **kwargs: calls.append(kwargs) or (True, "ok"),
+    )
+
+    assert local_send._type_rich_message("请 @abz 和 @任威风 测试", None) == (True, "ok")
+    assert calls == ["请 ", ("abz", 0), " 和 ", ("任威风", 1), " 测试", {}]

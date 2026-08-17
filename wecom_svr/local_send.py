@@ -12,10 +12,12 @@
 """
 import ctypes
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
+from itertools import pairwise
 from urllib.parse import urlencode
 
 from .localdb import NOT_SYNCED as _NOT_SYNCED
@@ -322,6 +324,255 @@ def _post_return_key() -> tuple[bool, str]:
     return True, "ok"
 
 
+def _post_unicode_text(text: str) -> tuple[bool, str]:
+    """投递一段 Unicode 键盘事件,绕开当前输入法但保留真实输入语义。
+
+    企微的 @ 候选框只会响应真实键盘输入。AXValue 一次性写入 ``@姓名`` 只能得到
+    普通文本,而 System Events 的 ``keystroke`` 在中文输入法下可能把英文拆成带空格
+    的拼音。CoreGraphics 的 Unicode 事件同时解决这两个问题。
+    """
+    if not text:
+        return True, "ok"
+    try:
+        cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        cf = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        cg.CGEventCreateKeyboardEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool,
+        ]
+        cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+        cg.CGEventKeyboardSetUnicodeString.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_uint16),
+        ]
+        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        units = text.encode("utf-16-le")
+        chars = (ctypes.c_uint16 * (len(units) // 2)).from_buffer_copy(units)
+        down = cg.CGEventCreateKeyboardEvent(None, 0, True)
+        up = cg.CGEventCreateKeyboardEvent(None, 0, False)
+        if not down or not up:
+            if down:
+                cf.CFRelease(down)
+            if up:
+                cf.CFRelease(up)
+            return False, "无法创建 Unicode 键盘事件"
+        try:
+            cg.CGEventKeyboardSetUnicodeString(down, len(chars), chars)
+            cg.CGEventKeyboardSetUnicodeString(up, len(chars), chars)
+            cg.CGEventPost(0, down)  # kCGHIDEventTap
+            time.sleep(0.03)
+            cg.CGEventPost(0, up)
+        finally:
+            cf.CFRelease(down)
+            cf.CFRelease(up)
+    except OSError as e:
+        return False, f"加载 Quartz 失败: {e}"
+    return True, "ok"
+
+
+def _mention_candidates() -> list[str]:
+    """读取当前 @ 候选窗的第一列姓名。"""
+    script = r'''
+    tell application "System Events"
+        tell process "企业微信"
+            repeat with w in windows
+                try
+                    set ws to size of w
+                    if (item 1 of ws) > 600 or (item 2 of ws) > 500 then
+                        error "不是 @ 候选窗口"
+                    end if
+                    set tb to table 1 of scroll area 1 of w
+                    set acc to ""
+                    repeat with r in rows of tb
+                        try
+                            set acc to acc & (value of static text 1 of r as text) & linefeed
+                        end try
+                    end repeat
+                    return acc
+                end try
+            end repeat
+            error "找不到 @ 成员候选窗口"
+        end tell
+    end tell
+    '''
+    ok, out = _run_applescript(script, timeout=15)
+    if not ok:
+        raise LocalSendError(f"读取 @ 候选失败: {out}")
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def _mention_input_value() -> str:
+    """读取聊天输入框的 AXValue,其中 U+FFFC 代表一个已选中的提及对象。"""
+    script = r'''
+    tell application "System Events"
+        tell process "企业微信"
+            set inputBefore to value of attribute "AXFocusedUIElement"
+            if inputBefore is missing value then error "企业微信没有获得输入焦点"
+            set roleBefore to role of inputBefore
+            if roleBefore is not "AXTextArea" and roleBefore is not "AXTextField" then
+                error "当前焦点不是聊天输入框: " & roleBefore
+            end if
+            return value of inputBefore as text
+        end tell
+    end tell
+    '''
+    ok, out = _run_applescript(script, timeout=15)
+    if not ok:
+        raise LocalSendError(out)
+    return out
+
+
+def _clear_chat_input() -> tuple[bool, str]:
+    """清空当前聊天输入框并确认焦点仍在输入区。"""
+    script = r'''
+    tell application "System Events"
+        if not (exists process "企业微信") then error "企业微信进程不存在"
+        tell process "企业微信"
+            if (count of windows) is 0 then error "找不到企业微信窗口"
+            set frontmost to true
+            delay 0.3
+            set inputBefore to value of attribute "AXFocusedUIElement"
+            if inputBefore is missing value then error "企业微信没有获得输入焦点"
+            set roleBefore to role of inputBefore
+            if roleBefore is not "AXTextArea" and roleBefore is not "AXTextField" then
+                error "当前焦点不是聊天输入框: " & roleBefore
+            end if
+            set value of inputBefore to ""
+            set focused of inputBefore to true
+        end tell
+    end tell
+    '''
+    return _run_applescript(script, timeout=15)
+
+
+def _dismiss_mention_picker() -> None:
+    """关闭残留的 @ 候选窗,用于失败清理。"""
+    script = r'''
+    tell application "System Events"
+        tell process "企业微信"
+            repeat with w in windows
+                try
+                    set tb to table 1 of scroll area 1 of w
+                    key code 53
+                    return
+                end try
+            end repeat
+        end tell
+    end tell
+    '''
+    _run_applescript(script, timeout=10)
+
+
+def _type_mention(name: str, selected_count: int) -> None:
+    """触发 @ 候选,精确选中一个成员并校验生成了提及对象。"""
+    ok, err = _post_unicode_text("@")
+    if not ok:
+        raise LocalSendError(f"输入 @ 失败: {err}")
+    time.sleep(0.7)
+
+    ok, err = _post_unicode_text(name)
+    if not ok:
+        raise LocalSendError(f"输入 @成员搜索词失败: {err}")
+    time.sleep(1.0)
+
+    candidates = _mention_candidates()
+    if candidates != [name]:
+        shown = ", ".join(candidates[:8]) or "(无结果)"
+        raise LocalSendError(
+            f"@「{name}」匹配到 {len(candidates)} 个候选: {shown};"
+            "为避免误 @,未发送消息"
+        )
+
+    ok, err = _run_applescript(
+        '''
+        tell application "System Events"
+            tell process "企业微信"
+                set frontmost to true
+                keystroke return
+            end tell
+        end tell
+        ''',
+        timeout=15,
+    )
+    if not ok:
+        raise LocalSendError(f"选择 @成员失败: {err}")
+    time.sleep(0.8)
+
+    value = _mention_input_value()
+    if value.count("\ufffc") != selected_count + 1:
+        raise LocalSendError(
+            f"@「{name}」未生成真实提及对象(当前已选 {value.count(chr(0xfffc))} 个),"
+            "未发送消息"
+        )
+
+
+def _infer_mentions(content: str) -> list[str]:
+    """从常见的 @中文/英文/数字姓名写法推断提及列表。"""
+    return re.findall(r"(?<![\w@])@([A-Za-z0-9_\u3400-\u9fff]+)", content)
+
+
+def _mention_spans(content: str, mentions: list[str] | None) -> list[tuple[int, int, str]]:
+    """校验正文里的 @姓名并按正文位置返回跨度。"""
+    wanted = list(mentions) if mentions is not None else _infer_mentions(content)
+    seen: set[str] = set()
+    spans: list[tuple[int, int, str]] = []
+    for name in wanted:
+        name = name.strip()
+        if not name:
+            raise LocalSendError("mentions 中不能有空姓名")
+        if name in seen:
+            raise LocalSendError(f"mentions 中姓名重复: {name}")
+        seen.add(name)
+        token = f"@{name}"
+        start = content.find(token)
+        if start < 0 or content.find(token, start + 1) >= 0:
+            raise LocalSendError(f"正文中必须恰好出现一次 {token}")
+        spans.append((start, start + len(token), name))
+    spans.sort()
+    for (_, end, _), (start, _, _) in pairwise(spans):
+        if start < end:
+            raise LocalSendError("mentions 中的 @姓名发生重叠")
+    return spans
+
+
+def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, str]:
+    """逐段输入正文,把声明的 @姓名转换为企微内部提及对象。"""
+    spans = _mention_spans(content, mentions)
+    if not spans:
+        return _paste_and_send_current(text=content)
+
+    ok, err = _clear_chat_input()
+    if not ok:
+        return False, f"输入消息失败: {err}"
+
+    cursor = 0
+    selected = 0
+    try:
+        for start, end, name in spans:
+            ok, err = _post_unicode_text(content[cursor:start])
+            if not ok:
+                raise LocalSendError(f"输入消息失败: {err}")
+            _type_mention(name, selected)
+            selected += 1
+            cursor = end
+        ok, err = _post_unicode_text(content[cursor:])
+        if not ok:
+            raise LocalSendError(f"输入消息失败: {err}")
+        value = _mention_input_value()
+        if value.count("\ufffc") != selected:
+            raise LocalSendError("消息中的 @ 未全部生成真实提及对象,未发送消息")
+    except LocalSendError as e:
+        _dismiss_mention_picker()
+        _clear_chat_input()
+        return False, str(e)
+
+    return _paste_and_send_current()
+
+
 def _paste_and_send_current(
     paste_delay: float = 0.25,
     text: str | None = None,
@@ -480,7 +731,9 @@ def open_conversation_by_rid(rid: int) -> dict:
     }
 
 
-def _send_by_scheme(conv: dict, content: str) -> tuple[bool, str]:
+def _send_by_scheme(
+    conv: dict, content: str, mentions: list[str] | None = None
+) -> tuple[bool, str]:
     """按数据库会话 ID 打开目标会话后发送消息。
 
     文本走 AX 直接写入,全程不碰剪贴板 —— 所以这里也不需要备份/还原它。
@@ -489,7 +742,7 @@ def _send_by_scheme(conv: dict, content: str) -> tuple[bool, str]:
     if not ok:
         return False, f"打开对话失败: {msg}"
 
-    return _paste_and_send_current(text=content)
+    return _type_rich_message(content, mentions)
 
 
 def _send_image_by_scheme(conv: dict, image_path: str) -> tuple[bool, str]:
@@ -504,7 +757,12 @@ def _send_image_by_scheme(conv: dict, image_path: str) -> tuple[bool, str]:
     return _post_return_key()
 
 
-def _send_one(contact_name: str, content: str, skip_results: int = 0) -> tuple[bool, str]:
+def _send_one(
+    contact_name: str,
+    content: str,
+    skip_results: int = 0,
+    mentions: list[str] | None = None,
+) -> tuple[bool, str]:
     """向一个联系人/群发送消息(搜索框路径)。
 
     skip_results: 搜索后按 ↓ 的次数,用于跳过同名的用户/机器人。
@@ -552,7 +810,7 @@ def _send_one(contact_name: str, content: str, skip_results: int = 0) -> tuple[b
             return False, f"搜索/打开对话失败: {err}"
 
         # Step 3: AX 写入消息内容 → 发送(不经剪贴板)
-        ok, err = _paste_and_send_current(text=content)
+        ok, err = _type_rich_message(content, mentions)
         if not ok:
             return False, err
 
@@ -568,13 +826,19 @@ def _send_one(contact_name: str, content: str, skip_results: int = 0) -> tuple[b
 
 # ─── 公开 API ──────────────────────────────────────────────────────────
 
-def send_message(to: str = "", content: str = "", conv_rid: int | None = None) -> dict:
+def send_message(
+    to: str = "",
+    content: str = "",
+    conv_rid: int | None = None,
+    mentions: list[str] | None = None,
+) -> dict:
     """以登录用户身份发送消息。
 
     Args:
         to: 接收人/群名称(模糊搜索),与 conv_rid 二选一
         conv_rid: 会话 RID(服务端 ID),精准定位
         content: 消息正文
+        mentions: 要转换为真实提及的姓名;不传时自动识别常见的 @姓名
 
     Returns:
         {"success": bool, "conv_name": str, "conv_rid": int, "error": ...}
@@ -608,9 +872,17 @@ def send_message(to: str = "", content: str = "", conv_rid: int | None = None) -
     open_method = "url_scheme" if conv_rid else "search"
     with ui_session("发消息"):
         if conv_rid:
-            ok, msg = _send_by_scheme(conv, content)
+            if mentions is None:
+                ok, msg = _send_by_scheme(conv, content)
+            else:
+                ok, msg = _send_by_scheme(conv, content, mentions)
         else:
-            ok, msg = _send_one(name, content, skip_results=skip)
+            if mentions is None:
+                ok, msg = _send_one(name, content, skip_results=skip)
+            else:
+                ok, msg = _send_one(
+                    name, content, skip_results=skip, mentions=mentions
+                )
 
     return {
         "success": ok,
