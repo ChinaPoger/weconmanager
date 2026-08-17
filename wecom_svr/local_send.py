@@ -609,6 +609,27 @@ def _set_current_input(text: str) -> tuple[bool, str]:
         cf.CFRelease(element)
 
 
+def _insert_current_input(text: str) -> tuple[bool, str]:
+    """在当前光标插入文本,保留输入框里已选择的真实 @ 对象。"""
+    if not text:
+        return True, "ok"
+    ok, element, err = _focused_chat_input()
+    if not ok:
+        return False, err
+    ax, cf = _load_accessibility_libraries()
+    attribute = _cf_string("AXSelectedText")
+    value = _cf_string(text)
+    try:
+        code = ax.AXUIElementSetAttributeValue(element, attribute, value)
+        if code != 0:
+            return False, f"插入企微输入框失败(AXError={code})"
+        return True, "ok"
+    finally:
+        cf.CFRelease(value)
+        cf.CFRelease(attribute)
+        cf.CFRelease(element)
+
+
 def _post_unicode_text(text: str) -> tuple[bool, str]:
     """投递一段 Unicode 键盘事件,绕开当前输入法但保留真实输入语义。
 
@@ -696,15 +717,20 @@ def _dismiss_mention_picker() -> None:
 
 def _type_mention(name: str) -> None:
     """触发 @ 候选,确认唯一匹配后选中成员。"""
-    ok, err = _post_unicode_text("@")
+    # System Events 可稳定触发企微 CEF 的 @ 候选。Quartz 在服务宿主没有
+    # 输入监控权限时会静默丢弃,正是普通文本此前“假成功”的同一根因。
+    ok, err = _run_applescript(
+        'tell application "System Events" to tell process "企业微信" to keystroke "@"',
+        timeout=2,
+    )
     if not ok:
         raise LocalSendError(f"输入 @ 失败: {err}")
-    time.sleep(0.7)
+    time.sleep(0.25)
 
-    ok, err = _post_unicode_text(name)
+    ok, err = _insert_current_input(name)
     if not ok:
         raise LocalSendError(f"输入 @成员搜索词失败: {err}")
-    time.sleep(1.0)
+    time.sleep(0.35)
 
     candidates = _mention_candidates()
     if candidates != [name]:
@@ -789,7 +815,7 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
     cursor = 0
     try:
         for start, end, name in spans:
-            ok, err = _post_unicode_text(content[cursor:start])
+            ok, err = _insert_current_input(content[cursor:start])
             if not ok:
                 raise LocalSendError(f"输入消息失败: {err}")
             mention_started = time.perf_counter()
@@ -800,7 +826,7 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
                 time.perf_counter() - mention_started,
             )
             cursor = end
-        ok, err = _post_unicode_text(content[cursor:])
+        ok, err = _insert_current_input(content[cursor:])
         if not ok:
             raise LocalSendError(f"输入消息失败: {err}")
     except LocalSendError as e:

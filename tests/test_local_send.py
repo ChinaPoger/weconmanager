@@ -307,7 +307,7 @@ def test_rich_message_selects_mentions_before_sending(monkeypatch):
     calls = []
     monkeypatch.setattr(local_send, "_focus_chat_input", lambda: calls.append("focus") or (True, "ok"))
     monkeypatch.setattr(local_send, "_clear_current_input", lambda: calls.append("clear") or (True, "ok"))
-    monkeypatch.setattr(local_send, "_post_unicode_text", lambda text: calls.append(text) or (True, "ok"))
+    monkeypatch.setattr(local_send, "_insert_current_input", lambda text: calls.append(text) or (True, "ok"))
     monkeypatch.setattr(local_send, "_type_mention", lambda name: calls.append(("mention", name)))
     monkeypatch.setattr(local_send.time, "sleep", lambda delay: calls.append(("sleep", delay)))
     monkeypatch.setattr(
