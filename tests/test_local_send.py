@@ -116,8 +116,20 @@ def test_text_send_does_not_touch_the_clipboard(monkeypatch, script):
 
     assert local_send._send_by_scheme({"rid": 1}, "hi") == (True, "ok")
     assert script["focus_calls"] == 1
-    assert script["key_calls"] == [(0, 1 << 20), (51, 0)]
+    assert script["key_calls"] == [(0, 1 << 20)]
     assert script["unicode_calls"] == ["hi"]
+
+
+def test_select_current_input_uses_select_all(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        local_send,
+        "_post_key",
+        lambda keycode, flags=0: calls.append((keycode, flags)) or (True, "ok"),
+    )
+
+    assert local_send._select_current_input() == (True, "ok")
+    assert calls == [(0, 1 << 20)]
 
 
 def test_clear_current_input_uses_select_all_and_delete(monkeypatch):
@@ -134,6 +146,7 @@ def test_clear_current_input_uses_select_all_and_delete(monkeypatch):
 
 def test_focus_chat_input_uses_window_relative_quartz_click(monkeypatch):
     seen = {}
+    monkeypatch.setattr(local_send, "_chat_window_bounds", None)
     monkeypatch.setattr(
         local_send,
         "_run_applescript",
@@ -149,7 +162,28 @@ def test_focus_chat_input_uses_window_relative_quartz_click(monkeypatch):
     assert seen == {"x": 730.0, "y": 775.0}
 
 
+def test_focus_chat_input_reuses_cached_window_bounds(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        local_send, "_chat_window_bounds", (10.0, 20.0, 1000.0, 800.0)
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_run_applescript",
+        lambda *_args, **_kwargs: pytest.fail("缓存命中时不应再启动 AppleScript"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_post_mouse_click",
+        lambda x, y: seen.update(x=x, y=y) or (True, "ok"),
+    )
+
+    assert local_send._focus_chat_input() == (True, "ok")
+    assert seen == {"x": 730.0, "y": 775.0}
+
+
 def test_focus_chat_input_rejects_invalid_window_geometry(monkeypatch):
+    monkeypatch.setattr(local_send, "_chat_window_bounds", None)
     monkeypatch.setattr(
         local_send,
         "_run_applescript",
@@ -163,6 +197,7 @@ def test_focus_chat_input_rejects_invalid_window_geometry(monkeypatch):
 
 
 def test_focus_chat_input_rejects_too_small_window(monkeypatch):
+    monkeypatch.setattr(local_send, "_chat_window_bounds", None)
     monkeypatch.setattr(
         local_send,
         "_run_applescript",
@@ -178,6 +213,34 @@ def test_focus_chat_input_rejects_too_small_window(monkeypatch):
 
     assert ok is False
     assert error == "企业微信窗口尺寸异常: 300x200"
+
+
+def test_open_conversation_uses_short_settle_delay(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(
+        local_send.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Result", (), {"returncode": 0})(),
+    )
+    monkeypatch.setattr(local_send.time, "sleep", sleeps.append)
+
+    ok, _url = local_send._open_conversation_by_scheme({
+        "rid": 1, "type": 1, "fw_id": 0,
+    })
+
+    assert ok is True
+    assert sleeps == [0.25]
+
+
+def test_submit_current_input_has_no_default_settle_delay(monkeypatch):
+    monkeypatch.setattr(local_send, "_post_return_key", lambda: (True, "ok"))
+    monkeypatch.setattr(
+        local_send.time,
+        "sleep",
+        lambda _delay: pytest.fail("默认提交不应额外等待"),
+    )
+
+    assert local_send._submit_current_input() == (True, "ok")
 
 
 def test_mention_spans_are_inferred_and_ordered():
@@ -227,7 +290,7 @@ def test_rich_message_selects_mentions_before_sending(monkeypatch):
 def test_plain_text_uses_quartz_without_accessibility_or_clipboard(monkeypatch):
     calls = []
     monkeypatch.setattr(local_send, "_focus_chat_input", lambda: calls.append("focus") or (True, "ok"))
-    monkeypatch.setattr(local_send, "_clear_current_input", lambda: calls.append("clear") or (True, "ok"))
+    monkeypatch.setattr(local_send, "_select_current_input", lambda: calls.append("select") or (True, "ok"))
     monkeypatch.setattr(
         local_send,
         "_post_unicode_text",
@@ -250,4 +313,4 @@ def test_plain_text_uses_quartz_without_accessibility_or_clipboard(monkeypatch):
     )
 
     assert local_send._type_rich_message("test", None) == (True, "ok")
-    assert calls == ["focus", "clear", ("text", "test"), "submit"]
+    assert calls == ["focus", "select", ("text", "test"), "submit"]

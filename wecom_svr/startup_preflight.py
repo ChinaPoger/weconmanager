@@ -16,7 +16,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 
-from . import local_group, localdb, messages
+from . import local_group, local_send, localdb, messages
 from .localdb import LocalDataError
 from .settings import Settings, get_agent_home
 
@@ -146,6 +146,17 @@ def run(settings: Settings) -> PreflightResult:
             )
         else:
             ui_ready = True
+            bounds_ready, bounds_error = local_send._refresh_chat_window_bounds()
+            if bounds_ready:
+                try:
+                    local_send._load_quartz_libraries()
+                except OSError as e:
+                    log.warning("Quartz 运行时预热失败,本地发送首请求将重试: %s", e)
+            else:
+                log.warning(
+                    "企业微信聊天窗口位置预热失败,本地发送首请求将重试: %s",
+                    bounds_error,
+                )
 
     result = PreflightResult(
         database_ready=True,

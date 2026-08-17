@@ -150,6 +150,7 @@ class LocalSendResponse(BaseModel):
     conv_type: int | None = None
     conv_fw_id: int | None = None
     open_method: str | None = None
+    elapsed_ms: int | None = None
 
 
 class HealthResponse(BaseModel):

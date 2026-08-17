@@ -32,6 +32,9 @@ from .uilock import ui_session
 
 log = logging.getLogger(__name__)
 
+_quartz_libraries = None
+_chat_window_bounds: tuple[float, float, float, float] | None = None
+
 
 class _CGPoint(ctypes.Structure):
     _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
@@ -290,25 +293,44 @@ def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str
     return True, image_path
 
 
+def _load_quartz_libraries():
+    """加载并配置 Quartz 动态库;同一服务进程内只做一次。"""
+    global _quartz_libraries
+    if _quartz_libraries is not None:
+        return _quartz_libraries
+
+    cg = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+    )
+    cf = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    cg.CGEventCreateKeyboardEvent.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool,
+    ]
+    cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+    cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    cg.CGEventSetFlags.restype = None
+    cg.CGEventKeyboardSetUnicodeString.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_uint16),
+    ]
+    cg.CGEventKeyboardSetUnicodeString.restype = None
+    cg.CGEventCreateMouseEvent.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, _CGPoint, ctypes.c_uint32,
+    ]
+    cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+    cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    cg.CGEventPost.restype = None
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFRelease.restype = None
+    _quartz_libraries = cg, cf
+    return _quartz_libraries
+
+
 def _post_key(keycode: int, flags: int = 0) -> tuple[bool, str]:
     """通过 Quartz HID 事件投递一个按键。"""
     try:
-        cg = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
-        )
-        cf = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-        )
-        cg.CGEventCreateKeyboardEvent.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool,
-        ]
-        cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
-        cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
-        cg.CGEventSetFlags.restype = None
-        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-        cg.CGEventPost.restype = None
-        cf.CFRelease.argtypes = [ctypes.c_void_p]
-        cf.CFRelease.restype = None
+        cg, cf = _load_quartz_libraries()
 
         down = cg.CGEventCreateKeyboardEvent(None, keycode, True)
         up = cg.CGEventCreateKeyboardEvent(None, keycode, False)
@@ -341,20 +363,7 @@ def _post_return_key() -> tuple[bool, str]:
 def _post_mouse_click(x: float, y: float) -> tuple[bool, str]:
     """通过 Quartz 点击屏幕坐标,避免 System Events 在企微 CEF 上阻塞。"""
     try:
-        cg = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
-        )
-        cf = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-        )
-        cg.CGEventCreateMouseEvent.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint32, _CGPoint, ctypes.c_uint32,
-        ]
-        cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
-        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-        cg.CGEventPost.restype = None
-        cf.CFRelease.argtypes = [ctypes.c_void_p]
-        cf.CFRelease.restype = None
+        cg, cf = _load_quartz_libraries()
 
         point = _CGPoint(float(x), float(y))
         down = cg.CGEventCreateMouseEvent(None, 1, point, 0)  # kCGEventLeftMouseDown
@@ -377,8 +386,9 @@ def _post_mouse_click(x: float, y: float) -> tuple[bool, str]:
     return True, "ok"
 
 
-def _focus_chat_input() -> tuple[bool, str]:
-    """置前企微窗口并用窗口相对坐标点击聊天输入区。"""
+def _refresh_chat_window_bounds() -> tuple[bool, str]:
+    """读取并缓存企微聊天窗口位置,供后续发送直接复用。"""
+    global _chat_window_bounds
     script = r'''
     tell application "System Events"
         if not (exists process "企业微信") then error "企业微信进程不存在"
@@ -408,22 +418,41 @@ def _focus_chat_input() -> tuple[bool, str]:
         return False, f"无法解析企业微信窗口位置: {out!r}"
     if width < 400 or height < 300:
         return False, f"企业微信窗口尺寸异常: {width:g}x{height:g}"
+    _chat_window_bounds = win_x, win_y, width, height
+    return True, "ok"
+
+
+def _focus_chat_input() -> tuple[bool, str]:
+    """置前企微窗口并用缓存的窗口相对坐标点击聊天输入区。"""
+    if _chat_window_bounds is None:
+        ok, err = _refresh_chat_window_bounds()
+        if not ok:
+            return False, err
+    assert _chat_window_bounds is not None
+    win_x, win_y, width, height = _chat_window_bounds
 
     # 输入区位于主窗口右下方。按窗口比例取点可适配缩放/移动后的窗口,
     # y 距底部 45px 落在多行编辑区中部,避开发送按钮和工具栏。
     ok, err = _post_mouse_click(win_x + width * 0.72, win_y + height - 45)
     if ok:
-        time.sleep(0.12)
+        time.sleep(0.06)
+    return ok, err
+
+
+def _select_current_input() -> tuple[bool, str]:
+    """选中输入框现有内容;后续文本输入会直接替换它。"""
+    command_flag = 1 << 20  # kCGEventFlagMaskCommand
+    ok, err = _post_key(0, command_flag)  # Cmd+A
+    if ok:
+        time.sleep(0.03)
     return ok, err
 
 
 def _clear_current_input() -> tuple[bool, str]:
     """用原生按键清空输入框,避开企微 CEF 上很慢的 AXValue 查询。"""
-    command_flag = 1 << 20  # kCGEventFlagMaskCommand
-    ok, err = _post_key(0, command_flag)  # Cmd+A
+    ok, err = _select_current_input()
     if not ok:
         return False, err
-    time.sleep(0.04)
     ok, err = _post_key(51)  # Delete
     if ok:
         time.sleep(0.08)
@@ -440,24 +469,7 @@ def _post_unicode_text(text: str) -> tuple[bool, str]:
     if not text:
         return True, "ok"
     try:
-        cg = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
-        )
-        cf = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-        )
-        cg.CGEventCreateKeyboardEvent.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool,
-        ]
-        cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
-        cg.CGEventKeyboardSetUnicodeString.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_uint16),
-        ]
-        cg.CGEventKeyboardSetUnicodeString.restype = None
-        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-        cg.CGEventPost.restype = None
-        cf.CFRelease.argtypes = [ctypes.c_void_p]
-        cf.CFRelease.restype = None
+        cg, cf = _load_quartz_libraries()
 
         units = text.encode("utf-16-le")
         chars = (ctypes.c_uint16 * (len(units) // 2)).from_buffer_copy(units)
@@ -591,19 +603,34 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
     """逐段输入正文,把声明的 @姓名转换为企微内部提及对象。"""
     started = time.perf_counter()
     spans = _mention_spans(content, mentions)
+    focus_started = time.perf_counter()
     ok, err = _focus_chat_input()
+    focus_elapsed = time.perf_counter() - focus_started
     if not ok:
         return False, f"聚焦聊天输入框失败: {err}"
     if not spans:
-        ok, err = _clear_current_input()
+        clear_started = time.perf_counter()
+        ok, err = _select_current_input()
+        clear_elapsed = time.perf_counter() - clear_started
         if not ok:
             return False, f"输入消息失败: {err}"
+        input_started = time.perf_counter()
         ok, err = _post_unicode_text(content)
+        input_elapsed = time.perf_counter() - input_started
         if not ok:
             return False, f"输入消息失败: {err}"
-        time.sleep(0.1)
+        submit_started = time.perf_counter()
         result = _submit_current_input()
-        log.info("本地文本发送完成: elapsed=%.3fs", time.perf_counter() - started)
+        submit_elapsed = time.perf_counter() - submit_started
+        log.info(
+            "本地文本发送完成: elapsed=%.3fs focus=%.3fs clear=%.3fs "
+            "input=%.3fs submit=%.3fs",
+            time.perf_counter() - started,
+            focus_elapsed,
+            clear_elapsed,
+            input_elapsed,
+            submit_elapsed,
+        )
         return result
 
     ok, err = _clear_current_input()
@@ -632,7 +659,6 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
         _clear_current_input()
         return False, str(e)
 
-    time.sleep(0.1)
     result = _submit_current_input()
     log.info(
         "本地 @ 消息发送完成: mentions=%d elapsed=%.3fs",
@@ -642,12 +668,14 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
     return result
 
 
-def _submit_current_input(settle_delay: float = 0.4) -> tuple[bool, str]:
+def _submit_current_input(settle_delay: float = 0.0) -> tuple[bool, str]:
     """提交已组装好的输入内容,不读取或粘贴剪贴板。"""
     ok, err = _post_return_key()
     if not ok:
         return False, f"发送失败: {err}"
-    time.sleep(max(0.0, min(float(settle_delay), 3.0)))
+    delay = max(0.0, min(float(settle_delay), 3.0))
+    if delay:
+        time.sleep(delay)
     return True, "ok"
 
 
@@ -729,7 +757,7 @@ def _conversation_jump_url(conv: dict, msgid: int = 0) -> str:
     return f"wxwork://jump?{query}"
 
 
-def _open_conversation_by_scheme(conv: dict, wait: float = 1.2) -> tuple[bool, str]:
+def _open_conversation_by_scheme(conv: dict, wait: float = 0.25) -> tuple[bool, str]:
     """使用客户端 URL Scheme 按 RID/type/fw_id 精准打开会话。"""
     try:
         url = _conversation_jump_url(conv)
@@ -747,7 +775,9 @@ def _open_conversation_by_scheme(conv: dict, wait: float = 1.2) -> tuple[bool, s
         err = (r.stderr or r.stdout).strip()
         return False, err or f"打开会话失败: {url}"
 
-    time.sleep(wait)
+    delay = max(0.0, min(float(wait), 3.0))
+    if delay:
+        time.sleep(delay)
     return True, url
 
 
@@ -920,6 +950,7 @@ def send_message(
     Returns:
         {"success": bool, "conv_name": str, "conv_rid": int, "error": ...}
     """
+    started = time.perf_counter()
     ensure_macos()
     if not content.strip():
         return {"success": False, "error": "消息内容为空"}
@@ -970,6 +1001,7 @@ def send_message(
         "conv_fw_id": conv.get("fw_id", 0),
         "open_method": open_method,
         "skipped_users": skip,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000),
         "error": msg if not ok else None,
     }
 
