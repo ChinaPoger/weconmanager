@@ -226,8 +226,8 @@ def _run_applescript(script: str, timeout: int = 15) -> tuple[bool, str]:
 def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str]:
     """把图片写入系统剪贴板并粘贴到当前聊天框。
 
-    图片无法通过 AXValue 写入，因此仍需临时使用 NSPasteboard。发送后不恢复旧
-    剪贴板：这样步骤更少，也避免恢复动作覆盖用户在发送期间刚复制的新内容。
+    图片无法通过 AXValue 写入,因此仍需临时使用 NSPasteboard。发送后不恢复旧
+    剪贴板:这样步骤更少,也避免恢复动作覆盖用户在发送期间刚复制的新内容。
     """
     try:
         image_path = _normalize_file_path(path)
@@ -284,9 +284,9 @@ def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str
 def _post_return_key() -> tuple[bool, str]:
     """通过 Quartz HID 事件提交聊天输入框。
 
-    企业微信 5.0.x 的原生输入框会吞掉 System Events 的 ``keystroke return``，
+    企业微信 5.0.x 的原生输入框会吞掉 System Events 的 ``keystroke return``,
     表现为 API 返回成功但文字仍留在输入框。直接调用 CoreGraphics 投递硬件层
-    Return（keycode 36），既能触发真实发送，也避免每次启动 Swift 编译器。
+    Return(keycode 36),既能触发真实发送,也避免每次启动 Swift 编译器。
     """
     try:
         cg = ctypes.CDLL(
@@ -375,8 +375,8 @@ def _paste_and_send_current(
     if not ok:
         return False, f"粘贴/发送失败: {err}"
 
-    # AXValue 写入后，企微 5.0.x 会吞掉 System Events 的 keystroke return。
-    # 使用 Quartz CGEvent 在 HID 层投递 Return，才能触发输入框的真实发送动作。
+    # AXValue 写入后,企微 5.0.x 会吞掉 System Events 的 keystroke return。
+    # 使用 Quartz CGEvent 在 HID 层投递 Return,才能触发输入框的真实发送动作。
     ok, err = _post_return_key()
     if not ok:
         return False, f"粘贴/发送失败: {err}"
