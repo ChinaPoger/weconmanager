@@ -10,6 +10,7 @@
   - 无 RID 时退回搜索框匹配,并用 ↓ 键跳过同名用户/机器人
   - 每次发送前从数据库读最新名称,不受群名变更影响
 """
+import ctypes
 import os
 import sqlite3
 import subprocess
@@ -222,14 +223,19 @@ def _run_applescript(script: str, timeout: int = 15) -> tuple[bool, str]:
     return True, out
 
 
-def _set_clipboard_image(path: str) -> tuple[bool, str]:
-    """把图片内容写入系统剪贴板,而不是写入文本路径。"""
+def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str]:
+    """把图片写入系统剪贴板并粘贴到当前聊天框。
+
+    图片无法通过 AXValue 写入,因此仍需临时使用 NSPasteboard。发送后不恢复旧
+    剪贴板:这样步骤更少,也避免恢复动作覆盖用户在发送期间刚复制的新内容。
+    """
     try:
         image_path = _normalize_file_path(path)
     except (OSError, ValueError) as e:
         return False, str(e)
+    delay = max(0.4, min(float(paste_delay), 3.0))
 
-    script = '''
+    script = f'''
     use framework "AppKit"
     use scripting additions
 
@@ -237,25 +243,83 @@ def _set_clipboard_image(path: str) -> tuple[bool, str]:
         set imagePath to item 1 of argv
         set imageObj to current application's NSImage's alloc()'s initWithContentsOfFile:imagePath
         if imageObj is missing value then error "无法读取图片: " & imagePath
+
         set pb to current application's NSPasteboard's generalPasteboard()
         pb's clearContents()
-        set ok to pb's writeObjects:{imageObj}
+        set ok to pb's writeObjects:{{imageObj}}
         if (ok as boolean) is false then error "写入图片剪贴板失败"
+
+        tell application "System Events"
+            if not (exists process "企业微信") then error "企业微信进程不存在"
+            tell process "企业微信"
+                if (count of windows) is 0 then error "找不到企业微信窗口"
+                set frontmost to true
+                delay 0.3
+                set inputBefore to value of attribute "AXFocusedUIElement"
+                if inputBefore is missing value then error "企业微信没有获得输入焦点"
+                set roleBefore to role of inputBefore
+                if roleBefore is not "AXTextArea" and roleBefore is not "AXTextField" then
+                    error "当前焦点不是聊天输入框: " & roleBefore
+                end if
+                keystroke "v" using command down
+            end tell
+        end tell
+        delay {delay * 2:.2f}
     end run
     '''
     try:
-        r = subprocess.run(
+        result = subprocess.run(
             ["osascript", "-l", "AppleScript", "-s", "o", "-", image_path],
-            input=script, capture_output=True, text=True, timeout=10,
+            input=script, capture_output=True, text=True, timeout=15,
         )
     except subprocess.TimeoutExpired:
-        return False, "写入图片剪贴板超时"
+        return False, "粘贴图片超时"
     except FileNotFoundError:
         return False, "osascript 不可用(非 macOS?)"
-
-    if r.returncode != 0:
-        return False, (r.stderr or r.stdout).strip() or "写入图片剪贴板失败"
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout).strip() or "粘贴图片失败"
     return True, image_path
+
+
+def _post_return_key() -> tuple[bool, str]:
+    """通过 Quartz HID 事件提交聊天输入框。
+
+    企业微信 5.0.x 的原生输入框会吞掉 System Events 的 ``keystroke return``,
+    表现为 API 返回成功但文字仍留在输入框。直接调用 CoreGraphics 投递硬件层
+    Return(keycode 36),既能触发真实发送,也避免每次启动 Swift 编译器。
+    """
+    try:
+        cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        cf = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        cg.CGEventCreateKeyboardEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool,
+        ]
+        cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        down = cg.CGEventCreateKeyboardEvent(None, 36, True)
+        up = cg.CGEventCreateKeyboardEvent(None, 36, False)
+        if not down or not up:
+            if down:
+                cf.CFRelease(down)
+            if up:
+                cf.CFRelease(up)
+            return False, "无法创建 Quartz Return 事件"
+        try:
+            cg.CGEventPost(0, down)  # kCGHIDEventTap
+            time.sleep(0.08)
+            cg.CGEventPost(0, up)
+        finally:
+            cf.CFRelease(down)
+            cf.CFRelease(up)
+    except OSError as e:
+        return False, f"加载 Quartz 失败: {e}"
+    return True, "ok"
 
 
 def _paste_and_send_current(
@@ -311,17 +375,12 @@ def _paste_and_send_current(
     if not ok:
         return False, f"粘贴/发送失败: {err}"
 
-    # AXValue 写入和按键放在同一个 process tell 块时,企业微信可能在内容变化后
-    # 卡住 AX 查询,导致脚本走不到提交键。独立的全局按键事件能立即投递给前台企微。
-    script_submit = '''
-    tell application "System Events"
-        keystroke return
-        delay 0.4
-    end tell
-    '''
-    ok, err = _run_applescript(script_submit, timeout=3)
+    # AXValue 写入后,企微 5.0.x 会吞掉 System Events 的 keystroke return。
+    # 使用 Quartz CGEvent 在 HID 层投递 Return,才能触发输入框的真实发送动作。
+    ok, err = _post_return_key()
     if not ok:
         return False, f"粘贴/发送失败: {err}"
+    time.sleep(0.4)
     return True, "ok"
 
 
@@ -435,29 +494,14 @@ def _send_by_scheme(conv: dict, content: str) -> tuple[bool, str]:
 
 def _send_image_by_scheme(conv: dict, image_path: str) -> tuple[bool, str]:
     """按数据库会话 ID 打开目标会话后发送图片。"""
-    old_clipboard = ""
-    try:
-        old_clipboard = _get_clipboard()
-    except Exception:
-        pass
+    ok, msg = _open_conversation_by_scheme(conv)
+    if not ok:
+        return False, f"打开对话失败: {msg}"
 
-    try:
-        ok, msg = _open_conversation_by_scheme(conv)
-        if not ok:
-            return False, f"打开对话失败: {msg}"
-
-        ok, msg = _set_clipboard_image(image_path)
-        if not ok:
-            return False, msg
-
-        return _paste_and_send_current(paste_delay=0.8)
-
-    finally:
-        if old_clipboard:
-            try:
-                _set_clipboard(old_clipboard)
-            except Exception:
-                pass
+    ok, msg = _paste_image_current(image_path, paste_delay=0.8)
+    if not ok:
+        return False, msg
+    return _post_return_key()
 
 
 def _send_one(contact_name: str, content: str, skip_results: int = 0) -> tuple[bool, str]:
