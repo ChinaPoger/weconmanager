@@ -38,7 +38,9 @@ def _result_response(result: dict) -> JSONResponse:
     response_model=LocalSendResponse,
 )
 def send_local_message(req: LocalSendRequest, _: None = Depends(require_token)):
-    result = local_send.send_message(to=req.to, content=req.content, conv_rid=req.conv_rid)
+    result = local_send.send_message(
+        to=req.to, content=req.content, conv_rid=req.conv_rid, mentions=req.mentions
+    )
     return _result_response(result)
 
 

@@ -126,8 +126,19 @@ async def _send_app_message(req: SendMessageRequest) -> dict:
 
 
 async def _send_local_message(req: LocalSendRequest) -> dict:
+    if req.mentions is None:
+        return await asyncio.to_thread(
+            local_send.send_message,
+            to=req.to,
+            content=req.content,
+            conv_rid=req.conv_rid,
+        )
     return await asyncio.to_thread(
-        local_send.send_message, to=req.to, content=req.content, conv_rid=req.conv_rid
+        local_send.send_message,
+        to=req.to,
+        content=req.content,
+        conv_rid=req.conv_rid,
+        mentions=req.mentions,
     )
 
 

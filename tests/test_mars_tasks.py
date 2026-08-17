@@ -122,8 +122,10 @@ def local(monkeypatch):
     """本地客户端打桩。"""
     calls = []
 
-    def fake(to="", content="", conv_rid=None):
-        calls.append({"to": to, "content": content, "conv_rid": conv_rid})
+    def fake(to="", content="", conv_rid=None, **kwargs):
+        call = {"to": to, "content": content, "conv_rid": conv_rid}
+        call.update(kwargs)
+        calls.append(call)
         return {"success": True, "conv_name": to or str(conv_rid)}
 
     monkeypatch.setattr(mars_tasks.local_send, "send_message", fake)
@@ -197,6 +199,18 @@ def test_whitelisted_local_send_runs(settings, mars, local):
 
     assert local == [{"to": "张三", "content": "hi", "conv_rid": None}]
     assert mars.last_ack["ok"] is True
+
+
+def test_whitelisted_local_send_passes_mentions(settings, mars, local):
+    settings = settings.model_copy(update={"mars_tasks_actions": "message.send"})
+    mars.give(1, "message.send", {
+        "to": "张三", "content": "@abz", "mentions": ["abz"],
+    })
+    run(mars_tasks.run_once(settings, wait=0))
+
+    assert local == [{
+        "to": "张三", "content": "@abz", "conv_rid": None, "mentions": ["abz"],
+    }]
 
 
 def test_star_allows_every_known_action(settings):

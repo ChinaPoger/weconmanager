@@ -419,6 +419,99 @@ def _short_text(content) -> str:
     return ""
 
 
+def _pb_varints(buf: bytes) -> dict[int, list[int]]:
+    """扫 protobuf 顶层 varint 字段;用途与 `_pb_fields` 相同。"""
+    out: dict[int, list[int]] = {}
+    i, n = 0, len(buf)
+    while i < n:
+        key = shift = 0
+        while i < n:
+            b = buf[i]
+            key |= (b & 0x7F) << shift
+            i += 1
+            shift += 7
+            if not b & 0x80:
+                break
+            if shift > 63:
+                return out
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            value = shift = 0
+            while i < n:
+                b = buf[i]
+                value |= (b & 0x7F) << shift
+                i += 1
+                shift += 7
+                if not b & 0x80:
+                    break
+                if shift > 63:
+                    return out
+            out.setdefault(field, []).append(value)
+        elif wire == 2:
+            ln = shift = 0
+            while i < n:
+                b = buf[i]
+                ln |= (b & 0x7F) << shift
+                i += 1
+                shift += 7
+                if not b & 0x80:
+                    break
+            i += ln
+        elif wire == 5:
+            i += 4
+        elif wire == 1:
+            i += 8
+        else:
+            return out
+    return out
+
+
+def _text_with_mentions(content) -> str:
+    """按企微文本片段顺序还原 @ 提及;不匹配已知结构则返回空串。
+
+    实测文本顶层 field 1 是有序片段:kind=0 的 body.field1 是用户文字,
+    kind=5 的 body.field2 是被提及者显示名。上游递归抽字符串会把后者当普通
+    文本,并用换行拼片段,于是 `@名字 正文` 变成 `名字\n正文`。
+    """
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+    if not isinstance(content, bytes):
+        return ""
+
+    rendered: list[str] = []
+    has_mention = False
+    for part in _pb_fields(content).get(1, []):
+        kinds = _pb_varints(part).get(1)
+        bodies = _pb_fields(part).get(2)
+        if not kinds or not bodies:
+            return ""
+        kind, body = kinds[0], bodies[0]
+        if kind == 0:
+            payloads = _pb_fields(body).get(1)
+            if not payloads:
+                return ""
+            try:
+                rendered.append(payloads[0].decode("utf-8"))
+            except UnicodeDecodeError:
+                return ""
+        elif kind == 5:
+            names = _pb_fields(body).get(2)
+            if not names:
+                return ""
+            try:
+                name = names[0].decode("utf-8")
+            except UnicodeDecodeError:
+                return ""
+            rendered.append(name if name.startswith("@") else f"@{name}")
+            has_mention = True
+        else:
+            text = _vendor().export.render(0, part) or ""
+            if not text or text == "[文本]":
+                return ""
+            rendered.append(text)
+    return "".join(rendered) if has_mention else ""
+
+
 def _render(content_type: int, content, label: str) -> str:
     """正文 —— 被修正过类型的走我们的占位符,其余交给上游。
 
@@ -434,6 +527,8 @@ def _render(content_type: int, content, label: str) -> str:
         return IMAGE_PLACEHOLDER
     if rich := _rich_image_text(content_type, content):
         return rich
+    if label == "文本" and (mentioned := _text_with_mentions(content)):
+        return mentioned
     rendered = _vendor().export.render(content_type, content) or ""
     if label == "文本" and (not rendered or rendered == "[文本]"):
         return _short_text(content) or rendered

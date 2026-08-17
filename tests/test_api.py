@@ -101,14 +101,22 @@ def test_local_send_failure_is_400_with_body(client, monkeypatch):
 
 
 def test_local_send_success(client, monkeypatch):
+    seen = {}
+
+    def fake_send(**kw):
+        seen.update(kw)
+        return {"success": True, "conv_name": "测试群", "conv_rid": kw["conv_rid"],
+                "open_method": "url_scheme", "error": None}
+
     monkeypatch.setattr(
-        local_send, "send_message",
-        lambda **kw: {"success": True, "conv_name": "测试群", "conv_rid": kw["conv_rid"],
-                      "open_method": "url_scheme", "error": None},
+        local_send, "send_message", fake_send,
     )
-    r = client.post("/api/v1/message/send", json={"conv_rid": 123, "content": "hi"})
+    r = client.post("/api/v1/message/send", json={
+        "conv_rid": 123, "content": "@abz", "mentions": ["abz"],
+    })
     assert r.status_code == 200
     assert r.json()["conv_name"] == "测试群"
+    assert seen["mentions"] == ["abz"]
 
 
 def test_local_data_error_maps_to_503(client, monkeypatch):

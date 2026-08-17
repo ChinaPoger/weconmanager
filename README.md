@@ -126,6 +126,11 @@ curl -X POST http://127.0.0.1:8090/api/v1/message/send \
   -H 'Content-Type: application/json' \
   -d '{"conv_rid":3395103030,"content":"你好,我是本人"}'
 
+# 以本人身份发送真实 @ 提醒
+curl -X POST http://127.0.0.1:8090/api/v1/message/send \
+  -H 'Content-Type: application/json' \
+  -d '{"conv_rid":3395103030,"content":"请 @abz 和 @任威风 看一下","mentions":["abz","任威风"]}'
+
 # 查本地会话拿 RID
 curl -X POST http://127.0.0.1:8090/api/v1/conversations \
   -H 'Content-Type: application/json' -d '{"keyword":"notify"}'
@@ -143,11 +148,17 @@ curl -X POST http://127.0.0.1:8090/api/v1/app/contact/search \
 curl ... -H 'Authorization: Bearer <token>'
 ```
 
+`mentions` 中的每个姓名必须在 `content` 里以 `@姓名` 出现。服务会操作客户端的
+@ 选择器，把它转换为真正的提及消息；只在正文里粘贴普通 `@姓名` 不能保证产生
+@ 提醒。`mentions` 可省略，此时服务会自动识别正文里的常见 `@英文/数字/中文姓名`，
+但生产调用建议显式传入，避免姓名边界识别不符合预期。找不到对应成员或候选不明确时，
+接口返回 HTTP 400，并且不会发送消息。
+
 完整端点:
 
 - `GET  /health` —— 健康检查(公开,含 agent home 解析状态)
 - `POST /api/v1/app/message/send` —— 应用身份发消息,`msgtype`: `text` / `markdown` / `news`
-- `POST /api/v1/message/send` —— 本人身份发消息(`to` 或 `conv_rid`)
+- `POST /api/v1/message/send` —— 本人身份发消息(`to` 或 `conv_rid`),真实 @ 用 `mentions`
 - `POST /api/v1/image/send` —— 本人身份发图片(需 `conv_rid`)
 - `POST /api/v1/conversations` —— 查本地会话(body 可省略)
 - `POST /api/v1/conversation/open` —— 只打开会话不发送

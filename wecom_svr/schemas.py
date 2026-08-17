@@ -43,6 +43,13 @@ class LocalSendRequest(BaseModel):
     to: str = Field("", description="会话/群名称(模糊搜索),与 conv_rid 二选一")
     conv_rid: int | None = Field(None, description="会话 RID(数据库 ID),精准定位")
     content: str = Field(..., min_length=1)
+    mentions: list[str] | None = Field(
+        None,
+        description=(
+            "要转换为真实提及的姓名。正文中须出现对应的 @姓名;留空时服务会从"
+            "正文中自动识别 @英文/数字/中文姓名"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_target(self):

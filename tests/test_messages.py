@@ -116,6 +116,44 @@ def test_short_text_fallback_ignores_unrelated_one_character_fields(monkeypatch)
     assert messages._render(2, _pb(9, b"1"), "文本") == "[文本]"
 
 
+def _mention(name: str, rid: int = 1688851653323565) -> bytes:
+    return _pb(1, b"\x08\x05" + _pb(2, b"\x08" + _varint(rid) + _pb(2, name.encode())))
+
+
+def _text_part(text: str) -> bytes:
+    return _pb(1, b"\x08\x00" + _pb(2, _pb(1, text.encode())))
+
+
+def _varint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+def test_at_mention_keeps_symbol_and_inline_text():
+    """真实问题载荷:上游会渲染成 `SMB咨询顾问\n有人吗`。"""
+    content = bytes.fromhex(
+        "0A1E0805121A08ADB6BEA699808003120F534D42E592A8E8AFA2E9A1BEE997AE"
+        "0A100800120C0A0A20E69C89E4BABAE59097"
+    )
+
+    assert messages._render(0, content, "文本") == "@SMB咨询顾问 有人吗"
+
+
+def test_at_only_message_keeps_symbol():
+    assert messages._render(0, _mention("SMB咨询顾问"), "文本") == "@SMB咨询顾问"
+
+
+def test_multiple_at_mentions_preserve_segment_order_and_spaces():
+    content = _text_part("请 ") + _mention("张三") + _text_part(" 和 ") + _mention("李四")
+
+    assert messages._render(0, content, "文本") == "请 @张三 和 @李四"
+
+
 def test_type_123_image_with_caption_keeps_both_parts():
     """企微把图片加随图文字也标成卡片;不能只留下图片文件名。"""
     content = _pb(1, b"WeChatWorkScreenshot_deadbeef.png") + _pb(1, b"aaaa")
