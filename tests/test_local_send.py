@@ -6,7 +6,14 @@ from wecom_svr import local_send
 @pytest.fixture
 def script(monkeypatch):
     """截住 osascript 和 Quartz Return,记录生成的脚本。"""
-    seen = {"scripts": [], "timeouts": [], "return_calls": 0}
+    seen = {
+        "scripts": [],
+        "timeouts": [],
+        "return_calls": 0,
+        "key_calls": [],
+        "unicode_calls": [],
+        "focus_calls": 0,
+    }
 
     def fake(script, timeout=15):
         seen["scripts"].append(script)
@@ -19,8 +26,23 @@ def script(monkeypatch):
         seen["return_calls"] += 1
         return True, "ok"
 
+    def fake_key(keycode, flags=0):
+        seen["key_calls"].append((keycode, flags))
+        return True, "ok"
+
+    def fake_unicode(text):
+        seen["unicode_calls"].append(text)
+        return True, "ok"
+
+    def fake_focus():
+        seen["focus_calls"] += 1
+        return True, "ok"
+
     monkeypatch.setattr(local_send, "_run_applescript", fake)
     monkeypatch.setattr(local_send, "_post_return_key", fake_return)
+    monkeypatch.setattr(local_send, "_post_key", fake_key)
+    monkeypatch.setattr(local_send, "_post_unicode_text", fake_unicode)
+    monkeypatch.setattr(local_send, "_focus_chat_input", fake_focus)
     return seen
 
 
@@ -79,7 +101,7 @@ def test_paste_and_send_surfaces_accessibility_failure(monkeypatch):
 
 
 def test_text_send_does_not_touch_the_clipboard(monkeypatch, script):
-    """AX 直接写入,不该再借剪贴板中转 —— 借了就会把用户剪贴板洗掉。"""
+    """Quartz 直接输入,不该再借剪贴板中转。"""
     monkeypatch.setattr(local_send, "_open_conversation_by_scheme", lambda conv: (True, "ok"))
     monkeypatch.setattr(
         local_send,
@@ -93,6 +115,69 @@ def test_text_send_does_not_touch_the_clipboard(monkeypatch, script):
     )
 
     assert local_send._send_by_scheme({"rid": 1}, "hi") == (True, "ok")
+    assert script["focus_calls"] == 1
+    assert script["key_calls"] == [(0, 1 << 20), (51, 0)]
+    assert script["unicode_calls"] == ["hi"]
+
+
+def test_clear_current_input_uses_select_all_and_delete(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        local_send,
+        "_post_key",
+        lambda keycode, flags=0: calls.append((keycode, flags)) or (True, "ok"),
+    )
+
+    assert local_send._clear_current_input() == (True, "ok")
+    assert calls == [(0, 1 << 20), (51, 0)]
+
+
+def test_focus_chat_input_uses_window_relative_quartz_click(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        local_send,
+        "_run_applescript",
+        lambda script, timeout=15: (True, "10,20,1000,800"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_post_mouse_click",
+        lambda x, y: seen.update(x=x, y=y) or (True, "ok"),
+    )
+
+    assert local_send._focus_chat_input() == (True, "ok")
+    assert seen == {"x": 730.0, "y": 775.0}
+
+
+def test_focus_chat_input_rejects_invalid_window_geometry(monkeypatch):
+    monkeypatch.setattr(
+        local_send,
+        "_run_applescript",
+        lambda script, timeout=15: (True, "not-window-bounds"),
+    )
+
+    ok, error = local_send._focus_chat_input()
+
+    assert ok is False
+    assert "无法解析企业微信窗口位置" in error
+
+
+def test_focus_chat_input_rejects_too_small_window(monkeypatch):
+    monkeypatch.setattr(
+        local_send,
+        "_run_applescript",
+        lambda script, timeout=15: (True, "10,20,300,200"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_post_mouse_click",
+        lambda *_args: pytest.fail("窗口尺寸异常时不应点击"),
+    )
+
+    ok, error = local_send._focus_chat_input()
+
+    assert ok is False
+    assert error == "企业微信窗口尺寸异常: 300x200"
 
 
 def test_mention_spans_are_inferred_and_ordered():
@@ -117,15 +202,52 @@ def test_mention_spans_reject_invalid_declarations(content, mentions, message):
 
 def test_rich_message_selects_mentions_before_sending(monkeypatch):
     calls = []
-    monkeypatch.setattr(local_send, "_clear_chat_input", lambda: (True, "ok"))
+    monkeypatch.setattr(local_send, "_focus_chat_input", lambda: calls.append("focus") or (True, "ok"))
+    monkeypatch.setattr(local_send, "_clear_current_input", lambda: calls.append("clear") or (True, "ok"))
     monkeypatch.setattr(local_send, "_post_unicode_text", lambda text: calls.append(text) or (True, "ok"))
-    monkeypatch.setattr(local_send, "_type_mention", lambda name, selected: calls.append((name, selected)))
-    monkeypatch.setattr(local_send, "_mention_input_value", lambda: "\ufffc\ufffc")
+    monkeypatch.setattr(local_send, "_type_mention", lambda name: calls.append(("mention", name)))
+    monkeypatch.setattr(
+        local_send,
+        "_submit_current_input",
+        lambda: calls.append("submit") or (True, "ok"),
+    )
     monkeypatch.setattr(
         local_send,
         "_paste_and_send_current",
-        lambda **kwargs: calls.append(kwargs) or (True, "ok"),
+        lambda **kwargs: pytest.fail("富文本 @ 消息不应触发剪贴板粘贴"),
     )
 
     assert local_send._type_rich_message("请 @abz 和 @任威风 测试", None) == (True, "ok")
-    assert calls == ["请 ", ("abz", 0), " 和 ", ("任威风", 1), " 测试", {}]
+    assert calls == [
+        "focus", "clear", "请 ", ("mention", "abz"), " 和 ",
+        ("mention", "任威风"), " 测试", "submit",
+    ]
+
+
+def test_plain_text_uses_quartz_without_accessibility_or_clipboard(monkeypatch):
+    calls = []
+    monkeypatch.setattr(local_send, "_focus_chat_input", lambda: calls.append("focus") or (True, "ok"))
+    monkeypatch.setattr(local_send, "_clear_current_input", lambda: calls.append("clear") or (True, "ok"))
+    monkeypatch.setattr(
+        local_send,
+        "_post_unicode_text",
+        lambda text: calls.append(("text", text)) or (True, "ok"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_submit_current_input",
+        lambda: calls.append("submit") or (True, "ok"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_run_applescript",
+        lambda *_args, **_kwargs: pytest.fail("普通文本不应读取辅助功能输入框"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_paste_and_send_current",
+        lambda **kwargs: pytest.fail("普通文本不应触发剪贴板粘贴"),
+    )
+
+    assert local_send._type_rich_message("test", None) == (True, "ok")
+    assert calls == ["focus", "clear", ("text", "test"), "submit"]
