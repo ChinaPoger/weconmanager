@@ -11,6 +11,7 @@
   - 每次发送前从数据库读最新名称,不受群名变更影响
 """
 import ctypes
+import logging
 import os
 import re
 import sqlite3
@@ -28,6 +29,12 @@ from .localdb import LocalDataError as LocalDataError
 from .localdb import LocalSendError as LocalSendError
 from .localdb import connect
 from .uilock import ui_session
+
+log = logging.getLogger(__name__)
+
+
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
 
 
 def ensure_macos() -> None:
@@ -283,13 +290,8 @@ def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str
     return True, image_path
 
 
-def _post_return_key() -> tuple[bool, str]:
-    """通过 Quartz HID 事件提交聊天输入框。
-
-    企业微信 5.0.x 的原生输入框会吞掉 System Events 的 ``keystroke return``,
-    表现为 API 返回成功但文字仍留在输入框。直接调用 CoreGraphics 投递硬件层
-    Return(keycode 36),既能触发真实发送,也避免每次启动 Swift 编译器。
-    """
+def _post_key(keycode: int, flags: int = 0) -> tuple[bool, str]:
+    """通过 Quartz HID 事件投递一个按键。"""
     try:
         cg = ctypes.CDLL(
             "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
@@ -301,20 +303,27 @@ def _post_return_key() -> tuple[bool, str]:
             ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool,
         ]
         cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+        cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        cg.CGEventSetFlags.restype = None
         cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cg.CGEventPost.restype = None
         cf.CFRelease.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.restype = None
 
-        down = cg.CGEventCreateKeyboardEvent(None, 36, True)
-        up = cg.CGEventCreateKeyboardEvent(None, 36, False)
+        down = cg.CGEventCreateKeyboardEvent(None, keycode, True)
+        up = cg.CGEventCreateKeyboardEvent(None, keycode, False)
         if not down or not up:
             if down:
                 cf.CFRelease(down)
             if up:
                 cf.CFRelease(up)
-            return False, "无法创建 Quartz Return 事件"
+            return False, "无法创建 Quartz 键盘事件"
         try:
+            if flags:
+                cg.CGEventSetFlags(down, flags)
+                cg.CGEventSetFlags(up, flags)
             cg.CGEventPost(0, down)  # kCGHIDEventTap
-            time.sleep(0.08)
+            time.sleep(0.03)
             cg.CGEventPost(0, up)
         finally:
             cf.CFRelease(down)
@@ -322,6 +331,103 @@ def _post_return_key() -> tuple[bool, str]:
     except OSError as e:
         return False, f"加载 Quartz 失败: {e}"
     return True, "ok"
+
+
+def _post_return_key() -> tuple[bool, str]:
+    """提交聊天输入框;企微 5.0.x 需要 Quartz Return 才能稳定触发发送。"""
+    return _post_key(36)
+
+
+def _post_mouse_click(x: float, y: float) -> tuple[bool, str]:
+    """通过 Quartz 点击屏幕坐标,避免 System Events 在企微 CEF 上阻塞。"""
+    try:
+        cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        cf = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        cg.CGEventCreateMouseEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, _CGPoint, ctypes.c_uint32,
+        ]
+        cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cg.CGEventPost.restype = None
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.restype = None
+
+        point = _CGPoint(float(x), float(y))
+        down = cg.CGEventCreateMouseEvent(None, 1, point, 0)  # kCGEventLeftMouseDown
+        up = cg.CGEventCreateMouseEvent(None, 2, point, 0)  # kCGEventLeftMouseUp
+        if not down or not up:
+            if down:
+                cf.CFRelease(down)
+            if up:
+                cf.CFRelease(up)
+            return False, "无法创建 Quartz 鼠标事件"
+        try:
+            cg.CGEventPost(0, down)
+            time.sleep(0.03)
+            cg.CGEventPost(0, up)
+        finally:
+            cf.CFRelease(down)
+            cf.CFRelease(up)
+    except OSError as e:
+        return False, f"加载 Quartz 失败: {e}"
+    return True, "ok"
+
+
+def _focus_chat_input() -> tuple[bool, str]:
+    """置前企微窗口并用窗口相对坐标点击聊天输入区。"""
+    script = r'''
+    tell application "System Events"
+        if not (exists process "企业微信") then error "企业微信进程不存在"
+        tell process "企业微信"
+            if (count of windows) is 0 then error "找不到企业微信窗口"
+            set frontmost to true
+            set chatWindow to window 1
+            try
+                set value of attribute "AXMinimized" of chatWindow to false
+            end try
+            try
+                perform action "AXRaise" of chatWindow
+            end try
+            set wp to position of chatWindow
+            set ws to size of chatWindow
+            return (item 1 of wp as text) & "," & (item 2 of wp as text) & "," & ¬
+                (item 1 of ws as text) & "," & (item 2 of ws as text)
+        end tell
+    end tell
+    '''
+    ok, out = _run_applescript(script, timeout=5)
+    if not ok:
+        return False, out
+    try:
+        win_x, win_y, width, height = (float(part.strip()) for part in out.split(","))
+    except (TypeError, ValueError):
+        return False, f"无法解析企业微信窗口位置: {out!r}"
+    if width < 400 or height < 300:
+        return False, f"企业微信窗口尺寸异常: {width:g}x{height:g}"
+
+    # 输入区位于主窗口右下方。按窗口比例取点可适配缩放/移动后的窗口,
+    # y 距底部 45px 落在多行编辑区中部,避开发送按钮和工具栏。
+    ok, err = _post_mouse_click(win_x + width * 0.72, win_y + height - 45)
+    if ok:
+        time.sleep(0.12)
+    return ok, err
+
+
+def _clear_current_input() -> tuple[bool, str]:
+    """用原生按键清空输入框,避开企微 CEF 上很慢的 AXValue 查询。"""
+    command_flag = 1 << 20  # kCGEventFlagMaskCommand
+    ok, err = _post_key(0, command_flag)  # Cmd+A
+    if not ok:
+        return False, err
+    time.sleep(0.04)
+    ok, err = _post_key(51)  # Delete
+    if ok:
+        time.sleep(0.08)
+    return ok, err
 
 
 def _post_unicode_text(text: str) -> tuple[bool, str]:
@@ -347,8 +453,11 @@ def _post_unicode_text(text: str) -> tuple[bool, str]:
         cg.CGEventKeyboardSetUnicodeString.argtypes = [
             ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_uint16),
         ]
+        cg.CGEventKeyboardSetUnicodeString.restype = None
         cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cg.CGEventPost.restype = None
         cf.CFRelease.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.restype = None
 
         units = text.encode("utf-16-le")
         chars = (ctypes.c_uint16 * (len(units) // 2)).from_buffer_copy(units)
@@ -405,50 +514,6 @@ def _mention_candidates() -> list[str]:
     return [line for line in out.splitlines() if line.strip()]
 
 
-def _mention_input_value() -> str:
-    """读取聊天输入框的 AXValue,其中 U+FFFC 代表一个已选中的提及对象。"""
-    script = r'''
-    tell application "System Events"
-        tell process "企业微信"
-            set inputBefore to value of attribute "AXFocusedUIElement"
-            if inputBefore is missing value then error "企业微信没有获得输入焦点"
-            set roleBefore to role of inputBefore
-            if roleBefore is not "AXTextArea" and roleBefore is not "AXTextField" then
-                error "当前焦点不是聊天输入框: " & roleBefore
-            end if
-            return value of inputBefore as text
-        end tell
-    end tell
-    '''
-    ok, out = _run_applescript(script, timeout=15)
-    if not ok:
-        raise LocalSendError(out)
-    return out
-
-
-def _clear_chat_input() -> tuple[bool, str]:
-    """清空当前聊天输入框并确认焦点仍在输入区。"""
-    script = r'''
-    tell application "System Events"
-        if not (exists process "企业微信") then error "企业微信进程不存在"
-        tell process "企业微信"
-            if (count of windows) is 0 then error "找不到企业微信窗口"
-            set frontmost to true
-            delay 0.3
-            set inputBefore to value of attribute "AXFocusedUIElement"
-            if inputBefore is missing value then error "企业微信没有获得输入焦点"
-            set roleBefore to role of inputBefore
-            if roleBefore is not "AXTextArea" and roleBefore is not "AXTextField" then
-                error "当前焦点不是聊天输入框: " & roleBefore
-            end if
-            set value of inputBefore to ""
-            set focused of inputBefore to true
-        end tell
-    end tell
-    '''
-    return _run_applescript(script, timeout=15)
-
-
 def _dismiss_mention_picker() -> None:
     """关闭残留的 @ 候选窗,用于失败清理。"""
     script = r'''
@@ -467,8 +532,8 @@ def _dismiss_mention_picker() -> None:
     _run_applescript(script, timeout=10)
 
 
-def _type_mention(name: str, selected_count: int) -> None:
-    """触发 @ 候选,精确选中一个成员并校验生成了提及对象。"""
+def _type_mention(name: str) -> None:
+    """触发 @ 候选,确认唯一匹配后选中成员。"""
     ok, err = _post_unicode_text("@")
     if not ok:
         raise LocalSendError(f"输入 @ 失败: {err}")
@@ -487,27 +552,10 @@ def _type_mention(name: str, selected_count: int) -> None:
             "为避免误 @,未发送消息"
         )
 
-    ok, err = _run_applescript(
-        '''
-        tell application "System Events"
-            tell process "企业微信"
-                set frontmost to true
-                keystroke return
-            end tell
-        end tell
-        ''',
-        timeout=15,
-    )
+    ok, err = _post_return_key()
     if not ok:
         raise LocalSendError(f"选择 @成员失败: {err}")
-    time.sleep(0.8)
-
-    value = _mention_input_value()
-    if value.count("\ufffc") != selected_count + 1:
-        raise LocalSendError(
-            f"@「{name}」未生成真实提及对象(当前已选 {value.count(chr(0xfffc))} 个),"
-            "未发送消息"
-        )
+    time.sleep(0.4)
 
 
 def _infer_mentions(content: str) -> list[str]:
@@ -541,36 +589,66 @@ def _mention_spans(content: str, mentions: list[str] | None) -> list[tuple[int, 
 
 def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, str]:
     """逐段输入正文,把声明的 @姓名转换为企微内部提及对象。"""
+    started = time.perf_counter()
     spans = _mention_spans(content, mentions)
+    ok, err = _focus_chat_input()
+    if not ok:
+        return False, f"聚焦聊天输入框失败: {err}"
     if not spans:
-        return _paste_and_send_current(text=content)
+        ok, err = _clear_current_input()
+        if not ok:
+            return False, f"输入消息失败: {err}"
+        ok, err = _post_unicode_text(content)
+        if not ok:
+            return False, f"输入消息失败: {err}"
+        time.sleep(0.1)
+        result = _submit_current_input()
+        log.info("本地文本发送完成: elapsed=%.3fs", time.perf_counter() - started)
+        return result
 
-    ok, err = _clear_chat_input()
+    ok, err = _clear_current_input()
     if not ok:
         return False, f"输入消息失败: {err}"
 
     cursor = 0
-    selected = 0
     try:
         for start, end, name in spans:
             ok, err = _post_unicode_text(content[cursor:start])
             if not ok:
                 raise LocalSendError(f"输入消息失败: {err}")
-            _type_mention(name, selected)
-            selected += 1
+            mention_started = time.perf_counter()
+            _type_mention(name)
+            log.info(
+                "本地消息 @ 候选并选择完成: name=%r elapsed=%.3fs",
+                name,
+                time.perf_counter() - mention_started,
+            )
             cursor = end
         ok, err = _post_unicode_text(content[cursor:])
         if not ok:
             raise LocalSendError(f"输入消息失败: {err}")
-        value = _mention_input_value()
-        if value.count("\ufffc") != selected:
-            raise LocalSendError("消息中的 @ 未全部生成真实提及对象,未发送消息")
     except LocalSendError as e:
         _dismiss_mention_picker()
-        _clear_chat_input()
+        _clear_current_input()
         return False, str(e)
 
-    return _paste_and_send_current()
+    time.sleep(0.1)
+    result = _submit_current_input()
+    log.info(
+        "本地 @ 消息发送完成: mentions=%d elapsed=%.3fs",
+        len(spans),
+        time.perf_counter() - started,
+    )
+    return result
+
+
+def _submit_current_input(settle_delay: float = 0.4) -> tuple[bool, str]:
+    """提交已组装好的输入内容,不读取或粘贴剪贴板。"""
+    ok, err = _post_return_key()
+    if not ok:
+        return False, f"发送失败: {err}"
+    time.sleep(max(0.0, min(float(settle_delay), 3.0)))
+    return True, "ok"
 
 
 def _paste_and_send_current(
@@ -626,12 +704,9 @@ def _paste_and_send_current(
     if not ok:
         return False, f"粘贴/发送失败: {err}"
 
-    # AXValue 写入后,企微 5.0.x 会吞掉 System Events 的 keystroke return。
-    # 使用 Quartz CGEvent 在 HID 层投递 Return,才能触发输入框的真实发送动作。
-    ok, err = _post_return_key()
+    ok, err = _submit_current_input()
     if not ok:
-        return False, f"粘贴/发送失败: {err}"
-    time.sleep(0.4)
+        return False, f"粘贴/发送失败: {err.removeprefix('发送失败: ')}"
     return True, "ok"
 
 
@@ -736,9 +811,11 @@ def _send_by_scheme(
 ) -> tuple[bool, str]:
     """按数据库会话 ID 打开目标会话后发送消息。
 
-    文本走 AX 直接写入,全程不碰剪贴板 —— 所以这里也不需要备份/还原它。
+    文本走 Quartz 原生键盘事件,全程不碰剪贴板和 CEF 的慢速 AXValue 查询。
     """
+    started = time.perf_counter()
     ok, msg = _open_conversation_by_scheme(conv)
+    log.info("本地消息打开会话完成: elapsed=%.3fs", time.perf_counter() - started)
     if not ok:
         return False, f"打开对话失败: {msg}"
 
