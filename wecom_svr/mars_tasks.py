@@ -43,7 +43,6 @@ from .mars_sync import MarsNotConfigured, MarsSyncError, mars_base
 from .paths import AgentHomeError
 from .schemas import (
     LocalCreateGroupRequest,
-    LocalImageRequest,
     LocalRenameGroupRequest,
     LocalSendRequest,
     SendMessageRequest,
@@ -126,6 +125,12 @@ async def _send_app_message(req: SendMessageRequest) -> dict:
 
 
 async def _send_local_message(req: LocalSendRequest) -> dict:
+    if req.msgtype == "image":
+        def send_image() -> dict:
+            with materialized_image(req) as image_path:
+                return local_send.send_image(image_path=image_path, conv_rid=req.conv_rid)
+        return await asyncio.to_thread(send_image)
+
     if req.mentions is None:
         return await asyncio.to_thread(
             local_send.send_message,
@@ -140,14 +145,6 @@ async def _send_local_message(req: LocalSendRequest) -> dict:
         conv_rid=req.conv_rid,
         mentions=req.mentions,
     )
-
-
-async def _send_local_image(req: LocalImageRequest) -> dict:
-    def go() -> dict:
-        with materialized_image(req) as image_path:
-            return local_send.send_image(image_path=image_path, conv_rid=req.conv_rid)
-
-    return await asyncio.to_thread(go)
 
 
 async def _create_local_group(req: LocalCreateGroupRequest) -> dict:
@@ -182,7 +179,6 @@ class Action(NamedTuple):
 ACTIONS: dict[str, Action] = {
     "app.message.send": Action(SendMessageRequest, _send_app_message, False),  # 官方 API,不碰界面
     "message.send": Action(LocalSendRequest, _send_local_message, True),
-    "image.send": Action(LocalImageRequest, _send_local_image, True),
     "group.create": Action(LocalCreateGroupRequest, _create_local_group, True),
     "group.rename": Action(LocalRenameGroupRequest, _rename_local_group, True),
 }

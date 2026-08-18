@@ -317,14 +317,13 @@ action 名和 wecom-svr 的 HTTP 路由**同构**:带 `app.` 前缀的是自建�
 | action | 落到 wecom-svr 的哪里 | 身份 |
 | --- | --- | --- |
 | `app.message.send` | `POST /api/v1/app/message/send` | 自建应用 |
-| `message.send` | `POST /api/v1/message/send` | **本人** |
-| `image.send` | `POST /api/v1/image/send` | **本人** |
+| `message.send` (`msgtype=text/image`) | `POST /api/v1/message/send` | **本人** |
 | `group.create` | `POST /api/v1/group/create` | **本人** |
 | `group.rename` | `POST /api/v1/group/rename` | **本人** |
 
 `payload` 就是对应接口的 body,原样透传。mars 不重新建模这些字段 —— 建了就会漂。
 
-> 不带前缀的那四条默认**不在** worker 的白名单里(§5.2)。"本人身份是默认关的"
+> 不带前缀的那三条默认**不在** worker 的白名单里(§5.2)。"本人身份是默认关的"
 > 靠的是白名单,不是名字长得像 —— 加新 action 时别指望前缀替你把门。
 
 ### 4.7 发到群
@@ -359,7 +358,7 @@ RID 从两处拿:`POST /api/v1/conversations`(按关键字搜),或
 `wework-<RID>`(`mars_sync` 加的前缀,防止和真实 QQ 群号撞号),从那里取值入队
 **要把前缀去掉**。
 
-`image.send` 发到群同理,但它的 schema **只认 `conv_rid`**,没有按名字找的路。
+图片也走 `message.send`,payload 使用 `msgtype=image`;图片必须按 `conv_rid` 精准定位会话。
 
 群发比单发更该带 `dedup_key`:多发一条私聊是尴尬,多发一条群消息是一屋子人看着。
 
@@ -419,7 +418,7 @@ action 时不回答这个问题根本构造不出来。漏标的后果不对称:
 
 `WECOM_SVR_MARS_TASKS_ACTIONS` 默认 `app.message.send`。
 
-不带 `app.` 前缀的那四条(`message.send` / `image.send` / `group.create` /
+不带 `app.` 前缀的三条(`message.send` / `group.create` /
 `group.rename`)是**以你本人的身份说话**,让一个远端队列能驱动它,权限边界比
 "应用发通知"大一个量级。要开必须显式写进白名单。不在白名单里的 action 直接 ack
 失败(`retry=false`),不执行。

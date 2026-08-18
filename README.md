@@ -135,10 +135,15 @@ curl -X POST http://127.0.0.1:8090/api/v1/message/send \
 curl -X POST http://127.0.0.1:8090/api/v1/conversations \
   -H 'Content-Type: application/json' -d '{"keyword":"notify"}'
 
-# 发图片(image_path 或 image_base64 二选一)
-curl -X POST http://127.0.0.1:8090/api/v1/image/send \
+# 以本人身份发图片(image_path、image_url、image_base64 三选一)
+curl -X POST http://127.0.0.1:8090/api/v1/message/send \
   -H 'Content-Type: application/json' \
-  -d '{"conv_rid":3395103030,"image_path":"/tmp/a.png"}'
+  -d '{"conv_rid":3395103030,"msgtype":"image","image_url":"https://example.com/a.png"}'
+
+# 以应用身份发图文消息(news,即外链文章卡片)
+curl -X POST http://127.0.0.1:8090/api/v1/app/message/send \
+  -H 'Content-Type: application/json' \
+  -d '{"touser":"zhangsan","msgtype":"news","articles":[{"title":"标题","description":"摘要","url":"https://example.com/article","picurl":"https://example.com/cover.jpg"}]}'
 
 # 查通讯录
 curl -X POST http://127.0.0.1:8090/api/v1/app/contact/search \
@@ -158,8 +163,9 @@ curl ... -H 'Authorization: Bearer <token>'
 
 - `GET  /health` —— 健康检查(公开,含 agent home 解析状态)
 - `POST /api/v1/app/message/send` —— 应用身份发消息,`msgtype`: `text` / `markdown` / `news`
-- `POST /api/v1/message/send` —— 本人身份发消息(`to` 或 `conv_rid`),真实 @ 用 `mentions`
-- `POST /api/v1/image/send` —— 本人身份发图片(需 `conv_rid`)
+- `POST /api/v1/message/send` —— 本人身份发消息,`msgtype`: `text` / `image`;真实 @ 用 `mentions`
+  - `text`: `to` 或 `conv_rid` + `content`
+  - `image`: `conv_rid` + `image_path` / `image_url` / `image_base64` 三选一
 - `POST /api/v1/conversations` —— 查本地会话(body 可省略)
 - `POST /api/v1/conversation/open` —— 只打开会话不发送
 - `GET  /api/v1/busy` —— 客户端界面正被哪个操作占着(UI 锁的状态)
@@ -521,7 +527,7 @@ pending,直到 `MARS_IMAGE_WAIT` 超时才推占位符。
 
 沿用原 `api_server.py` 的语义,而非 FastAPI 默认的 422:
 
-- 本人身份那几条(`message/send`、`image/send`、`conversations`、
+- 本人身份那几条(`message/send`、`conversations`、
   `conversation/open`、`busy`、`group/create`、`group/rename`)
   → `{"success": false, "error": "..."}`
 - 其它 → `{"errcode": -1, "errmsg": "..."}`
@@ -577,7 +583,7 @@ curl http://127.0.0.1:8090/api/v1/mars/tasks/status
 
 - **本人身份的 action 默认不在白名单。** `WECOM_SVR_MARS_TASKS_ACTIONS` 默认只有
   `app.message.send`(应用身份)。action 名和 HTTP 路由同构 —— 带 `app.` 前缀的是
-  应用身份,不带的(`message.send` / `image.send` / `group.create` / `group.rename`)
+  应用身份,不带的(`message.send` / `group.create` / `group.rename`)
   是**以你本人的身份说话**,让一个远端队列能驱动它,权限边界比"应用发通知"
   大一个量级,要开必须显式写进配置。
 - **宁可漏发,不重发。** 跟群消息同步的取舍正好相反 —— 那边 mars 有 checksum
