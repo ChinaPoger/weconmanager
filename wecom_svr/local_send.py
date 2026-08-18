@@ -299,10 +299,21 @@ def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str
     if not ok:
         return False, f"粘贴图片失败: {err}"
 
-    # 企微 5.x 的附件预览不会改变 AXValue/AXRole,无法像文本一样低成本回读确认;
-    # 等缩略图完成后由调用方提交。这里只等待一次,比旧组合脚本的 1.6 秒更快。
-    time.sleep(max(0.2, min(float(paste_delay), 3.0)))
-    return True, image_path
+    # 图片附件在 AXValue 中表现为对象替换字符 U+FFFC。必须等它出现再提交:
+    # Cmd+V 投递成功并不等于企微已接收剪贴板内容;若输入框原本就是空的,后续
+    # Return + “输入框为空”会把一次完全没粘上的操作误报为发送成功。
+    attempts = max(2, round(max(0.2, min(float(paste_delay), 3.0)) / 0.1))
+    last_error = ""
+    for attempt in range(attempts):
+        ok, value, err = _current_input_value()
+        if ok and "\ufffc" in value:
+            return True, image_path
+        if not ok:
+            last_error = err
+        if attempt + 1 < attempts:
+            time.sleep(0.1)
+    detail = f": {last_error}" if last_error else ""
+    return False, f"图片粘贴后未出现在输入框中{detail}"
 
 
 def _load_quartz_libraries():

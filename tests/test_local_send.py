@@ -103,6 +103,7 @@ def test_paste_image_splits_clipboard_and_ui_automation(monkeypatch, tmp_path):
         "_run_applescript",
         lambda script, timeout=15: calls.append(("paste", script, timeout)) or (True, "ok"),
     )
+    monkeypatch.setattr(local_send, "_current_input_value", lambda: (True, "\ufffc", "ok"))
     monkeypatch.setattr(local_send.time, "sleep", lambda delay: calls.append(("sleep", delay)))
 
     assert local_send._paste_image_current(str(image)) == (True, str(image))
@@ -110,7 +111,22 @@ def test_paste_image_splits_clipboard_and_ui_automation(monkeypatch, tmp_path):
     assert calls[1] == ("clipboard", str(image))
     assert calls[2][0] == "paste"
     assert calls[2][2] == 2
-    assert calls[3] == ("sleep", 0.8)
+    assert len(calls) == 3
+
+
+def test_paste_image_rejects_silent_clipboard_failure(monkeypatch, tmp_path):
+    image = tmp_path / "a.png"
+    image.write_bytes(b"png")
+    monkeypatch.setattr(local_send, "_focus_chat_input", lambda: (True, "ok"))
+    monkeypatch.setattr(local_send, "_focused_chat_input", lambda: (True, 1, "ok"))
+    monkeypatch.setattr(local_send, "_write_image_clipboard", lambda _path: (True, "ok"))
+    monkeypatch.setattr(local_send, "_run_applescript", lambda *_a, **_kw: (True, "ok"))
+    monkeypatch.setattr(local_send, "_current_input_value", lambda: (True, "", "ok"))
+    monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
+
+    assert local_send._paste_image_current(str(image), paste_delay=0.2) == (
+        False, "图片粘贴后未出现在输入框中",
+    )
 
 
 def test_paste_and_send_surfaces_submit_failure(monkeypatch):
