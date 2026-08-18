@@ -32,6 +32,11 @@ from .uilock import ui_session
 
 log = logging.getLogger(__name__)
 
+_quartz_libraries = None
+_accessibility_libraries = None
+_wecom_ax_application: tuple[int, int] | None = None
+_chat_window_bounds: tuple[float, float, float, float] | None = None
+
 
 class _CGPoint(ctypes.Structure):
     _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
@@ -232,83 +237,112 @@ def _run_applescript(script: str, timeout: int = 15) -> tuple[bool, str]:
     return True, out
 
 
-def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str]:
-    """把图片写入系统剪贴板并粘贴到当前聊天框。
+def _write_image_clipboard(image_path: str) -> tuple[bool, str]:
+    """用短生命周期 AppKit 脚本把图片写进剪贴板。
 
-    图片无法通过 AXValue 写入,因此仍需临时使用 NSPasteboard。发送后不恢复旧
-    剪贴板:这样步骤更少,也避免恢复动作覆盖用户在发送期间刚复制的新内容。
+    不要把 AppKit 和 System Events 放在同一个 osascript 进程里:实测前者写完只需
+    约 0.6 秒,混合脚本却会在企微接收粘贴后卡住直至 15 秒超时。
     """
-    try:
-        image_path = _normalize_file_path(path)
-    except (OSError, ValueError) as e:
-        return False, str(e)
-    delay = max(0.4, min(float(paste_delay), 3.0))
-
-    script = f'''
+    script = r'''
     use framework "AppKit"
     use scripting additions
-
     on run argv
         set imagePath to item 1 of argv
         set imageObj to current application's NSImage's alloc()'s initWithContentsOfFile:imagePath
         if imageObj is missing value then error "无法读取图片: " & imagePath
-
+        -- writeObjects 会注册由当前 osascript 进程提供的惰性 NSImage。脚本一退出,
+        -- 后续独立进程发 Cmd+V 时 provider 已消失,企微拿不到图片。必须写入实体 TIFF
+        -- bytes,让 pasteboard server 在脚本退出后仍持有完整数据。
+        set imageData to imageObj's TIFFRepresentation()
+        if imageData is missing value then error "无法编码图片: " & imagePath
         set pb to current application's NSPasteboard's generalPasteboard()
         pb's clearContents()
-        set ok to pb's writeObjects:{{imageObj}}
+        set ok to pb's setData:imageData forType:(current application's NSPasteboardTypeTIFF)
         if (ok as boolean) is false then error "写入图片剪贴板失败"
-
-        tell application "System Events"
-            if not (exists process "企业微信") then error "企业微信进程不存在"
-            tell process "企业微信"
-                if (count of windows) is 0 then error "找不到企业微信窗口"
-                set frontmost to true
-                delay 0.3
-                set inputBefore to value of attribute "AXFocusedUIElement"
-                if inputBefore is missing value then error "企业微信没有获得输入焦点"
-                set roleBefore to role of inputBefore
-                if roleBefore is not "AXTextArea" and roleBefore is not "AXTextField" then
-                    error "当前焦点不是聊天输入框: " & roleBefore
-                end if
-                keystroke "v" using command down
-            end tell
-        end tell
-        delay {delay * 2:.2f}
     end run
     '''
     try:
         result = subprocess.run(
             ["osascript", "-l", "AppleScript", "-s", "o", "-", image_path],
-            input=script, capture_output=True, text=True, timeout=15,
+            input=script, capture_output=True, text=True, timeout=5,
         )
     except subprocess.TimeoutExpired:
-        return False, "粘贴图片超时"
+        return False, "写入图片剪贴板超时"
     except FileNotFoundError:
         return False, "osascript 不可用(非 macOS?)"
     if result.returncode != 0:
-        return False, (result.stderr or result.stdout).strip() or "粘贴图片失败"
+        return False, (result.stderr or result.stdout).strip() or "写入图片剪贴板失败"
+    return True, "ok"
+
+
+def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str]:
+    """把图片写入剪贴板并粘贴;各阶段拆开执行,避免组合脚本卡死。"""
+    try:
+        image_path = _normalize_file_path(path)
+    except (OSError, ValueError) as e:
+        return False, str(e)
+
+    ok, err = _focus_chat_input()
+    if not ok:
+        return False, f"聚焦聊天输入框失败: {err}"
+    ok, _element, err = _focused_chat_input()
+    if not ok:
+        return False, err
+    ok, err = _write_image_clipboard(image_path)
+    if not ok:
+        return False, err
+    ok, err = _run_applescript(
+        'tell application "System Events" to tell process "企业微信" '
+        'to keystroke "v" using command down',
+        timeout=2,
+    )
+    if not ok:
+        return False, f"粘贴图片失败: {err}"
+
+    # 企微 5.x 的附件预览不会改变 AXValue/AXRole,无法像文本一样低成本回读确认;
+    # 等缩略图完成后由调用方提交。这里只等待一次,比旧组合脚本的 1.6 秒更快。
+    time.sleep(max(0.2, min(float(paste_delay), 3.0)))
     return True, image_path
+
+
+def _load_quartz_libraries():
+    """加载并配置 Quartz 动态库;同一服务进程内只做一次。"""
+    global _quartz_libraries
+    if _quartz_libraries is not None:
+        return _quartz_libraries
+
+    cg = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+    )
+    cf = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    cg.CGEventCreateKeyboardEvent.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool,
+    ]
+    cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+    cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    cg.CGEventSetFlags.restype = None
+    cg.CGEventKeyboardSetUnicodeString.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_uint16),
+    ]
+    cg.CGEventKeyboardSetUnicodeString.restype = None
+    cg.CGEventCreateMouseEvent.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, _CGPoint, ctypes.c_uint32,
+    ]
+    cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+    cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    cg.CGEventPost.restype = None
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFRelease.restype = None
+    _quartz_libraries = cg, cf
+    return _quartz_libraries
 
 
 def _post_key(keycode: int, flags: int = 0) -> tuple[bool, str]:
     """通过 Quartz HID 事件投递一个按键。"""
     try:
-        cg = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
-        )
-        cf = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-        )
-        cg.CGEventCreateKeyboardEvent.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool,
-        ]
-        cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
-        cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
-        cg.CGEventSetFlags.restype = None
-        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-        cg.CGEventPost.restype = None
-        cf.CFRelease.argtypes = [ctypes.c_void_p]
-        cf.CFRelease.restype = None
+        cg, cf = _load_quartz_libraries()
 
         down = cg.CGEventCreateKeyboardEvent(None, keycode, True)
         up = cg.CGEventCreateKeyboardEvent(None, keycode, False)
@@ -334,27 +368,31 @@ def _post_key(keycode: int, flags: int = 0) -> tuple[bool, str]:
 
 
 def _post_return_key() -> tuple[bool, str]:
-    """提交聊天输入框;企微 5.0.x 需要 Quartz Return 才能稳定触发发送。"""
-    return _post_key(36)
+    """提交消息,并以输入框清空作为客户端已接受提交的确认。
+
+    ``osascript`` 零退出码只表示 Return 事件成功投递给 System Events,不表示企微
+    消费了它。后台宿主权限、客户端发送快捷键设置或 CEF 卡顿都可能让事件静默
+    无效;旧实现会因此向任务队列回报假成功。
+
+    这里不在确认失败后再按一次 Return:第一下也可能已经发送,只是 UI 状态读取
+    滞后;重按会违反任务队列“宁可漏发,不可重复”的约束。
+    """
+    ok, _element, err = _focused_chat_input()
+    if not ok:
+        return False, err
+    ok, err = _run_applescript(
+        'tell application "System Events" to tell process "企业微信" to key code 36',
+        timeout=2,
+    )
+    if not ok:
+        return False, err
+    return _wait_current_input_cleared()
 
 
 def _post_mouse_click(x: float, y: float) -> tuple[bool, str]:
     """通过 Quartz 点击屏幕坐标,避免 System Events 在企微 CEF 上阻塞。"""
     try:
-        cg = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
-        )
-        cf = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-        )
-        cg.CGEventCreateMouseEvent.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint32, _CGPoint, ctypes.c_uint32,
-        ]
-        cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
-        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-        cg.CGEventPost.restype = None
-        cf.CFRelease.argtypes = [ctypes.c_void_p]
-        cf.CFRelease.restype = None
+        cg, cf = _load_quartz_libraries()
 
         point = _CGPoint(float(x), float(y))
         down = cg.CGEventCreateMouseEvent(None, 1, point, 0)  # kCGEventLeftMouseDown
@@ -377,8 +415,9 @@ def _post_mouse_click(x: float, y: float) -> tuple[bool, str]:
     return True, "ok"
 
 
-def _focus_chat_input() -> tuple[bool, str]:
-    """置前企微窗口并用窗口相对坐标点击聊天输入区。"""
+def _refresh_chat_window_bounds() -> tuple[bool, str]:
+    """读取并缓存企微聊天窗口位置,供后续发送直接复用。"""
+    global _chat_window_bounds
     script = r'''
     tell application "System Events"
         if not (exists process "企业微信") then error "企业微信进程不存在"
@@ -408,26 +447,249 @@ def _focus_chat_input() -> tuple[bool, str]:
         return False, f"无法解析企业微信窗口位置: {out!r}"
     if width < 400 or height < 300:
         return False, f"企业微信窗口尺寸异常: {width:g}x{height:g}"
+    _chat_window_bounds = win_x, win_y, width, height
+    return True, "ok"
+
+
+def _focus_chat_input() -> tuple[bool, str]:
+    """使用预热的窗口位置点击聊天输入区;无缓存时再读取一次。"""
+    if _chat_window_bounds is None:
+        ok, err = _refresh_chat_window_bounds()
+        if not ok:
+            return False, err
+    assert _chat_window_bounds is not None
+    win_x, win_y, width, height = _chat_window_bounds
 
     # 输入区位于主窗口右下方。按窗口比例取点可适配缩放/移动后的窗口,
     # y 距底部 45px 落在多行编辑区中部,避开发送按钮和工具栏。
     ok, err = _post_mouse_click(win_x + width * 0.72, win_y + height - 45)
     if ok:
-        time.sleep(0.12)
+        time.sleep(0.06)
+    return ok, err
+
+
+def _select_current_input() -> tuple[bool, str]:
+    """选中输入框现有内容;后续文本输入会直接替换它。"""
+    command_flag = 1 << 20  # kCGEventFlagMaskCommand
+    ok, err = _post_key(0, command_flag)  # Cmd+A
+    if ok:
+        time.sleep(0.03)
     return ok, err
 
 
 def _clear_current_input() -> tuple[bool, str]:
     """用原生按键清空输入框,避开企微 CEF 上很慢的 AXValue 查询。"""
-    command_flag = 1 << 20  # kCGEventFlagMaskCommand
-    ok, err = _post_key(0, command_flag)  # Cmd+A
+    ok, err = _select_current_input()
     if not ok:
         return False, err
-    time.sleep(0.04)
     ok, err = _post_key(51)  # Delete
     if ok:
         time.sleep(0.08)
     return ok, err
+
+
+def _load_accessibility_libraries():
+    """加载原生 Accessibility/CoreFoundation API;避免慢速 System Events 查询。"""
+    global _accessibility_libraries
+    if _accessibility_libraries is not None:
+        return _accessibility_libraries
+    ax = ctypes.CDLL(
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+    )
+    cf = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    ax.AXUIElementCreateApplication.argtypes = [ctypes.c_int]
+    ax.AXUIElementCreateApplication.restype = ctypes.c_void_p
+    ax.AXUIElementCopyAttributeValue.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ax.AXUIElementCopyAttributeValue.restype = ctypes.c_int32
+    ax.AXUIElementSetAttributeValue.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    ax.AXUIElementSetAttributeValue.restype = ctypes.c_int32
+    cf.CFStringCreateWithCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+    ]
+    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+    cf.CFStringGetCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+    ]
+    cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFRelease.restype = None
+    _accessibility_libraries = ax, cf
+    return _accessibility_libraries
+
+
+def _cf_string(value: str) -> int:
+    _ax, cf = _load_accessibility_libraries()
+    # kCFStringEncodingUTF8
+    return int(cf.CFStringCreateWithCString(None, value.encode(), 0x08000100))
+
+
+def _cf_string_value(ref: int) -> str:
+    _ax, cf = _load_accessibility_libraries()
+    size = 256
+    while size <= 1 << 20:
+        buf = ctypes.create_string_buffer(size)
+        if cf.CFStringGetCString(ref, buf, size, 0x08000100):
+            return buf.value.decode("utf-8")
+        size *= 2
+    raise ValueError("Accessibility 文本超过 1 MiB")
+
+
+def _ax_application() -> tuple[bool, int, str]:
+    global _wecom_ax_application
+    if _wecom_ax_application is not None:
+        return True, _wecom_ax_application[1], "ok"
+    try:
+        result = subprocess.run(
+            ["pgrep", "-x", "企业微信"], capture_output=True, text=True, timeout=1,
+        )
+        pid = int(result.stdout.splitlines()[0]) if result.returncode == 0 else 0
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        pid = 0
+    if not pid:
+        return False, 0, "企业微信进程不存在"
+    try:
+        ax, _cf = _load_accessibility_libraries()
+        app = int(ax.AXUIElementCreateApplication(pid))
+    except OSError as e:
+        return False, 0, f"加载 Accessibility 失败: {e}"
+    if not app:
+        return False, 0, "无法连接企业微信辅助功能"
+    _wecom_ax_application = pid, app
+    return True, app, "ok"
+
+
+def _ax_attribute(element: int, name: str) -> tuple[bool, int, str]:
+    ax, cf = _load_accessibility_libraries()
+    attribute = _cf_string(name)
+    value = ctypes.c_void_p()
+    try:
+        code = ax.AXUIElementCopyAttributeValue(element, attribute, ctypes.byref(value))
+    finally:
+        cf.CFRelease(attribute)
+    if code != 0 or not value.value:
+        return False, 0, f"读取 {name} 失败(AXError={code})"
+    return True, int(value.value), "ok"
+
+
+def _focused_chat_input() -> tuple[bool, int, str]:
+    ok, app, err = _ax_application()
+    if not ok:
+        return False, 0, err
+    ok, element, err = _ax_attribute(app, "AXFocusedUIElement")
+    if not ok:
+        return False, 0, f"企业微信没有获得输入焦点: {err}"
+    ok, role_ref, err = _ax_attribute(element, "AXRole")
+    if not ok:
+        return False, 0, err
+    _ax, cf = _load_accessibility_libraries()
+    try:
+        role = _cf_string_value(role_ref)
+    finally:
+        cf.CFRelease(role_ref)
+    if role not in {"AXTextArea", "AXTextField"}:
+        cf.CFRelease(element)
+        return False, 0, f"当前焦点不是聊天输入框: {role}"
+    return True, element, "ok"
+
+
+def _current_input_value() -> tuple[bool, str, str]:
+    """读取当前企微聊天输入框;返回 ``(成功, 内容, 错误)``。"""
+    ok, element, err = _focused_chat_input()
+    if not ok:
+        return False, "", err
+    _ax, cf = _load_accessibility_libraries()
+    try:
+        ok, value_ref, err = _ax_attribute(element, "AXValue")
+        if not ok:
+            return False, "", err
+        try:
+            return True, _cf_string_value(value_ref), "ok"
+        finally:
+            cf.CFRelease(value_ref)
+    finally:
+        cf.CFRelease(element)
+
+
+def _wait_current_input_cleared(
+    attempts: int = 11, interval: float = 0.05,
+) -> tuple[bool, str]:
+    """等待企微消费提交并清空输入框,避免把“按键已投递”误报成发送成功。
+
+    正常路径第一次原生 AX 读取即成功(约 2ms),不固定 sleep;只有企微尚未消费
+    Return 的异常/慢速路径才轮询,且最多等待约 0.5 秒。
+    """
+    last_value = ""
+    last_error = ""
+    for attempt in range(max(1, attempts)):
+        ok, value, err = _current_input_value()
+        if ok:
+            if value == "":
+                return True, "ok"
+            last_value = value
+        else:
+            last_error = err
+        if attempt + 1 < attempts:
+            time.sleep(max(0.0, interval))
+
+    if last_value:
+        preview = last_value.replace("\n", "\\n")[:80]
+        return False, f"Return 已投递但输入框未清空,无法确认发送: {preview!r}"
+    return False, f"Return 已投递但无法读取输入框确认发送: {last_error or '未知错误'}"
+
+
+def _set_current_input(text: str) -> tuple[bool, str]:
+    """用原生 AX 写入并回读输入框;实测约 2ms。"""
+    ok, element, err = _focused_chat_input()
+    if not ok:
+        return False, err
+    ax, cf = _load_accessibility_libraries()
+    attribute = _cf_string("AXValue")
+    value = _cf_string(text)
+    try:
+        code = ax.AXUIElementSetAttributeValue(element, attribute, value)
+        if code != 0:
+            return False, f"写入企微输入框失败(AXError={code})"
+        ok, actual_ref, err = _ax_attribute(element, "AXValue")
+        if not ok:
+            return False, err
+        try:
+            actual = _cf_string_value(actual_ref)
+        finally:
+            cf.CFRelease(actual_ref)
+        if actual != text:
+            return False, "企微输入框未接受消息正文"
+        return True, "ok"
+    finally:
+        cf.CFRelease(value)
+        cf.CFRelease(attribute)
+        cf.CFRelease(element)
+
+
+def _insert_current_input(text: str) -> tuple[bool, str]:
+    """在当前光标插入文本,保留输入框里已选择的真实 @ 对象。"""
+    if not text:
+        return True, "ok"
+    ok, element, err = _focused_chat_input()
+    if not ok:
+        return False, err
+    ax, cf = _load_accessibility_libraries()
+    attribute = _cf_string("AXSelectedText")
+    value = _cf_string(text)
+    try:
+        code = ax.AXUIElementSetAttributeValue(element, attribute, value)
+        if code != 0:
+            return False, f"插入企微输入框失败(AXError={code})"
+        return True, "ok"
+    finally:
+        cf.CFRelease(value)
+        cf.CFRelease(attribute)
+        cf.CFRelease(element)
 
 
 def _post_unicode_text(text: str) -> tuple[bool, str]:
@@ -440,24 +702,7 @@ def _post_unicode_text(text: str) -> tuple[bool, str]:
     if not text:
         return True, "ok"
     try:
-        cg = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
-        )
-        cf = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-        )
-        cg.CGEventCreateKeyboardEvent.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool,
-        ]
-        cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
-        cg.CGEventKeyboardSetUnicodeString.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_uint16),
-        ]
-        cg.CGEventKeyboardSetUnicodeString.restype = None
-        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
-        cg.CGEventPost.restype = None
-        cf.CFRelease.argtypes = [ctypes.c_void_p]
-        cf.CFRelease.restype = None
+        cg, cf = _load_quartz_libraries()
 
         units = text.encode("utf-16-le")
         chars = (ctypes.c_uint16 * (len(units) // 2)).from_buffer_copy(units)
@@ -534,15 +779,20 @@ def _dismiss_mention_picker() -> None:
 
 def _type_mention(name: str) -> None:
     """触发 @ 候选,确认唯一匹配后选中成员。"""
-    ok, err = _post_unicode_text("@")
+    # System Events 可稳定触发企微 CEF 的 @ 候选。Quartz 在服务宿主没有
+    # 输入监控权限时会静默丢弃,正是普通文本此前“假成功”的同一根因。
+    ok, err = _run_applescript(
+        'tell application "System Events" to tell process "企业微信" to keystroke "@"',
+        timeout=2,
+    )
     if not ok:
         raise LocalSendError(f"输入 @ 失败: {err}")
-    time.sleep(0.7)
+    time.sleep(0.25)
 
-    ok, err = _post_unicode_text(name)
+    ok, err = _insert_current_input(name)
     if not ok:
         raise LocalSendError(f"输入 @成员搜索词失败: {err}")
-    time.sleep(1.0)
+    time.sleep(0.35)
 
     candidates = _mention_candidates()
     if candidates != [name]:
@@ -591,19 +841,33 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
     """逐段输入正文,把声明的 @姓名转换为企微内部提及对象。"""
     started = time.perf_counter()
     spans = _mention_spans(content, mentions)
+    focus_started = time.perf_counter()
     ok, err = _focus_chat_input()
+    focus_elapsed = time.perf_counter() - focus_started
     if not ok:
         return False, f"聚焦聊天输入框失败: {err}"
     if not spans:
-        ok, err = _clear_current_input()
+        clear_started = time.perf_counter()
+        # 普通文本直接写 AXValue 并回读。CGEventPost 在缺少输入监控权限时会
+        # 静默丢弃 Unicode 事件,不能作为“输入成功”的依据。
+        ok, err = _set_current_input(content)
+        clear_elapsed = time.perf_counter() - clear_started
+        input_elapsed = 0.0
         if not ok:
             return False, f"输入消息失败: {err}"
-        ok, err = _post_unicode_text(content)
-        if not ok:
-            return False, f"输入消息失败: {err}"
-        time.sleep(0.1)
+        time.sleep(0.08)
+        submit_started = time.perf_counter()
         result = _submit_current_input()
-        log.info("本地文本发送完成: elapsed=%.3fs", time.perf_counter() - started)
+        submit_elapsed = time.perf_counter() - submit_started
+        log.info(
+            "本地文本发送完成: elapsed=%.3fs focus=%.3fs clear=%.3fs "
+            "input=%.3fs submit=%.3fs",
+            time.perf_counter() - started,
+            focus_elapsed,
+            clear_elapsed,
+            input_elapsed,
+            submit_elapsed,
+        )
         return result
 
     ok, err = _clear_current_input()
@@ -613,7 +877,7 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
     cursor = 0
     try:
         for start, end, name in spans:
-            ok, err = _post_unicode_text(content[cursor:start])
+            ok, err = _insert_current_input(content[cursor:start])
             if not ok:
                 raise LocalSendError(f"输入消息失败: {err}")
             mention_started = time.perf_counter()
@@ -624,7 +888,7 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
                 time.perf_counter() - mention_started,
             )
             cursor = end
-        ok, err = _post_unicode_text(content[cursor:])
+        ok, err = _insert_current_input(content[cursor:])
         if not ok:
             raise LocalSendError(f"输入消息失败: {err}")
     except LocalSendError as e:
@@ -642,12 +906,14 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
     return result
 
 
-def _submit_current_input(settle_delay: float = 0.4) -> tuple[bool, str]:
+def _submit_current_input(settle_delay: float = 0.0) -> tuple[bool, str]:
     """提交已组装好的输入内容,不读取或粘贴剪贴板。"""
     ok, err = _post_return_key()
     if not ok:
         return False, f"发送失败: {err}"
-    time.sleep(max(0.0, min(float(settle_delay), 3.0)))
+    delay = max(0.0, min(float(settle_delay), 3.0))
+    if delay:
+        time.sleep(delay)
     return True, "ok"
 
 
@@ -729,7 +995,7 @@ def _conversation_jump_url(conv: dict, msgid: int = 0) -> str:
     return f"wxwork://jump?{query}"
 
 
-def _open_conversation_by_scheme(conv: dict, wait: float = 1.2) -> tuple[bool, str]:
+def _open_conversation_by_scheme(conv: dict, wait: float = 0.45) -> tuple[bool, str]:
     """使用客户端 URL Scheme 按 RID/type/fw_id 精准打开会话。"""
     try:
         url = _conversation_jump_url(conv)
@@ -747,7 +1013,9 @@ def _open_conversation_by_scheme(conv: dict, wait: float = 1.2) -> tuple[bool, s
         err = (r.stderr or r.stdout).strip()
         return False, err or f"打开会话失败: {url}"
 
-    time.sleep(wait)
+    delay = max(0.0, min(float(wait), 3.0))
+    if delay:
+        time.sleep(delay)
     return True, url
 
 
@@ -831,6 +1099,10 @@ def _send_image_by_scheme(conv: dict, image_path: str) -> tuple[bool, str]:
     ok, msg = _paste_image_current(image_path, paste_delay=0.8)
     if not ok:
         return False, msg
+    # 预览生成后企微会把 AX 焦点移到附件表格;重新点回输入区再提交。
+    ok, msg = _focus_chat_input()
+    if not ok:
+        return False, f"图片已粘贴但无法聚焦输入框发送: {msg}"
     return _post_return_key()
 
 
@@ -920,6 +1192,7 @@ def send_message(
     Returns:
         {"success": bool, "conv_name": str, "conv_rid": int, "error": ...}
     """
+    started = time.perf_counter()
     ensure_macos()
     if not content.strip():
         return {"success": False, "error": "消息内容为空"}
@@ -970,6 +1243,7 @@ def send_message(
         "conv_fw_id": conv.get("fw_id", 0),
         "open_method": open_method,
         "skipped_users": skip,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000),
         "error": msg if not ok else None,
     }
 
