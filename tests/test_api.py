@@ -139,10 +139,16 @@ def test_conversations_body_optional(client, monkeypatch):
     assert r.json()["conversations"][0]["name"] == "群"
 
 
-def test_image_requires_a_source(client):
-    r = client.post("/api/v1/image/send", json={"conv_rid": 1})
+def test_image_requires_exactly_one_source(client):
+    r = client.post("/api/v1/message/send", json={"conv_rid": 1, "msgtype": "image"})
     assert r.status_code == 400
-    assert "image_base64" in r.json()["error"]
+    assert "必须且只能" in r.json()["error"]
+
+    r = client.post("/api/v1/message/send", json={
+        "conv_rid": 1, "msgtype": "image", "image_path": "/tmp/a.png",
+        "image_url": "https://example.com/a.png",
+    })
+    assert r.status_code == 400
 
 
 def test_image_base64_is_written_to_a_real_file(client, monkeypatch):
@@ -154,17 +160,24 @@ def test_image_base64_is_written_to_a_real_file(client, monkeypatch):
         return {"success": True, "conv_name": "群", "conv_rid": conv_rid, "error": None}
 
     monkeypatch.setattr(local_send, "send_image", fake_send_image)
-    r = client.post("/api/v1/image/send", json={
-        "conv_rid": 1, "image_base64": "aGVsbG8=", "filename": "a.png",
+    r = client.post("/api/v1/message/send", json={
+        "conv_rid": 1, "msgtype": "image", "image_base64": "aGVsbG8=", "filename": "a.png",
     })
     assert r.status_code == 200
     assert captured["bytes"] == b"hello"
 
 
 def test_bad_base64_rejected(client):
-    r = client.post("/api/v1/image/send", json={"conv_rid": 1, "image_base64": "!!!!"})
+    r = client.post("/api/v1/message/send", json={
+        "conv_rid": 1, "msgtype": "image", "image_base64": "!!!!",
+    })
     assert r.status_code == 400
     assert r.json()["success"] is False
+
+
+def test_old_image_endpoint_is_removed(client):
+    r = client.post("/api/v1/image/send", json={"conv_rid": 1, "image_path": "/tmp/a.png"})
+    assert r.status_code == 404
 
 
 # ─── 鉴权 ──────────────────────────────────────────────────────────────

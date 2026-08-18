@@ -1,9 +1,18 @@
 """请求/响应模型。"""
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .group import MAX_NAME_LEN
+
+
+class NewsArticle(BaseModel):
+    """企业微信 news 图文消息中的一篇外链文章。"""
+
+    title: str = Field(..., min_length=1, description="标题")
+    description: str = Field("", description="摘要")
+    url: str = Field(..., min_length=1, description="点击后打开的链接")
+    picurl: str = Field("", description="封面图片 URL")
 
 
 class SendMessageRequest(BaseModel):
@@ -16,7 +25,7 @@ class SendMessageRequest(BaseModel):
     touser: str = Field(..., min_length=1, description="接收人 userid,多人用 | 分隔")
     msgtype: Literal["text", "markdown", "news"] = "text"
     content: str = ""
-    articles: list[dict[str, Any]] | None = None
+    articles: list[NewsArticle] | None = Field(None, min_length=1, max_length=8)
 
     @model_validator(mode="after")
     def _check_payload(self):
@@ -29,51 +38,56 @@ class SendMessageRequest(BaseModel):
 
     def to_agent_args(self) -> dict:
         if self.msgtype == "news":
-            return {"touser": self.touser, "articles": self.articles}
+            return {"touser": self.touser, "articles": [a.model_dump() for a in self.articles or []]}
         return {"touser": self.touser, "content": self.content}
 
 
 class LocalSendRequest(BaseModel):
-    """以「本人登录账号」身份发消息。"""
+    """以「本人登录账号」身份发送文本或图片。"""
 
     model_config = ConfigDict(json_schema_extra={
-        "example": {"conv_rid": 3395103030, "content": "你好,我是本人"}
+        "examples": [
+            {"conv_rid": 3395103030, "msgtype": "text", "content": "你好,我是本人"},
+            {"conv_rid": 3395103030, "msgtype": "image", "image_url": "https://example.com/a.png"},
+        ]
     })
 
     to: str = Field("", description="会话/群名称(模糊搜索),与 conv_rid 二选一")
     conv_rid: int | None = Field(None, description="会话 RID(数据库 ID),精准定位")
-    content: str = Field(..., min_length=1)
+    msgtype: Literal["text", "image"] = Field("text", description="消息类型,与官方 API 命名一致")
+    content: str = Field("", description="text 消息正文")
     mentions: list[str] | None = Field(
         None,
         description=(
-            "要转换为真实提及的姓名。正文中须出现对应的 @姓名;留空时服务会从"
-            "正文中自动识别 @英文/数字/中文姓名"
+            "text 消息中要转换为真实提及的姓名。正文中须出现对应的 @姓名;留空时"
+            "服务会从正文中自动识别 @英文/数字/中文姓名"
         ),
     )
+    image_path: str = Field("", description="image 消息的服务端本地图片路径")
+    image_url: str = Field("", description="image 消息的 HTTP(S) 图片下载地址")
+    image_base64: str = Field("", description="image 消息的 base64,支持 data: 前缀")
+    filename: str | None = Field(None, description="配合 image_base64,用于推断临时文件后缀")
 
     @model_validator(mode="after")
-    def _check_target(self):
+    def _check_payload(self):
         if not self.to.strip() and self.conv_rid is None:
             raise ValueError("缺少 to 或 conv_rid(会话名称 或 数据库 RID)")
-        return self
 
-
-class LocalImageRequest(BaseModel):
-    """以「本人登录账号」身份发图片。"""
-
-    model_config = ConfigDict(json_schema_extra={
-        "example": {"conv_rid": 3395103030, "image_path": "/tmp/a.png"}
-    })
-
-    conv_rid: int = Field(..., description="会话 RID,发图片必填")
-    image_path: str = Field("", description="服务端本地图片路径")
-    image_base64: str = Field("", description="图片 base64,支持 data: 前缀")
-    filename: str | None = Field(None, description="配合 image_base64,用于推断后缀")
-
-    @model_validator(mode="after")
-    def _check_source(self):
-        if not self.image_path and not self.image_base64.strip():
-            raise ValueError("缺少 image_path 或 image_base64")
+        sources = [
+            bool(self.image_path.strip()), bool(self.image_url.strip()), bool(self.image_base64.strip()),
+        ]
+        if self.msgtype == "text":
+            if not self.content:
+                raise ValueError("text 类型需要 content")
+            if any(sources):
+                raise ValueError("text 类型不能传 image_path、image_url 或 image_base64")
+        else:
+            if self.conv_rid is None:
+                raise ValueError("image 类型必须指定 conv_rid")
+            if sum(sources) != 1:
+                raise ValueError("image_path、image_url、image_base64 必须且只能提供一个")
+            if self.content or self.mentions is not None:
+                raise ValueError("image 类型不能传 content 或 mentions")
         return self
 
 

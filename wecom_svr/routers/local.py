@@ -14,7 +14,6 @@ from ..schemas import (
     ConversationsRequest,
     ConversationsResponse,
     LocalCreateGroupRequest,
-    LocalImageRequest,
     LocalRenameGroupRequest,
     LocalSendRequest,
     LocalSendResponse,
@@ -38,18 +37,12 @@ def _result_response(result: dict) -> JSONResponse:
     response_model=LocalSendResponse,
 )
 def send_local_message(req: LocalSendRequest, _: None = Depends(require_token)):
-    result = local_send.send_message(
-        to=req.to, content=req.content, conv_rid=req.conv_rid, mentions=req.mentions
-    )
-    return _result_response(result)
+    if req.msgtype == "text":
+        result = local_send.send_message(
+            to=req.to, content=req.content, conv_rid=req.conv_rid, mentions=req.mentions
+        )
+        return _result_response(result)
 
-
-@router.post(
-    "/image/send",
-    summary="以本人身份发图片(操控客户端)",
-    response_model=LocalSendResponse,
-)
-def send_local_image(req: LocalImageRequest, _: None = Depends(require_token)):
     try:
         with materialized_image(req) as image_path:
             result = local_send.send_image(image_path=image_path, conv_rid=req.conv_rid)
