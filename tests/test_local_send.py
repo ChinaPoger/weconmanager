@@ -81,6 +81,38 @@ def test_paste_and_send_image_does_not_read_ax_value_after_paste(script):
     assert script["return_calls"] == 1
 
 
+def test_paste_image_splits_clipboard_and_ui_automation(monkeypatch, tmp_path):
+    image = tmp_path / "a.png"
+    image.write_bytes(b"png")
+    calls = []
+    focus_results = iter([
+        (True, "ok"),                         # 点击聊天输入框
+        (True, 1, "ok"),                      # 粘贴前确认
+    ])
+    monkeypatch.setattr(
+        local_send, "_focus_chat_input", lambda: calls.append("focus") or next(focus_results)
+    )
+    monkeypatch.setattr(local_send, "_focused_chat_input", lambda: next(focus_results))
+    monkeypatch.setattr(
+        local_send,
+        "_write_image_clipboard",
+        lambda path: calls.append(("clipboard", path)) or (True, "ok"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_run_applescript",
+        lambda script, timeout=15: calls.append(("paste", script, timeout)) or (True, "ok"),
+    )
+    monkeypatch.setattr(local_send.time, "sleep", lambda delay: calls.append(("sleep", delay)))
+
+    assert local_send._paste_image_current(str(image)) == (True, str(image))
+    assert calls[0] == "focus"
+    assert calls[1] == ("clipboard", str(image))
+    assert calls[2][0] == "paste"
+    assert calls[2][2] == 2
+    assert calls[3] == ("sleep", 0.8)
+
+
 def test_paste_and_send_surfaces_submit_failure(monkeypatch):
     monkeypatch.setattr(local_send, "_run_applescript", lambda script, timeout=15: (True, ""))
     monkeypatch.setattr(
@@ -130,6 +162,11 @@ def test_text_send_does_not_touch_the_clipboard(monkeypatch, script):
 def test_submit_checks_native_ax_focus_then_uses_system_events(monkeypatch):
     seen = {}
     monkeypatch.setattr(local_send, "_focused_chat_input", lambda: (True, 123, "ok"))
+    monkeypatch.setattr(
+        local_send,
+        "_wait_current_input_cleared",
+        lambda: seen.update(confirmed=True) or (True, "ok"),
+    )
 
     def fake(script, timeout=15):
         seen["script"] = script
@@ -141,6 +178,44 @@ def test_submit_checks_native_ax_focus_then_uses_system_events(monkeypatch):
     assert local_send._post_return_key() == (True, "ok")
     assert 'process "企业微信" to key code 36' in seen["script"]
     assert seen["timeout"] == 2
+    assert seen["confirmed"] is True
+
+
+def test_submit_fails_when_return_does_not_clear_input(monkeypatch):
+    monkeypatch.setattr(local_send, "_focused_chat_input", lambda: (True, 123, "ok"))
+    monkeypatch.setattr(local_send, "_run_applescript", lambda *_args, **_kwargs: (True, "ok"))
+    monkeypatch.setattr(
+        local_send,
+        "_wait_current_input_cleared",
+        lambda: (False, "Return 已投递但输入框未清空,无法确认发送: 'hi'"),
+    )
+
+    assert local_send._post_return_key() == (
+        False, "Return 已投递但输入框未清空,无法确认发送: 'hi'",
+    )
+
+
+def test_wait_current_input_cleared_polls_until_empty(monkeypatch):
+    values = iter([(True, "hi", "ok"), (True, "", "ok")])
+    sleeps = []
+    monkeypatch.setattr(local_send, "_current_input_value", lambda: next(values))
+    monkeypatch.setattr(local_send.time, "sleep", sleeps.append)
+
+    assert local_send._wait_current_input_cleared(attempts=3, interval=0.1) == (True, "ok")
+    assert sleeps == [0.1]
+
+
+def test_wait_current_input_cleared_rejects_stale_text(monkeypatch):
+    monkeypatch.setattr(
+        local_send, "_current_input_value", lambda: (True, "仍在输入框", "ok")
+    )
+    monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
+
+    ok, error = local_send._wait_current_input_cleared(attempts=2)
+
+    assert ok is False
+    assert "输入框未清空" in error
+    assert "仍在输入框" in error
 
 
 def test_submit_rejects_non_chat_focus_without_sending(monkeypatch):
