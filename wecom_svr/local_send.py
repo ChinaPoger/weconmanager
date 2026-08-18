@@ -237,61 +237,71 @@ def _run_applescript(script: str, timeout: int = 15) -> tuple[bool, str]:
     return True, out
 
 
-def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str]:
-    """把图片写入系统剪贴板并粘贴到当前聊天框。
+def _write_image_clipboard(image_path: str) -> tuple[bool, str]:
+    """用短生命周期 AppKit 脚本把图片写进剪贴板。
 
-    图片无法通过 AXValue 写入,因此仍需临时使用 NSPasteboard。发送后不恢复旧
-    剪贴板:这样步骤更少,也避免恢复动作覆盖用户在发送期间刚复制的新内容。
+    不要把 AppKit 和 System Events 放在同一个 osascript 进程里:实测前者写完只需
+    约 0.6 秒,混合脚本却会在企微接收粘贴后卡住直至 15 秒超时。
     """
-    try:
-        image_path = _normalize_file_path(path)
-    except (OSError, ValueError) as e:
-        return False, str(e)
-    delay = max(0.4, min(float(paste_delay), 3.0))
-
-    script = f'''
+    script = r'''
     use framework "AppKit"
     use scripting additions
-
     on run argv
         set imagePath to item 1 of argv
         set imageObj to current application's NSImage's alloc()'s initWithContentsOfFile:imagePath
         if imageObj is missing value then error "无法读取图片: " & imagePath
-
+        -- writeObjects 会注册由当前 osascript 进程提供的惰性 NSImage。脚本一退出,
+        -- 后续独立进程发 Cmd+V 时 provider 已消失,企微拿不到图片。必须写入实体 TIFF
+        -- bytes,让 pasteboard server 在脚本退出后仍持有完整数据。
+        set imageData to imageObj's TIFFRepresentation()
+        if imageData is missing value then error "无法编码图片: " & imagePath
         set pb to current application's NSPasteboard's generalPasteboard()
         pb's clearContents()
-        set ok to pb's writeObjects:{{imageObj}}
+        set ok to pb's setData:imageData forType:(current application's NSPasteboardTypeTIFF)
         if (ok as boolean) is false then error "写入图片剪贴板失败"
-
-        tell application "System Events"
-            if not (exists process "企业微信") then error "企业微信进程不存在"
-            tell process "企业微信"
-                if (count of windows) is 0 then error "找不到企业微信窗口"
-                set frontmost to true
-                delay 0.3
-                set inputBefore to value of attribute "AXFocusedUIElement"
-                if inputBefore is missing value then error "企业微信没有获得输入焦点"
-                set roleBefore to role of inputBefore
-                if roleBefore is not "AXTextArea" and roleBefore is not "AXTextField" then
-                    error "当前焦点不是聊天输入框: " & roleBefore
-                end if
-                keystroke "v" using command down
-            end tell
-        end tell
-        delay {delay * 2:.2f}
     end run
     '''
     try:
         result = subprocess.run(
             ["osascript", "-l", "AppleScript", "-s", "o", "-", image_path],
-            input=script, capture_output=True, text=True, timeout=15,
+            input=script, capture_output=True, text=True, timeout=5,
         )
     except subprocess.TimeoutExpired:
-        return False, "粘贴图片超时"
+        return False, "写入图片剪贴板超时"
     except FileNotFoundError:
         return False, "osascript 不可用(非 macOS?)"
     if result.returncode != 0:
-        return False, (result.stderr or result.stdout).strip() or "粘贴图片失败"
+        return False, (result.stderr or result.stdout).strip() or "写入图片剪贴板失败"
+    return True, "ok"
+
+
+def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str]:
+    """把图片写入剪贴板并粘贴;各阶段拆开执行,避免组合脚本卡死。"""
+    try:
+        image_path = _normalize_file_path(path)
+    except (OSError, ValueError) as e:
+        return False, str(e)
+
+    ok, err = _focus_chat_input()
+    if not ok:
+        return False, f"聚焦聊天输入框失败: {err}"
+    ok, _element, err = _focused_chat_input()
+    if not ok:
+        return False, err
+    ok, err = _write_image_clipboard(image_path)
+    if not ok:
+        return False, err
+    ok, err = _run_applescript(
+        'tell application "System Events" to tell process "企业微信" '
+        'to keystroke "v" using command down',
+        timeout=2,
+    )
+    if not ok:
+        return False, f"粘贴图片失败: {err}"
+
+    # 企微 5.x 的附件预览不会改变 AXValue/AXRole,无法像文本一样低成本回读确认;
+    # 等缩略图完成后由调用方提交。这里只等待一次,比旧组合脚本的 1.6 秒更快。
+    time.sleep(max(0.2, min(float(paste_delay), 3.0)))
     return True, image_path
 
 
@@ -358,18 +368,25 @@ def _post_key(keycode: int, flags: int = 0) -> tuple[bool, str]:
 
 
 def _post_return_key() -> tuple[bool, str]:
-    """校验输入焦点后通过 System Events 提交消息。
+    """提交消息,并以输入框清空作为客户端已接受提交的确认。
 
-    原生 AX 负责快速校验;System Events 只投递一个 Return,实测约 0.15 秒。
-    不能改回 ``CGEventPost``:宿主缺少输入监控权限时它会静默丢事件。
+    ``osascript`` 零退出码只表示 Return 事件成功投递给 System Events,不表示企微
+    消费了它。后台宿主权限、客户端发送快捷键设置或 CEF 卡顿都可能让事件静默
+    无效;旧实现会因此向任务队列回报假成功。
+
+    这里不在确认失败后再按一次 Return:第一下也可能已经发送,只是 UI 状态读取
+    滞后;重按会违反任务队列“宁可漏发,不可重复”的约束。
     """
     ok, _element, err = _focused_chat_input()
     if not ok:
         return False, err
-    return _run_applescript(
+    ok, err = _run_applescript(
         'tell application "System Events" to tell process "企业微信" to key code 36',
         timeout=2,
     )
+    if not ok:
+        return False, err
+    return _wait_current_input_cleared()
 
 
 def _post_mouse_click(x: float, y: float) -> tuple[bool, str]:
@@ -579,6 +596,51 @@ def _focused_chat_input() -> tuple[bool, int, str]:
         cf.CFRelease(element)
         return False, 0, f"当前焦点不是聊天输入框: {role}"
     return True, element, "ok"
+
+
+def _current_input_value() -> tuple[bool, str, str]:
+    """读取当前企微聊天输入框;返回 ``(成功, 内容, 错误)``。"""
+    ok, element, err = _focused_chat_input()
+    if not ok:
+        return False, "", err
+    _ax, cf = _load_accessibility_libraries()
+    try:
+        ok, value_ref, err = _ax_attribute(element, "AXValue")
+        if not ok:
+            return False, "", err
+        try:
+            return True, _cf_string_value(value_ref), "ok"
+        finally:
+            cf.CFRelease(value_ref)
+    finally:
+        cf.CFRelease(element)
+
+
+def _wait_current_input_cleared(
+    attempts: int = 11, interval: float = 0.05,
+) -> tuple[bool, str]:
+    """等待企微消费提交并清空输入框,避免把“按键已投递”误报成发送成功。
+
+    正常路径第一次原生 AX 读取即成功(约 2ms),不固定 sleep;只有企微尚未消费
+    Return 的异常/慢速路径才轮询,且最多等待约 0.5 秒。
+    """
+    last_value = ""
+    last_error = ""
+    for attempt in range(max(1, attempts)):
+        ok, value, err = _current_input_value()
+        if ok:
+            if value == "":
+                return True, "ok"
+            last_value = value
+        else:
+            last_error = err
+        if attempt + 1 < attempts:
+            time.sleep(max(0.0, interval))
+
+    if last_value:
+        preview = last_value.replace("\n", "\\n")[:80]
+        return False, f"Return 已投递但输入框未清空,无法确认发送: {preview!r}"
+    return False, f"Return 已投递但无法读取输入框确认发送: {last_error or '未知错误'}"
 
 
 def _set_current_input(text: str) -> tuple[bool, str]:
@@ -1037,6 +1099,10 @@ def _send_image_by_scheme(conv: dict, image_path: str) -> tuple[bool, str]:
     ok, msg = _paste_image_current(image_path, paste_delay=0.8)
     if not ok:
         return False, msg
+    # 预览生成后企微会把 AX 焦点移到附件表格;重新点回输入区再提交。
+    ok, msg = _focus_chat_input()
+    if not ok:
+        return False, f"图片已粘贴但无法聚焦输入框发送: {msg}"
     return _post_return_key()
 
 
