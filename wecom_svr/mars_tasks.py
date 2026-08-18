@@ -151,7 +151,14 @@ async def _send_local_image(req: LocalImageRequest) -> dict:
 
 
 async def _create_local_group(req: LocalCreateGroupRequest) -> dict:
-    return await asyncio.to_thread(local_group.create_group, req.members, name=req.name)
+    result = await asyncio.to_thread(
+        local_group.create_group, req.members, name=req.name, return_rid=True
+    )
+    # mars 的 ack 会把 result 原样写回任务条目。用 group_id 暴露稳定的业务字段,
+    # 同时保留 rid 兼容本机接口调用方。
+    if isinstance(result, dict) and result.get("success") and result.get("rid") is not None:
+        result = {**result, "group_id": result["rid"]}
+    return result
 
 
 async def _rename_local_group(req: LocalRenameGroupRequest) -> dict:

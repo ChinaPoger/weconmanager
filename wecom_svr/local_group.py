@@ -518,13 +518,17 @@ def calibrate_ui() -> dict:
 
 # ─── 公开 API ──────────────────────────────────────────────────────────
 
-def create_group(members: list[str], name: str = "") -> dict:
+def create_group(members: list[str], name: str = "", return_rid: bool = False) -> dict:
     """以本人身份拉群。你自己自动是群主,不用写进 members。
+
+    ``return_rid`` 用于需要把新群关联回业务单据的调用方。客户端建群
+    成功后不会直接返回 RID,需要用建群前后的会话差集定位。
 
     Args:
         members: 除自己以外的成员,按客户端通讯录搜索(内部同事、外部联系人、微信都行)
         name: 群名。选人面板里没有命名输入框,所以是「先建群、再改名」两步;
               改名失败不会回滚群 —— 群已经建出来了,回滚反而更吓人。
+        return_rid: 是否定位并返回新群的本地会话 RID。
 
     Returns:
         {"success": bool, "members": [...], "member_count": int, "rid": ..., "error": ...}
@@ -561,7 +565,7 @@ def create_group(members: list[str], name: str = "") -> dict:
     # RID」。所以差集选出来的候选还要再过一道标题核对(_rename_locked 的
     # expect_members),对不上就不改名。
     with ui_session("拉群"):
-        before = set(_group_names()) if wanted_name else set()
+        before = set(_group_names()) if (wanted_name or return_rid) else set()
 
         _activate()
         _open_picker()
@@ -585,15 +589,25 @@ def create_group(members: list[str], name: str = "") -> dict:
             "name": None,
             "error": None,
         }
-        if not wanted_name:
+        if not wanted_name and not return_rid:
             return result
 
         new_rids = _wait_new_group_rids(before)
         if len(new_rids) != 1:
-            result["name_error"] = (
-                "群建好了,等待本地会话落库后仍没能唯一定位新建的会话"
-                f"(新增 {len(new_rids)} 个),群名没改成。请手动改名。"
-            )
+            if wanted_name:
+                result["name_error"] = (
+                    "群建好了,等待本地会话落库后仍没能唯一定位新建的会话"
+                    f"(新增 {len(new_rids)} 个),群名没改成。请手动改名。"
+                )
+            else:
+                result["rid_error"] = (
+                    "群建好了,但等待本地会话落库后未能唯一定位新群"
+                    f"(新增 {len(new_rids)} 个)"
+                )
+            return result
+
+        if not wanted_name:
+            result["rid"] = new_rids[0]
             return result
 
         renamed = _rename_locked(
