@@ -181,6 +181,18 @@ def test_submit_checks_native_ax_focus_then_uses_system_events(monkeypatch):
     assert seen["confirmed"] is True
 
 
+def test_return_selects_mention_without_requiring_empty_input(monkeypatch):
+    monkeypatch.setattr(local_send, "_focused_chat_input", lambda: (True, 123, "ok"))
+    monkeypatch.setattr(local_send, "_run_applescript", lambda *_args, **_kwargs: (True, "ok"))
+    monkeypatch.setattr(
+        local_send,
+        "_wait_current_input_cleared",
+        lambda: pytest.fail("选择 @ 候选不应校验正文已清空"),
+    )
+
+    assert local_send._post_return_key(confirm_send=False) == (True, "ok")
+
+
 def test_submit_fails_when_return_does_not_clear_input(monkeypatch):
     monkeypatch.setattr(local_send, "_focused_chat_input", lambda: (True, 123, "ok"))
     monkeypatch.setattr(local_send, "_run_applescript", lambda *_args, **_kwargs: (True, "ok"))
@@ -376,6 +388,23 @@ def test_mention_spans_are_inferred_and_ordered():
 def test_mention_spans_reject_invalid_declarations(content, mentions, message):
     with pytest.raises(local_send.LocalSendError, match=message):
         local_send._mention_spans(content, mentions)
+
+
+def test_type_mention_selects_candidate_without_send_confirmation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(local_send, "_run_applescript", lambda *_args, **_kwargs: (True, "ok"))
+    monkeypatch.setattr(local_send, "_insert_current_input", lambda _text: (True, "ok"))
+    monkeypatch.setattr(local_send, "_mention_candidates", lambda: ["abz"])
+    monkeypatch.setattr(
+        local_send,
+        "_post_return_key",
+        lambda confirm_send=True: calls.append(confirm_send) or (True, "ok"),
+    )
+    monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
+
+    local_send._type_mention("abz")
+
+    assert calls == [False]
 
 
 def test_rich_message_selects_mentions_before_sending(monkeypatch):

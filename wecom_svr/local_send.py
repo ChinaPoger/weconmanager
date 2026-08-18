@@ -367,8 +367,11 @@ def _post_key(keycode: int, flags: int = 0) -> tuple[bool, str]:
     return True, "ok"
 
 
-def _post_return_key() -> tuple[bool, str]:
-    """提交消息,并以输入框清空作为客户端已接受提交的确认。
+def _post_return_key(confirm_send: bool = True) -> tuple[bool, str]:
+    """投递 Return;发送消息时以输入框清空确认客户端已接受提交。
+
+    @ 候选窗口也用 Return 选人,但选人后正文当然不会清空,调用方必须传
+    ``confirm_send=False``。只有最终提交消息时才执行清空确认。
 
     ``osascript`` 零退出码只表示 Return 事件成功投递给 System Events,不表示企微
     消费了它。后台宿主权限、客户端发送快捷键设置或 CEF 卡顿都可能让事件静默
@@ -386,6 +389,8 @@ def _post_return_key() -> tuple[bool, str]:
     )
     if not ok:
         return False, err
+    if not confirm_send:
+        return True, "ok"
     return _wait_current_input_cleared()
 
 
@@ -802,7 +807,7 @@ def _type_mention(name: str) -> None:
             "为避免误 @,未发送消息"
         )
 
-    ok, err = _post_return_key()
+    ok, err = _post_return_key(confirm_send=False)
     if not ok:
         raise LocalSendError(f"选择 @成员失败: {err}")
     time.sleep(0.4)
