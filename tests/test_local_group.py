@@ -709,3 +709,281 @@ def test_rename_endpoint_rejects_empty_and_overlong_names(api, rename_env):
         assert r.status_code == 400, name
         assert r.json()["success"] is False
     assert rename_env["names"][77] == "陈挺、陈涛、任威风"     # 一次都没动过客户端
+
+
+# ─── 我在本群的昵称 ───────────────────────────────────────────────────
+
+def test_create_with_nickname_opens_group_info_not_the_title(fake, monkeypatch):
+    names = {1: "旧群"}
+    monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
+    captured = {}
+
+    def fake_nick(rid, nickname, expect_members=None, expect_title=None):
+        captured.update(
+            rid=rid, nickname=nickname,
+            expect_members=expect_members, expect_title=expect_title,
+        )
+        return {"success": True}
+
+    monkeypatch.setattr(local_group, "_set_nickname_locked", fake_nick)
+    monkeypatch.setattr(
+        local_group,
+        "_rename_locked",
+        lambda *a, **kw: pytest.fail("只改昵称时不该走改群名"),
+    )
+
+    def confirm():
+        names[42] = ""
+        fake.confirmed = True
+        fake.sheet_open = False
+
+    monkeypatch.setattr(local_group, "_confirm", confirm)
+
+    r = local_group.create_group(["陈涛", "陈挺"], nickname="小王")
+    assert r["success"] is True
+    assert r["rid"] == 42 and r["nickname"] == "小王"
+    assert captured == {
+        "rid": 42,
+        "nickname": "小王",
+        "expect_members": ["陈涛(水淼淼)", "陈挺"],
+        "expect_title": None,
+    }
+
+
+def test_create_with_name_and_nickname_does_both(fake, monkeypatch):
+    names = {1: "旧群"}
+    monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
+    nick = {}
+    monkeypatch.setattr(
+        local_group,
+        "_rename_locked",
+        lambda rid, name, expect_members=None: {"success": True},
+    )
+    monkeypatch.setattr(
+        local_group,
+        "_set_nickname_locked",
+        lambda rid, nickname, expect_members=None, expect_title=None: (
+            nick.update(
+                rid=rid, nickname=nickname,
+                expect_members=expect_members, expect_title=expect_title,
+            ) or {"success": True}
+        ),
+    )
+    monkeypatch.setattr(local_group, "_confirm", lambda: names.update({42: ""}) or setattr(fake, "sheet_open", False))
+
+    r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组", nickname="小王")
+    assert r["success"] is True
+    assert r["name"] == "临时讨论组"
+    assert r["nickname"] == "小王"
+    # 群名已经改过,不能再拿成员拼名去对标题,否则会把刚改好名的新群误判成别人的群
+    assert nick["expect_title"] == "临时讨论组"
+    assert nick["expect_members"] is None
+
+
+def test_create_reports_nickname_error_when_the_new_group_is_not_unique(fake, monkeypatch):
+    _snapshots(monkeypatch, {1: "旧群"}, {1: "旧群", 42: "", 43: ""})
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
+    monkeypatch.setattr(
+        local_group,
+        "_set_nickname_locked",
+        lambda *a, **kw: pytest.fail("新增会话不唯一时不该改昵称"),
+    )
+
+    r = local_group.create_group(["陈涛", "陈挺"], nickname="小王")
+    assert r["success"] is True
+    assert r["rid"] is None
+    assert "昵称没改成" in r["nickname_error"]
+
+
+def test_create_keeps_the_group_when_nickname_fails(fake, monkeypatch):
+    names = {1: "旧群"}
+    monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
+    monkeypatch.setattr(
+        local_group,
+        "_set_nickname_locked",
+        lambda *a, **kw: {"success": False, "error": "打不开群详情"},
+    )
+
+    def confirm():
+        names[42] = ""
+        fake.sheet_open = False
+
+    monkeypatch.setattr(local_group, "_confirm", confirm)
+
+    r = local_group.create_group(["陈涛", "陈挺"], nickname="小王")
+    assert r["success"] is True
+    assert r["rid"] == 42
+    assert "打不开群详情" in r["nickname_error"]
+
+
+def test_set_nickname_refuses_an_unrelated_conversation(rename_env, monkeypatch):
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: rename_env["names"][77])
+    monkeypatch.setattr(
+        local_group,
+        "_open_group_info_panel",
+        lambda: pytest.fail("认不出是新群时不该打开群详情"),
+    )
+    r = local_group._set_nickname_locked(77, "小王", expect_members=["张三", "李四"])
+    assert r["success"] is False
+    assert r["unrelated"] is True
+    assert "一个字都没改" in r["error"]
+
+
+def test_set_nickname_accepts_the_title_after_a_successful_rename(rename_env, monkeypatch):
+    state = {"wrote": None}
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: "临时讨论组")
+    monkeypatch.setattr(
+        local_group,
+        "_scan_nickname_ui",
+        lambda: {"kind": "FIELD", "value": f"我在本群的昵称{state['wrote'] or ''}", "x": 1, "y": 1},
+    )
+    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda: None)
+    monkeypatch.setattr(local_group, "_write_focused_nickname", lambda name: state.update(wrote=name))
+    monkeypatch.setattr(local_group, "_close_group_info", lambda: None)
+    monkeypatch.setattr(local_group, "_front_window_mentions", lambda text: text == state["wrote"])
+    monkeypatch.setattr(local_group, "_focused_text_field", lambda: None)
+    monkeypatch.setattr(local_group, "_probe_nickname_in_dialog", lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0})
+    monkeypatch.setattr(local_group, "_nickname_dialog_field", lambda: None)
+
+    r = local_group._set_nickname_locked(77, "小王", expect_title="临时讨论组")
+    assert r["success"] is True
+    assert state["wrote"] == "小王"
+
+
+def test_set_nickname_writes_the_focused_field_and_verifies(rename_env, monkeypatch):
+    state = {"opened": False, "wrote": None, "closed": False, "scans": 0}
+
+    def scan():
+        state["scans"] += 1
+        if state["wrote"]:
+            return {"kind": "FIELD", "value": f"我在本群的昵称{state['wrote']}", "x": 1, "y": 1}
+        return {"kind": "ROW", "value": "我在本群的昵称", "x": 10, "y": 20}
+
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: "")
+    monkeypatch.setattr(local_group, "_scan_nickname_ui", scan)
+    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda: state.update(opened=True))
+    monkeypatch.setattr(local_group, "_real_click", lambda x, y: None)
+    monkeypatch.setattr(
+        local_group,
+        "_write_focused_nickname",
+        lambda name: state.update(wrote=name),
+    )
+    monkeypatch.setattr(local_group, "_close_group_info", lambda: state.update(closed=True))
+    monkeypatch.setattr(local_group, "_front_window_mentions", lambda text: text == state["wrote"])
+    monkeypatch.setattr(local_group, "_focused_text_field", lambda: None)
+    monkeypatch.setattr(local_group, "_probe_nickname_in_dialog", lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0})
+    monkeypatch.setattr(local_group, "_nickname_dialog_field", lambda: None)
+
+    r = local_group._set_nickname_locked(77, "小王", expect_members=["陈挺", "陈涛"])
+    assert r["success"] is True
+    assert r["nickname"] == "小王"
+    assert state["opened"] and state["wrote"] == "小王" and state["closed"]
+
+
+def test_set_nickname_aborts_when_no_editor_took_focus(rename_env, monkeypatch):
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: "")
+    monkeypatch.setattr(
+        local_group,
+        "_scan_nickname_ui",
+        lambda: {"kind": "ROW", "value": "我在本群的昵称", "x": 10, "y": 20},
+    )
+    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda: None)
+    monkeypatch.setattr(local_group, "_real_click", lambda x, y: None)
+    monkeypatch.setattr(
+        local_group,
+        "_write_focused_nickname",
+        lambda name: (_ for _ in ()).throw(local_group.LocalGroupError("没有输入框拿到焦点")),
+    )
+    monkeypatch.setattr(local_group, "_close_group_info", lambda: None)
+    monkeypatch.setattr(local_group, "_nickname_dialog_field", lambda: None)
+
+    r = local_group._set_nickname_locked(77, "小王")
+    assert r["success"] is False
+    assert "没有输入框拿到焦点" in r["error"]
+
+
+def test_set_nickname_writes_the_dedicated_dialog_and_confirms(rename_env, monkeypatch):
+    state = {"wrote": None, "dialog": {"kind": "FIELD", "value": "", "x": 544, "y": 413}}
+
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: "临时讨论组")
+    monkeypatch.setattr(
+        local_group,
+        "_scan_nickname_ui",
+        lambda: {"kind": "FIELD", "value": "", "x": 544, "y": 413},
+    )
+    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda: None)
+    monkeypatch.setattr(local_group, "_nickname_dialog_field", lambda: state["dialog"])
+    monkeypatch.setattr(
+        local_group,
+        "_write_nickname_dialog",
+        lambda name: state.update(wrote=name, dialog=None),
+    )
+    monkeypatch.setattr(local_group, "_close_group_info", lambda: None)
+    monkeypatch.setattr(
+        local_group,
+        "_write_focused_nickname",
+        lambda name: pytest.fail("有昵称小窗时不该写聊天输入框"),
+    )
+
+    r = local_group._set_nickname_locked(77, "小王", expect_title="临时讨论组")
+    assert r["success"] is True
+    assert state["wrote"] == "小王"
+
+
+def test_nickname_hint_recognizes_chinese_and_english():
+    assert local_group._looks_like_nickname_hint("我在本群的昵称")
+    assert local_group._looks_like_nickname_hint("My Alias in Group")
+    assert not local_group._looks_like_nickname_hint("群聊名称")
+
+
+def test_header_more_uses_leftmost_of_three_buttons(monkeypatch):
+    monkeypatch.setattr(
+        local_group,
+        "_header_action_button_points",
+        lambda: [(1071, 57), (1111, 57), (1151, 57)],
+    )
+    assert local_group._header_more_click_point() == (1071, 57)
+
+
+def test_header_more_stays_leftmost_when_sidebar_is_open(monkeypatch):
+    monkeypatch.setattr(
+        local_group,
+        "_header_action_button_points",
+        lambda: [(1111, 57), (1151, 57)],
+    )
+    assert local_group._header_more_click_point() == (1111, 57)
+
+
+def test_nickname_verify_accepts_focused_field_when_window_text_is_empty(monkeypatch):
+    monkeypatch.setattr(local_group, "_front_window_mentions", lambda text: False)
+    monkeypatch.setattr(
+        local_group,
+        "_focused_text_field",
+        lambda: {"value": "小王", "x": 900, "y": 300},
+    )
+    assert local_group._nickname_write_verified("小王", {"x": 900, "y": 300}) is True
+    assert local_group._nickname_write_verified("小王", {"x": 373, "y": 712}) is False
+
+
+def test_nickname_endpoint_success(api, fake, monkeypatch):
+    names = {1: "旧群"}
+    monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
+    monkeypatch.setattr(
+        local_group,
+        "_set_nickname_locked",
+        lambda rid, nickname, expect_members=None, expect_title=None: {"success": True},
+    )
+
+    def confirm():
+        names[42] = ""
+        fake.sheet_open = False
+
+    monkeypatch.setattr(local_group, "_confirm", confirm)
+    r = api.post("/api/v1/group/create", json={"members": ["陈涛", "陈挺"], "nickname": "小王"})
+    assert r.status_code == 200
+    assert r.json()["nickname"] == "小王"
+    assert r.json()["rid"] == 42

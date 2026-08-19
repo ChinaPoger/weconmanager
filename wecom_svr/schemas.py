@@ -103,7 +103,11 @@ class LocalCreateGroupRequest(BaseModel):
     """以「本人登录账号」身份拉群(操控客户端)。"""
 
     model_config = ConfigDict(json_schema_extra={
-        "example": {"members": ["陈涛", "陈挺"], "name": "临时讨论组"}
+        "example": {
+            "members": ["陈涛", "陈挺"],
+            "name": "临时讨论组",
+            "nickname": "小王",
+        }
     })
 
     members: list[str] = Field(
@@ -114,6 +118,10 @@ class LocalCreateGroupRequest(BaseModel):
     )
     name: str = Field(
         "", max_length=MAX_NAME_LEN, description="群名。留空则用客户端按成员自动生成的名字"
+    )
+    nickname: str = Field(
+        "", max_length=MAX_NAME_LEN,
+        description="我在本群内的昵称。留空则不修改(建群完成后设置)",
     )
 
 

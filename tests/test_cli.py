@@ -32,23 +32,27 @@ def run(monkeypatch, capsys):
 def test_group_passes_members_and_name_through(run, monkeypatch):
     seen = {}
 
-    def create_group(members, name=""):
-        seen["members"], seen["name"] = members, name
+    def create_group(members, name="", nickname=""):
+        seen["members"], seen["name"], seen["nickname"] = members, name, nickname
         return {"success": True, "member_count": 3,
                 "members": [{"name": "陈涛(水淼淼)", "dept": "增长产品部", "query": "陈涛"},
                             {"name": "陈挺", "dept": "增长产品部", "query": "陈挺"}]}
 
     monkeypatch.setattr(cli, "create_group", create_group)
-    code, out = run("--group", " 陈涛 , 陈挺 ", "--group-name", "临时讨论组")
+    code, out = run(
+        "--group", " 陈涛 , 陈挺 ",
+        "--group-name", "临时讨论组",
+        "--group-nickname", "小王",
+    )
 
     assert code == 0
-    assert seen == {"members": ["陈涛", "陈挺"], "name": "临时讨论组"}
+    assert seen == {"members": ["陈涛", "陈挺"], "name": "临时讨论组", "nickname": "小王"}
     assert "陈涛(水淼淼)" in out and "共 3 人" in out
 
 
 def test_group_surfaces_a_rename_failure_instead_of_burying_it(run, monkeypatch):
     """群建出来了但名字没改上 —— 这是要人手工补的,不能被一句「已建群」盖过去。"""
-    monkeypatch.setattr(cli, "create_group", lambda members, name="": {
+    monkeypatch.setattr(cli, "create_group", lambda members, name="", nickname="": {
         "success": True, "member_count": 3, "members": [],
         "name_error": "群建好了,但改名失败: 没有输入框拿到焦点",
     })
@@ -57,8 +61,18 @@ def test_group_surfaces_a_rename_failure_instead_of_burying_it(run, monkeypatch)
     assert "改名失败" in out
 
 
+def test_group_surfaces_a_nickname_failure_instead_of_burying_it(run, monkeypatch):
+    monkeypatch.setattr(cli, "create_group", lambda members, name="", nickname="": {
+        "success": True, "member_count": 3, "members": [],
+        "nickname_error": "群建好了,但设置我在本群的昵称失败: 打不开群详情",
+    })
+    code, out = run("--group", "陈涛,陈挺", "--group-nickname", "小王")
+    assert code == 0
+    assert "昵称失败" in out
+
+
 def test_group_failure_exits_nonzero(run, monkeypatch):
-    monkeypatch.setattr(cli, "create_group", lambda members, name="": {
+    monkeypatch.setattr(cli, "create_group", lambda members, name="", nickname="": {
         "success": False, "error": "除自己外至少要 2 个人才能建群",
     })
     code, out = run("--group", "陈涛")
@@ -69,7 +83,7 @@ def test_group_failure_exits_nonzero(run, monkeypatch):
 def test_group_reports_client_errors_as_a_clean_message(run, monkeypatch):
     """搜出多条候选是可预期的失败,应该看到候选名单,而不是一串堆栈。"""
 
-    def boom(members, name=""):
+    def boom(members, name="", nickname=""):
         raise cli.LocalSendError("「陈」在客户端里搜出多条: 陈涛, 陈挺, 陈珂")
 
     monkeypatch.setattr(cli, "create_group", boom)

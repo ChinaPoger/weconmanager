@@ -110,7 +110,7 @@ UI 接口时再返回错误。这样不会因为 macOS 权限或客户端窗口�
 | `WECOM_SVR_STARTUP_KEY_TIMEOUT` | `180` | 自动取 key 的超时秒数 |
 | `WECOM_CORPID` / `WECOM_SECRET` / `WECOM_AGENTID` | 空 | 自建应用凭证,留空回落到 `config.json` |
 | `WECOM_SVR_MARS_*` | 见下 | 群消息同步到 mars,默认全关 |
-| `WECOM_SVR_UI_PLUS_OFFSET` / `WECOM_SVR_UI_TITLE_OFFSET` | 空 | 手工钉死坐标位置(`"x,y"`);标题项仅兼容旧版客户端 |
+| `WECOM_SVR_UI_PLUS_OFFSET` / `WECOM_SVR_UI_TITLE_OFFSET` / `WECOM_SVR_UI_MORE_OFFSET` | 空 | 手工钉死坐标位置(`"x,y"`);标题项仅兼容旧版客户端;更多项是相对窗口右上角往里 |
 | `WECOM_SVR_UI_CALIBRATE` | `true` | 点不中时在附近试候选偏移,试中了记进 `.data/ui_offsets.json` |
 
 ## 接口
@@ -199,7 +199,52 @@ curl -X POST http://127.0.0.1:8090/api/v1/app/group/members/resolve \
 # 本人身份(操控客户端):自己自动是群主,不用写进 members
 curl -X POST http://127.0.0.1:8090/api/v1/group/create \
   -H 'Content-Type: application/json' \
-  -d '{"members":["陈涛","陈挺"],"name":"临时讨论组"}'
+  -d '{"members":["陈涛","陈挺"],"name":"临时讨论组","nickname":"小王"}'
+```
+
+### `POST /api/v1/group/create` 请求 / 响应
+
+**请求**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `members` | 是 | 除自己外至少 2 人。按客户端通讯录搜索,同事 / 外部联系人 / 微信用户都行 |
+| `name` | 否 | 群名。面板里没有命名框,所以是先建群再改名;留空则用客户端按成员拼的名字 |
+| `nickname` | 否 | 我在本群的昵称。建群(以及改名)成功后再打开群详情设置;留空则不改 |
+
+**响应**(群一旦建出来就是 HTTP 200 / `success: true`。改名或改昵称失败不回滚,错误写在下面两个字段里)
+
+| 字段 | 说明 |
+| --- | --- |
+| `success` | 群是否建出来 |
+| `members` | 实际勾上的人(`query` / `name` / `dept`) |
+| `member_count` | 含自己 |
+| `rid` | 新群的本地会话 RID;定位失败时为 `null` |
+| `name` | 改名成功时的群名 |
+| `nickname` | 改昵称成功时的值 |
+| `name_error` | 群建好了但改名失败,需要手动改 |
+| `nickname_error` | 群建好了但「我在本群的昵称」没改成,需要手动改 |
+| `error` | 建群本身失败时的原因 |
+
+```json
+{
+  "success": true,
+  "members": [
+    {"query": "陈涛", "name": "陈涛(水淼淼)", "dept": "增长产品部/业务成功部"},
+    {"query": "陈挺", "name": "陈挺", "dept": "增长产品部/业务成功部"}
+  ],
+  "member_count": 3,
+  "rid": 10778384972479757,
+  "name": "临时讨论组",
+  "nickname": "小王",
+  "error": null
+}
+```
+
+CLI 与 HTTP 走同一套代码:
+
+```bash
+wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组" --group-nickname "小王"
 ```
 
 ### 为什么外部成员只能走 UI(实测记录)
@@ -231,8 +276,14 @@ curl -X POST http://127.0.0.1:8090/api/v1/group/create \
 
 `name` 是「先建群、再改名」两步(面板里没有命名输入框):建完用建群前后的群 RID 差集
 定位新群,打开它、改标题、覆写、回车,**最后回库核验那个 RID 的群名真的变了**。
-改名失败不回滚群 —— 群已经建出来了,回滚更吓人,接口会在 `name_error` 里说清楚
-让你手动改。
+`nickname` 是第三步:打开群详情,改「我在本群的昵称」。**不要点会话标题** —— 那是改群名,
+会把昵称写进群名。入口是聊天区标题栏右侧「…」(侧栏开着时最左那个约 28×28 的按钮仍是「…」,
+最右是添加成员)。点开约 320 宽的群详情后,再点「我在本群的昵称」那一行,会弹出独立小窗,
+写入后点确定。昵称不进本地会话库,核验只能回读这个小窗。
+
+改名/改昵称失败都不回滚群 —— 群已经建出来了,回滚更吓人,接口会在 `name_error` /
+`nickname_error` 里说清楚让你手动改。改过群名之后再改昵称,核验用的是**现在的标题**,
+不再拿成员拼名去对,否则会把刚改好名的新群误判成别人的群。
 
 差集本身**不足以**证明那个新会话是你建的:这期间别人也可能把你拉进一个群,而 UI 锁
 只挡得住本机并发。所以差集之后还有两道:看到第一个新会话再等 `GROUP_APPEAR_SETTLE`
@@ -249,10 +300,15 @@ curl -X POST http://127.0.0.1:8090/api/v1/group/create \
   会先用哨兵值占住剪贴板再全选复制:剪贴板没变 = 没有输入框拿到焦点,直接中止 ——
   否则 `Cmd+V` + 回车会把群名当成一条消息发进别人的聊天里。
 
-只有两个位置没有 AX 元素、只能按主窗口原点取偏移去点:会话列表顶部的 `+`,和会话
-标题。量出来的常量迟早会被客户端改版打掉,所以它们都**不是「点了就算」**——点完
-必须看到成功信号(面板真的开了 / 输入框真的拿到了焦点),看不到就按候选偏移在附近
-再试,试中了记进 `.data/ui_offsets.json`,下次第一发就命中(`ui_offsets.py`)。
+只有少数位置没有 AX 元素、只能按主窗口取偏移去点:会话列表顶部的 `+`(相对左上角),
+旧版会话标题,以及打不开「…」时的兜底(相对窗口**右边缘**往里)。量出来的常量迟早会被
+客户端改版打掉,所以它们都**不是「点了就算」**——点完必须看到成功信号(面板真的开了 /
+输入框真的拿到了焦点),看不到就按候选偏移在附近再试,试中了记进 `.data/ui_offsets.json`,
+下次第一发就命中(`ui_offsets.py`)。
+
+这些偏移是相对窗口的。**挪动企微窗口一般不用改配置**(每次点击前会重新量 AX);
+窗口拉得太窄、全屏、或不在当前桌面,才可能点偏。点不中「…」可设
+`WECOM_SVR_UI_MORE_OFFSET`。
 
 试探的边界是刻意划死的,因为「乱点」本身就是风险:
 
@@ -638,7 +694,7 @@ wecom-svr-local --rid 3395103030 --image /tmp/a.png
 wecom-svr-local --rid 3395103030 --open-only
 
 # 拉群 / 改群名:和 /api/v1/group/* 是同一套代码,只是不用先起服务
-wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组"
+wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组" --group-nickname "小王"
 wecom-svr-local --rid 3395103030 --rename "客户群-新名字"
 ```
 

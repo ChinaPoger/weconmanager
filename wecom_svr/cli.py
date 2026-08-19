@@ -4,7 +4,7 @@
     wecom-svr-local --rid 3395103030 "测试"     # 按 RID 发消息
     wecom-svr-local --rid 3395103030 --image /tmp/a.png
     wecom-svr-local --rid 3395103030 --open-only
-    wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组"   # 拉群
+    wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组" --group-nickname "小王"
     wecom-svr-local --rid 3395103030 --rename "客户群-新名字"       # 改群名
 
 拉群/改名和 HTTP 那两个端点走的是同一个 local_group,行为完全一致(包括选人前
@@ -39,7 +39,9 @@ def _create_group(a: argparse.Namespace) -> None:
     信息不够: 得让人看见到底拉进来的是哪个部门的哪个人。
     """
     members = [m.strip() for m in a.group.split(",") if m.strip()]
-    result = create_group(members, name=a.group_name or "")
+    result = create_group(
+        members, name=a.group_name or "", nickname=a.group_nickname or ""
+    )
 
     if result.get("success") and not a.json:
         for m in result.get("members", []):
@@ -48,6 +50,8 @@ def _create_group(a: argparse.Namespace) -> None:
         # 群建出来了但名字没改上 —— 不能被一句「已建群」盖过去,那是要人手工补的
         if result.get("name_error"):
             print(f"⚠️  {result['name_error']}")
+        if result.get("nickname_error"):
+            print(f"⚠️  {result['nickname_error']}")
 
     _finish(result, a.json, "✅ 已建群(含自己共 {member_count} 人)")
 
@@ -75,6 +79,7 @@ def main() -> None:
     ap.add_argument("--group", "-g", metavar="成员1,成员2",
                     help="以本人身份拉群:成员逗号分隔,除自己外至少 2 个")
     ap.add_argument("--group-name", help="拉群时顺便把群名改掉(可选)")
+    ap.add_argument("--group-nickname", help="拉群时顺便改我在本群的昵称(可选)")
     ap.add_argument("--rename", metavar="新群名",
                     help="给一个已有的群改名(必须配合 --rid)")
     ap.add_argument("--json", "-j", action="store_true", help="JSON 输出")
