@@ -16,6 +16,17 @@ def _raise(exc):
     return fail
 
 
+@pytest.fixture(autouse=True)
+def _dont_talk_to_the_real_client(monkeypatch):
+    """校准成功后的窗口预热会跑 AppleScript,单测里一律短路。"""
+    monkeypatch.setattr(
+        startup_preflight.local_send, "_refresh_chat_window_bounds", lambda: (True, "ok")
+    )
+    monkeypatch.setattr(
+        startup_preflight.local_send, "_load_quartz_libraries", lambda: None
+    )
+
+
 def _settings(tmp_path, **updates) -> Settings:
     values = {
         "data_dir": tmp_path,
@@ -114,6 +125,25 @@ def test_ui_failure_degrades_readiness_without_blocking_startup(tmp_path, monkey
     assert result.ui_ready is False
     assert "UI 预检/校准失败" in caplog.text
     assert "服务继续启动" in caplog.text
+
+
+def test_learned_plus_offset_skips_opening_the_group_picker(tmp_path, monkeypatch):
+    """已经校准过就不要每次启动都弹「发起群聊」。"""
+    calls = []
+    monkeypatch.setattr(startup_preflight.messages, "refresh", lambda force=False: None)
+    monkeypatch.setattr(
+        startup_preflight.local_group,
+        "calibrate_ui",
+        lambda: calls.append("ui"),
+    )
+    monkeypatch.setattr(
+        startup_preflight.ui_offsets, "learned", lambda name, settings=None: (295, 29)
+    )
+
+    result = startup_preflight.run(_settings(tmp_path))
+
+    assert result.ui_ready is True
+    assert calls == []
 
 
 def test_collect_only_mode_skips_ui_but_keeps_database_gate(tmp_path, monkeypatch):
