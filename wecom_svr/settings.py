@@ -46,8 +46,8 @@ class Settings(BaseSettings):
     wecom_timeout: int = 30
 
     # ── 新机器启动门禁 ─────────────────────────────────────────────────
-    # 默认在监听端口前验证/初始化本地数据库和客户端 UI。纯官方 API 部署可整体关闭;
-    # 只采集数据库、不操控界面的部署可只关 startup_ui_check。
+    # 默认在已经占住监听端口后验证/初始化本地数据库和客户端 UI。
+    # 纯官方 API 部署可整体关闭;只采集数据库、不操控界面的部署可只关 startup_ui_check。
     startup_preflight_enabled: bool = True
     startup_auto_init: bool = True
     startup_ui_check: bool = True

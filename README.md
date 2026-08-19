@@ -64,14 +64,24 @@ wecom-svr --port 8090 --reload
 
 启动后 OpenAPI 文档在 <http://127.0.0.1:8090/docs>。
 
+本机同时只该有一份服务。入口会先抢 `127.0.0.1:8090` 和 `.data/wecom-svr.lock`,再跑启动预检;
+端口或锁已被占用时立刻退出,不会再去打开企业微信面板。不要用
+`launchctl submit --keepalive` 叠第二份实例 —— 那会在「先弹框再 bind 失败」上打成死循环。常驻请用:
+
+```bash
+scripts/launchd.sh start    # KeepAlive 只在非 0 退出时拉起,并至少隔 10 秒
+scripts/launchd.sh status
+scripts/launchd.sh stop
+```
+
 ### 新机器首次启动
 
-默认采用“自动初始化 + 严格门禁”:Uvicorn 在端口进入 ready 前先完成以下检查:
+默认采用“自动初始化 + 严格门禁”:先占住监听端口,再完成以下检查:
 
 1. 用本机 key 刷新解密 `Info.db` / `Session.db`。
 2. key 不可用时自动运行 `decrypt/macos/find_key_fast.py`,再重新验证数据库。
 3. 打开并立即取消“发起群聊”面板,验证辅助功能/自动化权限并校准本机 `+` 偏移;
-   首次成功后生成 `.data/ui_offsets.json`。
+   首次成功后生成 `.data/ui_offsets.json`。之后再启动只要这份文件还在,就不会再打开面板。
 
 如果企业微信上残留了上一次操作留下的弹出面板,启动预检和后续发起群聊会先自动
 取消它;已知的选人面板点击“取消”,其它面板发送一次 Escape 并确认已经关闭。
@@ -106,7 +116,7 @@ UI 接口时再返回错误。这样不会因为 macOS 权限或客户端窗口�
 | `WECOM_SVR_API_TOKEN` | 空 | 留空则**不鉴权**(仅本地,勿暴露公网) |
 | `WECOM_SVR_STARTUP_PREFLIGHT_ENABLED` | `true` | 启动前检查本地数据库和客户端 UI;数据库失败阻止启动,UI 失败降级 |
 | `WECOM_SVR_STARTUP_AUTO_INIT` | `true` | key 无效时自动运行 `find_key_fast.py` |
-| `WECOM_SVR_STARTUP_UI_CHECK` | `true` | 首次/每次启动无副作用校准 `+` 偏移;采集-only 可关闭 |
+| `WECOM_SVR_STARTUP_UI_CHECK` | `true` | 首次启动校准 `+` 偏移;已有 `.data/ui_offsets.json` 时跳过打开面板;采集-only 可关闭 |
 | `WECOM_SVR_STARTUP_KEY_TIMEOUT` | `180` | 自动取 key 的超时秒数 |
 | `WECOM_CORPID` / `WECOM_SECRET` / `WECOM_AGENTID` | 空 | 自建应用凭证,留空回落到 `config.json` |
 | `WECOM_SVR_MARS_*` | 见下 | 群消息同步到 mars,默认全关 |

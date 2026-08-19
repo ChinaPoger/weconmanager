@@ -1,10 +1,16 @@
 """启动服务: `python -m wecom_svr` 或 `wecom-svr`。"""
 import argparse
 import logging
+import sys
 
 import uvicorn
+from uvicorn import Config, Server
 
 from .settings import get_settings
+from .singleton import InstanceTaken, claim, try_lock
+
+# --reload 路径里 uvicorn 自己先 bind;文件锁的 fd 必须一直活着,关掉就等于放锁。
+_HELD_LOCK_FDS: list[int] = []
 
 
 def main() -> None:
@@ -24,13 +30,48 @@ def main() -> None:
     if not settings.auth_enabled:
         print("🔓 未启用鉴权(仅本地使用,勿暴露公网)")
 
-    uvicorn.run(
-        "wecom_svr.main:app",
-        host=a.host,
-        port=a.port,
-        reload=a.reload,
-        log_level=a.log_level,
-    )
+    # Uvicorn 默认先跑 lifespan(会弹企业微信)再 bind。端口被占时就会
+    # 「先弹框再 exit 3」,KeepAlive 一开就是死循环。正式启动必须先把端口
+    # 和文件锁拿到手;--reload 路径里 uvicorn 自己会先 bind,这里只抢文件锁。
+    if a.reload:
+        _claim_lock_or_exit(settings.data_dir)
+        uvicorn.run(
+            "wecom_svr.main:app",
+            host=a.host,
+            port=a.port,
+            reload=True,
+            log_level=a.log_level,
+        )
+        return
+
+    try:
+        claimed = claim(a.host, a.port, settings.data_dir)
+    except InstanceTaken as e:
+        print(f"❌ {e}")
+        sys.exit(0 if e.ours else 1)
+
+    try:
+        config = Config(
+            "wecom_svr.main:app",
+            host=a.host,
+            port=a.port,
+            log_level=a.log_level,
+        )
+        Server(config).run(sockets=[claimed.sock])
+    finally:
+        claimed.close()
+
+
+def _claim_lock_or_exit(data_dir) -> None:
+    fd = try_lock(data_dir)
+    if fd is None:
+        print(
+            f"❌ 另一份 wecom-svr 正在运行(锁文件 {data_dir / 'wecom-svr.lock'}),"
+            "本次启动已放弃,不会再去操控企业微信"
+        )
+        sys.exit(0)
+    if fd >= 0:
+        _HELD_LOCK_FDS.append(fd)
 
 
 if __name__ == "__main__":

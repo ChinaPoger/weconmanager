@@ -16,7 +16,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 
-from . import local_group, local_send, localdb, messages
+from . import local_group, local_send, localdb, messages, ui_offsets
 from .localdb import LocalDataError
 from .settings import Settings, get_agent_home
 
@@ -135,8 +135,14 @@ def run(settings: Settings) -> PreflightResult:
 
     ui_ready = False
     if settings.startup_ui_check:
+        # 已经记住过 "+" 偏移就不要每次启动都打开「发起群聊」面板。
+        # 校准本身没有业务副作用,但会抢焦点;再叠上 KeepAlive 重启就会变成弹框风暴。
+        skip_picker = ui_offsets.learned("plus", settings) is not None
         try:
-            local_group.calibrate_ui()
+            if skip_picker:
+                log.info("已有本机 UI 偏移记录,跳过启动时打开「发起群聊」面板")
+            else:
+                local_group.calibrate_ui()
         except Exception as e:
             log.warning(
                 "企业微信 UI 预检/校准失败,服务继续启动;本地 UI 接口调用时将报错: %s。"
