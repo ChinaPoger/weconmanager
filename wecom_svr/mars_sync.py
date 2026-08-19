@@ -18,7 +18,8 @@ hook,models.MessageHook 的字段名带着 QQ 时代的痕迹(groupnumber/sender
   - **群内顺序有意义**: mars 的 SetTimeline 只在同一群找参照物。每群严格按
     (send_time, LID) 升序;跨群可以独立推进,HTTP 第一阶段仍整体串行。
   - **会顺手建群**: hook 里的 updateGroupInfo 会 upsert qq_groups。第一次推
-    某个群就等于在 mars 建了这个群的档案,群名取自本地会话名。
+    某个群就等于在 mars 建了这个群的档案,群名取自本地会话名;库里还没写下名字
+    的新建群用 `未命名群-{rid}`,改名后下一条消息会把档案更新成真名。
   - **hook 有非幂等副作用**: NightAlert 会跳过 Wework,BigCustomerAlert 只认写死的
     `R:` 群号,销售工单只认显式配置的群号;但 SyncToSlack 会处理所有 Wework 消息,
     robotLastActiveTime 也无条件执行。迁移/回滚不能把重推当成免费操作。
@@ -237,11 +238,22 @@ def _backup_v1_state(settings: Settings) -> None:
 
 # ─── 映射 ───────────────────────────────────────────────────────────────
 
-def group_name(name: str, settings: Settings) -> str:
-    """按配置给群名加上 mars 的企微群前缀;默认保持原名。
+UNNAMED_GROUP_FALLBACK = "未命名群"
 
-    配成 `work-` 时,mars 可借此识别企微群并排除相关客户未响应告警。
+
+def group_name(name: str, settings: Settings, rid: int | str | None = None) -> str:
+    """本地会话名 → 推给 mars 的群名。
+
+    企微新建群库里 name 经常是空的(客户端按成员现拼显示名,不落库)。空名不能
+    原样推:mars 用 GroupName 派生 Slack channel,空串会撞到一起。占位名带 RID,
+    群一改名,后续消息会把档案更新成真名。
+
+    配了 `mars_group_name_prefix`(例如 `work-`)时再加前缀,mars 可借此识别
+    企微群并排除相关客户未响应告警。
     """
+    name = (name or "").strip()
+    if not name:
+        name = f"{UNNAMED_GROUP_FALLBACK}-{rid}" if rid is not None else UNNAMED_GROUP_FALLBACK
     prefix = settings.mars_group_name_prefix
     if not prefix or name.startswith(prefix):
         return name
@@ -502,7 +514,7 @@ def to_hook(msg: dict, settings: Settings) -> dict:
         # 本地消息没有客户 UID 时保持 0,与 Mars MessageHook 的默认值一致。
         "uid": int(msg.get("uid") or 0),
         "groupNumber": f"{settings.mars_group_prefix}{msg['rid']}",
-        "groupName": group_name(msg.get("group_name") or "", settings),
+        "groupName": group_name(msg.get("group_name") or "", settings, msg.get("rid")),
         "senderNumber": sender_number,
         "userid": userid,
         "corpid": corpid,
@@ -646,8 +658,11 @@ class SyncResult:
 def target_rids(settings: Settings) -> tuple[list[int], list[str], list[str]]:
     """解析同步范围 → (rids, 命中的群名, 没匹配上的选择器)。"""
     if settings.mars_sync_all_groups:
-        groups = messages.list_groups(limit=None)
-        return [int(g["rid"]) for g in groups], [g["name"] for g in groups], []
+        # 无名群也要进同步。企微新建群库里 name 经常是空的,丢掉它们,改名后
+        # 会被当成全新群从 latest 起跳,中间那段消息永久漏掉。
+        groups = messages.list_groups(include_unnamed=True, limit=None)
+        names = [group_name(g["name"], settings, g["rid"]) for g in groups]
+        return [int(g["rid"]) for g in groups], names, []
 
     selectors = settings.mars_group_selectors
     if not selectors:
@@ -656,7 +671,8 @@ def target_rids(settings: Settings) -> tuple[list[int], list[str], list[str]]:
             "或者显式设置 WECOM_SVR_MARS_SYNC_ALL_GROUPS=true;候选见 GET /api/v1/mars/sync/groups"
         )
     hit, missing = messages.resolve_groups(selectors)
-    return [g["rid"] for g in hit], [g["name"] for g in hit], missing
+    names = [group_name(g["name"], settings, g["rid"]) for g in hit]
+    return [g["rid"] for g in hit], names, missing
 
 
 def cursor_for_backfill(seconds: int) -> Cursor:

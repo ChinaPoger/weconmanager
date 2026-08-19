@@ -653,7 +653,9 @@ def list_groups(
     """列出群会话(挑同步白名单用),按最近活跃排序。
 
     include_unnamed 才会带上 `name = ''` 的群 —— **刚建出来的群名字正是空的**
-    (客户端按成员现拼出显示名,库里不存),拉群时靠前后差集认新群要用到。
+    (客户端按成员现拼出显示名,库里不存)。拉群时靠前后差集认新群、以及
+    `sync_all_groups` / 按 RID 解析白名单,都必须带上;默认关掉只是给挑白名单
+    的界面用,避免一堆空名占位。
     limit=None 表示不截断:改名后回库核验要能查到任意一个老群,不能只看前 200。
     """
     sql = "SELECT RID, name, sort_time FROM CONVERSATION WHERE conversationtype = ?"
@@ -678,9 +680,9 @@ def resolve_groups(selectors: Iterable[str]) -> tuple[list[dict], list[str]]:
 
     白名单写群名更好读,但群名会被改;两种都收,让调用方自己权衡。
     """
-    # 同步白名单不能受“挑选界面最多 200 条”的限制。一个长期不活跃的群仍然
-    # 必须能按名字/RID 命中。
-    groups = list_groups(limit=None)
+    # 同步白名单不能受“挑选界面最多 200 条”的限制,也不能丢掉无名群 —— 按 RID
+    # 点名时,库里还没写下名字的存量群必须能命中。
+    groups = list_groups(include_unnamed=True, limit=None)
     by_rid = {str(g["rid"]): g for g in groups}
     by_name = {g["name"]: g for g in groups}
 
