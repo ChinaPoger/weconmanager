@@ -1212,7 +1212,9 @@ def _header_action_button_points() -> list[tuple[int, int]]:
     set p to position of b
     set s to size of b
     if (item 1 of s) ≥ 26 and (item 1 of s) ≤ 30 and (item 2 of s) ≥ 26 and (item 2 of s) ≤ 30 then
-      set end of hits to (((item 1 of p) + (item 1 of s) / 2) as integer as string) & "," & (((item 2 of p) + (item 2 of s) / 2) as integer as string)
+      set hx to ((item 1 of p) + (item 1 of s) / 2) as integer as string
+      set hy to ((item 2 of p) + (item 2 of s) / 2) as integer as string
+      set end of hits to hx & "," & hy
     end if
   end repeat
   set AppleScript's text item delimiters to linefeed
@@ -1321,7 +1323,11 @@ def _group_info_dialog_bounds() -> tuple[int, int, int, int] | None:
     set s to size of w
     if (item 1 of s) ≥ 280 and (item 1 of s) ≤ 360 and (item 2 of s) ≥ 500 then
       set p to position of w
-      return (item 1 of p as string) & "," & (item 2 of p as string) & "," & (item 1 of s as string) & "," & (item 2 of s as string)
+      set px to item 1 of p as string
+      set py to item 2 of p as string
+      set sx to item 1 of s as string
+      set sy to item 2 of s as string
+      return px & "," & py & "," & sx & "," & sy
     end if
   end repeat
   return "NONE"
@@ -1383,7 +1389,11 @@ def _group_info_setting_rows() -> list[tuple[int, int, int, int]]:
           set p to position of rw
           set sz to size of rw
           if (item 2 of sz) ≥ 30 and (item 2 of sz) ≤ 50 then
-            set end of acc to (item 1 of p as string) & "," & (item 2 of p as string) & "," & (item 1 of sz as string) & "," & (item 2 of sz as string)
+            set px to item 1 of p as string
+            set py to item 2 of p as string
+            set sx to item 1 of sz as string
+            set sy to item 2 of sz as string
+            set end of acc to px & "," & py & "," & sx & "," & sy
           end if
         end repeat
       end try
@@ -1424,7 +1434,7 @@ def _probe_nickname_in_dialog() -> dict:
     bounds = _group_info_dialog_bounds()
     if bounds is None:
         return {"kind": "NONE", "value": "", "x": 0, "y": 0}
-    x, y, w, h = bounds
+    _, y, _, h = bounds
     for rx, ry, rw, rh in _group_info_setting_rows():
         cy = ry + rh // 2
         if cy > y + h - 16:
@@ -1436,7 +1446,7 @@ def _probe_nickname_in_dialog() -> dict:
             return dialog
         focused = _focused_text_field()
         now = _group_info_dialog_bounds() or bounds
-        if _field_in_group_info(focused, now):
+        if focused is not None and _field_in_group_info(focused, now):
             return {
                 "kind": "FIELD",
                 "value": focused.get("value") or "",
@@ -1650,12 +1660,14 @@ def _set_nickname_locked(
         if _nickname_dialog_field() is not None:
             _write_nickname_dialog(nickname)
             time.sleep(0.5)
-            if _nickname_dialog_field() is None or nickname in ((_nickname_dialog_field() or {}).get("value") or ""):
+            dialog = _nickname_dialog_field()
+            current = (dialog or {}).get("value") or ""
+            if dialog is None or nickname in current:
                 return {"success": True, "rid": int(rid), "nickname": nickname, "error": None}
             return {
                 "success": False,
                 "rid": int(rid),
-                "error": f"点了确定但昵称对话框还在,读到的是 {(_nickname_dialog_field() or {}).get('value')!r}",
+                "error": f"点了确定但昵称对话框还在,读到的是 {current!r}",
             }
         focused_before = _focused_text_field()
         _write_focused_nickname(nickname)

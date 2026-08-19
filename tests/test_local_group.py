@@ -771,7 +771,11 @@ def test_create_with_name_and_nickname_does_both(fake, monkeypatch):
             ) or {"success": True}
         ),
     )
-    monkeypatch.setattr(local_group, "_confirm", lambda: names.update({42: ""}) or setattr(fake, "sheet_open", False))
+    monkeypatch.setattr(
+        local_group,
+        "_confirm",
+        lambda: names.update({42: ""}) or setattr(fake, "sheet_open", False),
+    )
 
     r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组", nickname="小王")
     assert r["success"] is True
@@ -845,7 +849,11 @@ def test_set_nickname_accepts_the_title_after_a_successful_rename(rename_env, mo
     monkeypatch.setattr(local_group, "_close_group_info", lambda: None)
     monkeypatch.setattr(local_group, "_front_window_mentions", lambda text: text == state["wrote"])
     monkeypatch.setattr(local_group, "_focused_text_field", lambda: None)
-    monkeypatch.setattr(local_group, "_probe_nickname_in_dialog", lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0})
+    monkeypatch.setattr(
+        local_group,
+        "_probe_nickname_in_dialog",
+        lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0},
+    )
     monkeypatch.setattr(local_group, "_nickname_dialog_field", lambda: None)
 
     r = local_group._set_nickname_locked(77, "小王", expect_title="临时讨论组")
@@ -874,7 +882,11 @@ def test_set_nickname_writes_the_focused_field_and_verifies(rename_env, monkeypa
     monkeypatch.setattr(local_group, "_close_group_info", lambda: state.update(closed=True))
     monkeypatch.setattr(local_group, "_front_window_mentions", lambda text: text == state["wrote"])
     monkeypatch.setattr(local_group, "_focused_text_field", lambda: None)
-    monkeypatch.setattr(local_group, "_probe_nickname_in_dialog", lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0})
+    monkeypatch.setattr(
+        local_group,
+        "_probe_nickname_in_dialog",
+        lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0},
+    )
     monkeypatch.setattr(local_group, "_nickname_dialog_field", lambda: None)
 
     r = local_group._set_nickname_locked(77, "小王", expect_members=["陈挺", "陈涛"])
