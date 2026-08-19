@@ -170,6 +170,22 @@ def test_group_name_prefix_is_not_doubled(settings):
     assert mars_sync.to_hook(msg, s)["groupName"] == "work-已经带前缀了"
 
 
+def test_empty_group_name_uses_rid_placeholder(settings):
+    """无名群不能原样推空串:mars 用 GroupName 派生 Slack channel,会撞到一起。"""
+    msg = {**_msg(1, 1, "x"), "group_name": ""}
+    assert mars_sync.to_hook(msg, settings)["groupName"] == f"未命名群-{GROUP['rid']}"
+
+
+def test_empty_group_name_placeholder_keeps_prefix(settings):
+    s = settings.model_copy(update={"mars_group_name_prefix": "work-"})
+    msg = {**_msg(1, 1, "x"), "group_name": "   "}
+    assert mars_sync.to_hook(msg, s)["groupName"] == f"work-未命名群-{GROUP['rid']}"
+
+
+def test_empty_group_name_without_rid_still_has_a_fallback(settings):
+    assert mars_sync.group_name("", settings) == "未命名群"
+
+
 def test_group_number_is_prefixed_to_avoid_colliding_with_qq_groups(settings):
     """mars 的 qq_groups.qq 是全局唯一键,裸 RID 可能撞上真实 QQ 群号。"""
     hook = mars_sync.to_hook(_msg(1, 1, "x"), settings)
@@ -828,6 +844,47 @@ def test_sync_all_groups_ignores_white_list(local, pushed, tmp_path, monkeypatch
     mars_sync.save_state(State(cursor=Cursor(800, 0)), s)
     run(mars_sync.sync_once(s))
     assert [h["message"] for h in pushed["sent"]] == ["a", "b"]
+
+
+def test_sync_all_groups_asks_for_unnamed_groups(settings, monkeypatch):
+    """无名群丢掉后,改名会被当成全新群从 latest 起跳。"""
+    seen = {}
+
+    def list_groups(search="", include_unnamed=False, limit=200):
+        seen["include_unnamed"] = include_unnamed
+        return [GROUP]
+
+    monkeypatch.setattr(messages, "list_groups", list_groups)
+    s = settings.model_copy(update={"mars_sync_all_groups": True, "mars_sync_groups": ""})
+    rids, names, missing = mars_sync.target_rids(s)
+    assert seen["include_unnamed"] is True
+    assert rids == [GROUP["rid"]]
+    assert names == [GROUP["name"]]
+    assert missing == []
+
+
+def test_sync_all_groups_gives_unnamed_groups_a_placeholder_name(settings, monkeypatch):
+    unnamed = {"rid": 10796022576028616, "name": "", "sort_time": 80}
+    monkeypatch.setattr(messages, "list_groups", lambda search="", **kw: [unnamed])
+    s = settings.model_copy(update={"mars_sync_all_groups": True, "mars_sync_groups": ""})
+    rids, names, missing = mars_sync.target_rids(s)
+    assert rids == [unnamed["rid"]]
+    assert names == ["未命名群-10796022576028616"]
+    assert missing == []
+
+
+def test_whitelist_can_select_an_unnamed_group_by_rid(settings, monkeypatch):
+    unnamed = {"rid": 10796022576028616, "name": "", "sort_time": 80}
+
+    def list_groups(search="", include_unnamed=False, limit=200):
+        return [unnamed] if include_unnamed else []
+
+    monkeypatch.setattr(messages, "list_groups", list_groups)
+    s = settings.model_copy(update={"mars_sync_groups": "10796022576028616"})
+    rids, names, missing = mars_sync.target_rids(s)
+    assert rids == [unnamed["rid"]]
+    assert names == ["未命名群-10796022576028616"]
+    assert missing == []
 
 
 def test_unknown_group_name_is_reported_not_silently_ignored(local, pushed, tmp_path):
