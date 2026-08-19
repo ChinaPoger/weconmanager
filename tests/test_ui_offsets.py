@@ -97,6 +97,11 @@ def test_unknown_position_is_a_programming_error(settings):
         ui_offsets.primary("nope", settings)
 
 
+def test_more_offset_is_from_the_right_edge(settings):
+    assert ui_offsets.DEFAULTS["more"] == (28, 33)
+    assert ui_offsets.candidates("more", settings)[0] == (28, 33)
+
+
 def test_describe_says_where_the_number_came_from(settings, tmp_path):
     assert "默认值" in ui_offsets.describe("plus", settings)
     ui_offsets.remember("plus", (275, 29), settings)

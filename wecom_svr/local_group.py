@@ -518,7 +518,9 @@ def calibrate_ui() -> dict:
 
 # ─── 公开 API ──────────────────────────────────────────────────────────
 
-def create_group(members: list[str], name: str = "", return_rid: bool = False) -> dict:
+def create_group(
+    members: list[str], name: str = "", return_rid: bool = False, nickname: str = ""
+) -> dict:
     """以本人身份拉群。你自己自动是群主,不用写进 members。
 
     ``return_rid`` 用于需要把新群关联回业务单据的调用方。客户端建群
@@ -529,6 +531,7 @@ def create_group(members: list[str], name: str = "", return_rid: bool = False) -
         name: 群名。选人面板里没有命名输入框,所以是「先建群、再改名」两步;
               改名失败不会回滚群 —— 群已经建出来了,回滚反而更吓人。
         return_rid: 是否定位并返回新群的本地会话 RID。
+        nickname: 我在该群中的昵称。建群成功并定位到 RID 后设置。
 
     Returns:
         {"success": bool, "members": [...], "member_count": int, "rid": ..., "error": ...}
@@ -555,7 +558,10 @@ def create_group(members: list[str], name: str = "", return_rid: bool = False) -
 
     wanted_name = ""
     if name and name.strip():
-        wanted_name = _check_name(name)
+        wanted_name = _check_name(name, "群名")
+    wanted_nickname = ""
+    if nickname and nickname.strip():
+        wanted_nickname = _check_name(nickname, "群昵称")
 
     # 快照 → 建群 → 差集 → 核对标题 → 改名,全程一次持锁。差集是靠「新出现的群
     # RID」认新群(新群的 name 是空的,只能这么认),中间放开锁的话,另一个并发
@@ -565,7 +571,7 @@ def create_group(members: list[str], name: str = "", return_rid: bool = False) -
     # RID」。所以差集选出来的候选还要再过一道标题核对(_rename_locked 的
     # expect_members),对不上就不改名。
     with ui_session("拉群"):
-        before = set(_group_names()) if (wanted_name or return_rid) else set()
+        before = set(_group_names()) if (wanted_name or wanted_nickname or return_rid) else set()
 
         _activate()
         _open_picker()
@@ -589,37 +595,50 @@ def create_group(members: list[str], name: str = "", return_rid: bool = False) -
             "name": None,
             "error": None,
         }
-        if not wanted_name and not return_rid:
+        if not wanted_name and not wanted_nickname and not return_rid:
             return result
 
         new_rids = _wait_new_group_rids(before)
         if len(new_rids) != 1:
+            locate_err = (
+                f"等待本地会话落库后仍没能唯一定位新建的会话(新增 {len(new_rids)} 个)"
+            )
             if wanted_name:
-                result["name_error"] = (
-                    "群建好了,等待本地会话落库后仍没能唯一定位新建的会话"
-                    f"(新增 {len(new_rids)} 个),群名没改成。请手动改名。"
+                result["name_error"] = f"群建好了,{locate_err},群名没改成。请手动改名。"
+            if wanted_nickname:
+                result["nickname_error"] = (
+                    f"群建好了,{locate_err},我在本群的昵称没改成。请手动修改。"
                 )
+            if not wanted_name and not wanted_nickname:
+                result["rid_error"] = f"群建好了,但{locate_err}"
+            return result
+
+        result["rid"] = new_rids[0]
+        expected = [p["name"] for p in picked]
+        # 改完群名后标题就不再是成员拼名。后面改昵称必须改核「现在这个标题」,
+        # 不能再用「像刚建出来的群」去拦,否则会把已经改好名的新群误判成别人的群。
+        expect_title = None
+        if wanted_name:
+            renamed = _rename_locked(new_rids[0], wanted_name, expect_members=expected)
+            if renamed.get("success"):
+                result["name"] = wanted_name
+                expect_title = wanted_name
             else:
-                result["rid_error"] = (
-                    "群建好了,但等待本地会话落库后未能唯一定位新群"
-                    f"(新增 {len(new_rids)} 个)"
-                )
-            return result
+                result["name_error"] = f"群建好了,但改名失败: {renamed.get('error')}"
+                if renamed.get("unrelated"):
+                    return result
 
-        if not wanted_name:
-            result["rid"] = new_rids[0]
-            return result
-
-        renamed = _rename_locked(
-            new_rids[0], wanted_name, expect_members=[p["name"] for p in picked]
-        )
-        if not renamed.get("unrelated"):
-            # 归属没核对上的那个 RID 不是本次建的群,不能当成结果报回去
-            result["rid"] = new_rids[0]
-        if renamed.get("success"):
-            result["name"] = wanted_name
-        else:
-            result["name_error"] = f"群建好了,但改名失败: {renamed.get('error')}"
+        if wanted_nickname:
+            nicked = _set_nickname_locked(
+                new_rids[0],
+                wanted_nickname,
+                expect_members=None if expect_title else expected,
+                expect_title=expect_title,
+            )
+            if nicked.get("success"):
+                result["nickname"] = wanted_nickname
+            else:
+                result["nickname_error"] = f"群建好了,但设置我在本群的昵称失败: {nicked.get('error')}"
         return result
 
 
@@ -728,6 +747,20 @@ def _window_point(dx: int, dy: int) -> tuple[int, int]:
     out = _osa(_MAIN_WINDOW + f'''
   set p to position of mainWin
   return ((item 1 of p) + {dx} as string) & "," & ((item 2 of p) + {dy} as string)
+''')
+    x, _, y = out.strip().strip('"').partition(",")
+    return int(x), int(y)
+
+
+def _window_point_from_right(dx: int, dy: int) -> tuple[int, int]:
+    """把「相对主窗口右上角往里的偏移」换算成屏幕坐标。
+
+    「更多」钉在聊天区标题栏最右侧,窗口一拉宽,相对左上角的 x 就废了。
+    """
+    out = _osa(_MAIN_WINDOW + f'''
+  set p to position of mainWin
+  set s to size of mainWin
+  return ((item 1 of p) + (item 1 of s) - {dx} as string) & "," & ((item 2 of p) + {dy} as string)
 ''')
     x, _, y = out.strip().strip('"').partition(",")
     return int(x), int(y)
@@ -912,12 +945,745 @@ def _rename_locked(rid: int, new_name: str, expect_members: list[str] | None = N
     }
 
 
-def _check_name(name: str) -> str:
+_NICK_HINTS = (
+    "本群的昵称",
+    "群昵称",
+    "My Alias",
+    "Alias in Group",
+    "nickname",
+    "Nick name",
+)
+
+
+def _looks_like_nickname_hint(text: str) -> bool:
+    raw = text or ""
+    lowered = raw.lower()
+    return any(
+        (hint.lower() in lowered) if hint.isascii() else (hint in raw)
+        for hint in _NICK_HINTS
+    )
+
+
+def _dump_ui_hints() -> str:
+    """浅扫所有窗口和 sheet 的控件提示。群详情是独立对话框,不能只看主窗口。
+
+    不用 entire contents:主窗口那棵 CEF 树又大又慢,还容易把 role 这类保留字踩爆。
+    坐标必须在 process tell 里当场读,丢给外面的 handler 会变成 0,0。
+    """
+    ok, out = _run_applescript(
+        '''
+tell application "System Events" to tell process "企业微信"
+  set acc to {}
+  repeat with w in windows
+    set winW to 9999
+    try
+      set winW to item 1 of (size of w)
+    end try
+    set maxDepth to 3
+    if winW < 600 then set maxDepth to 5
+    try
+      repeat with e1 in (UI elements of w)
+        set end of acc to my lineOf(e1)
+        if maxDepth ≥ 2 then
+          try
+            repeat with e2 in (UI elements of e1)
+              set end of acc to my lineOf(e2)
+              if maxDepth ≥ 3 then
+                try
+                  repeat with e3 in (UI elements of e2)
+                    set end of acc to my lineOf(e3)
+                    if maxDepth ≥ 4 then
+                      try
+                        repeat with e4 in (UI elements of e3)
+                          set end of acc to my lineOf(e4)
+                          if maxDepth ≥ 5 then
+                            try
+                              repeat with e5 in (UI elements of e4)
+                                set end of acc to my lineOf(e5)
+                              end repeat
+                            end try
+                          end if
+                        end repeat
+                      end try
+                    end if
+                  end repeat
+                end try
+              end if
+            end repeat
+          end try
+        end if
+      end repeat
+    end try
+    try
+      repeat with sh in (sheets of w)
+        try
+          repeat with e1 in (UI elements of sh)
+            set end of acc to my lineOf(e1)
+            try
+              repeat with e2 in (UI elements of e1)
+                set end of acc to my lineOf(e2)
+                try
+                  repeat with e3 in (UI elements of e2)
+                    set end of acc to my lineOf(e3)
+                    try
+                      repeat with e4 in (UI elements of e3)
+                        set end of acc to my lineOf(e4)
+                      end repeat
+                    end try
+                  end repeat
+                end try
+              end repeat
+            end try
+          end repeat
+        end try
+      end repeat
+    end try
+  end repeat
+  set AppleScript's text item delimiters to linefeed
+  return acc as text
+end tell
+
+on lineOf(theElem)
+  tell application "System Events"
+    set elemRole to ""
+    try
+      set elemRole to role of theElem as text
+    end try
+    set hintText to ""
+    try
+      set hintText to hintText & (description of theElem as text)
+    end try
+    try
+      set hintText to hintText & "/" & (name of theElem as text)
+    end try
+    try
+      set hintText to hintText & "/" & (value of theElem as text)
+    end try
+    set posX to 0
+    set posY to 0
+    try
+      set posX to item 1 of (position of theElem)
+      set posY to item 2 of (position of theElem)
+    end try
+    return elemRole & tab & hintText & tab & (posX as string) & "," & (posY as string)
+  end tell
+end lineOf
+''',
+        timeout=25,
+    )
+    if not ok:
+        raise LocalGroupError(f"扫描群详情控件失败: {out}")
+    return out
+
+
+def _parse_hint_line(line: str) -> tuple[str, str, int, int] | None:
+    role, sep, rest = line.partition("\t")
+    if not sep:
+        return None
+    hint, _, pos = rest.partition("\t")
+    x_s, _, y_s = pos.partition(",")
+    try:
+        return role, hint, int(x_s), int(y_s)
+    except ValueError:
+        return role, hint, 0, 0
+
+
+def _nickname_dialog_field() -> dict | None:
+    """找独立的「我在本群的昵称」小窗里的输入框。
+
+    点群详情里那一行后,企微会再弹出这个 360x190 的对话框,带确定/取消。
+    """
+    out = _osa('''
+  repeat with w in windows
+    set hit to false
+    try
+      repeat with e in (UI elements of w)
+        set hintText to ""
+        try
+          set hintText to hintText & (value of e as text)
+        end try
+        try
+          set hintText to hintText & (name of e as text)
+        end try
+        if hintText contains "我在本群的昵称" or hintText contains "My Alias" then
+          set hit to true
+          exit repeat
+        end if
+      end repeat
+    end try
+    if hit then
+      repeat with e in (UI elements of w)
+        set elemRole to ""
+        try
+          set elemRole to role of e as text
+        end try
+        if elemRole is "AXTextField" or elemRole is "AXTextArea" then
+          set v to ""
+          try
+            set v to value of e as text
+          end try
+          set p to position of e
+          return elemRole & tab & v & tab & (item 1 of p as string) & "," & (item 2 of p as string)
+        end if
+      end repeat
+      return "ROW\t\t0,0"
+    end if
+  end repeat
+  return "NONE"
+''')
+    raw = (out or "").strip().strip('"')
+    if not raw or raw == "NONE":
+        return None
+    role, sep, rest = raw.partition("\t")
+    if not sep:
+        return None
+    value, _, pos = rest.partition("\t")
+    x_s, _, y_s = pos.partition(",")
+    try:
+        x, y = int(x_s), int(y_s)
+    except ValueError:
+        x, y = 0, 0
+    kind = "FIELD" if role in {"AXTextField", "AXTextArea"} else "ROW"
+    return {"kind": kind, "value": value, "x": x, "y": y, "role": role}
+
+
+def _scan_nickname_ui() -> dict:
+    """在所有窗口里找「我在本群的昵称」控件。
+
+    返回 {kind, value, x, y}:
+      FIELD —— 已经是可写输入框
+      ROW   —— 还是一行静态文字,要点一下才会变成输入框
+      NONE  —— 详情面板大概还没打开
+    """
+    dialog = _nickname_dialog_field()
+    if dialog is not None:
+        return dialog
+    for line in (_dump_ui_hints() or "").splitlines():
+        parsed = _parse_hint_line(line)
+        if parsed is None:
+            continue
+        role, hint, x, y = parsed
+        if not _looks_like_nickname_hint(hint):
+            continue
+        kind = "FIELD" if role in {"AXTextField", "AXTextArea"} else "ROW"
+        return {"kind": kind, "value": hint, "x": x, "y": y}
+    return {"kind": "NONE", "value": "", "x": 0, "y": 0}
+
+
+def _front_window_mentions(text: str) -> bool:
+    """群详情里昵称和标签常常是两个控件,不能只盯着带「昵称」字样的那一行。"""
+    if not text:
+        return False
+    blob = _dump_ui_hints() or ""
+    return text in blob
+
+
+def _try_press_named_button(names: tuple[str, ...]) -> bool:
+    quoted = ", ".join(f'"{_escape(n)}"' for n in names)
+    out = _osa(f'''
+  set wanted to {{{quoted}}}
+  set target to missing value
+  repeat with b in (buttons of front window)
+    set n to ""
+    try
+      set n to name of b as text
+    end try
+    if n is in wanted then
+      set target to contents of b
+      exit repeat
+    end if
+  end repeat
+  if target is missing value then return "NONE"
+  perform action "AXPress" of target
+  return "OK"
+''')
+    return out.strip().strip('"') == "OK"
+
+
+def _header_action_button_points() -> list[tuple[int, int]]:
+    """聊天区标题栏右侧那排约 28x28 的按钮,按从左到右排序。
+
+    实测是: 更多 / 智能总结 / 添加成员。点最右边会弹出加人面板。
+    """
+    out = _osa(_MAIN_WINDOW + '''
+  set contentSplit to splitter group 1 of (splitter group 1 of mainWin)
+  set hits to {}
+  repeat with b in (buttons of contentSplit)
+    set p to position of b
+    set s to size of b
+    if (item 1 of s) ≥ 26 and (item 1 of s) ≤ 30 and (item 2 of s) ≥ 26 and (item 2 of s) ≤ 30 then
+      set end of hits to (((item 1 of p) + (item 1 of s) / 2) as integer as string) & "," & (((item 2 of p) + (item 2 of s) / 2) as integer as string)
+    end if
+  end repeat
+  set AppleScript's text item delimiters to linefeed
+  return hits as text
+''')
+    points: list[tuple[int, int]] = []
+    for line in (out or "").splitlines():
+        x_s, _, y_s = line.strip().strip('"').partition(",")
+        try:
+            points.append((int(x_s), int(y_s)))
+        except ValueError:
+            continue
+    points.sort(key=lambda p: p[0])
+    return points
+
+
+def _header_more_button_point() -> tuple[int, int] | None:
+    points = _header_action_button_points()
+    return points[0] if points else None
+
+
+def _try_press_named_menu_item(names: tuple[str, ...]) -> bool:
+    quoted = ", ".join(f'"{_escape(n)}"' for n in names)
+    out = _osa(f'''
+  set wanted to {{{quoted}}}
+  repeat with m in menus
+    repeat with mi in menu items of m
+      set n to ""
+      try
+        set n to name of mi as text
+      end try
+      if n is in wanted then
+        perform action "AXPress" of mi
+        return "OK"
+      end if
+    end repeat
+  end repeat
+  return "NONE"
+''')
+    return out.strip().strip('"') == "OK"
+
+
+def _group_info_dialog_open() -> bool:
+    """群详情是独立的约 320 宽对话框,不是主窗口里的侧栏。"""
+    out = _osa('''
+  repeat with w in windows
+    set s to size of w
+    if (item 1 of s) ≥ 280 and (item 1 of s) ≤ 360 and (item 2 of s) ≥ 500 then
+      return "YES"
+    end if
+  end repeat
+  return "NO"
+''')
+    return out.strip().strip('"') == "YES"
+
+
+def _nickname_ui_ready() -> bool:
+    return _scan_nickname_ui()["kind"] != "NONE" or _group_info_dialog_open()
+
+
+def _header_more_click_point() -> tuple[int, int] | None:
+    """标题栏「更多」的点击位置。
+
+    侧栏打开后这个按钮会从 AX 里消失,剩下智能总结/添加成员。这时取最左按钮再往左一格。
+    """
+    points = _header_action_button_points()
+    if not points:
+        return None
+    # 3 个时最左是「…」;侧栏开着只剩 2 个,最左那个仍是「…」(再往左偏会点空)
+    return points[0]
+
+
+def _open_group_info_panel() -> None:
+    """打开群详情。成功信号是扫到昵称行,或出现约 320 宽的详情对话框。
+
+    不能点会话标题:那是改群名的入口,会把昵称写进群名。也不能点最右按钮:
+    那是添加成员。入口是标题栏右侧那排里最左边的「更多」。
+    """
+    if _nickname_ui_ready():
+        return
+    if _try_press_named_button(("更多", "More")):
+        time.sleep(0.8)
+        if _nickname_ui_ready():
+            return
+
+    more = _header_more_click_point()
+    if more is None:
+        raise LocalGroupError(
+            "找不到聊天区标题栏的「更多」按钮,无法打开群详情改昵称"
+        )
+    _real_click(*more)
+    time.sleep(1.0)
+    if _try_press_named_menu_item(("群聊信息", "Chat Info", "群信息")):
+        time.sleep(0.8)
+    if _nickname_ui_ready():
+        return
+    raise LocalGroupError(
+        f"点了标题栏「更多」({more[0]},{more[1]}) 后仍找不到群详情。"
+        "请确认会话已打开,且右上角没有挡住「更多」的面板。"
+    )
+
+
+def _group_info_dialog_bounds() -> tuple[int, int, int, int] | None:
+    out = _osa('''
+  repeat with w in windows
+    set s to size of w
+    if (item 1 of s) ≥ 280 and (item 1 of s) ≤ 360 and (item 2 of s) ≥ 500 then
+      set p to position of w
+      return (item 1 of p as string) & "," & (item 2 of p as string) & "," & (item 1 of s as string) & "," & (item 2 of s as string)
+    end if
+  end repeat
+  return "NONE"
+''')
+    raw = out.strip().strip('"')
+    if not raw or raw == "NONE":
+        return None
+    parts = raw.split(",")
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+    except (ValueError, IndexError):
+        return None
+
+
+def _focused_text_field() -> dict | None:
+    out = _osa('''
+  set fe to missing value
+  try
+    set fe to value of attribute "AXFocusedUIElement"
+  end try
+  if fe is missing value then return "NONE"
+  set r to ""
+  try
+    set r to role of fe as text
+  end try
+  if r is not "AXTextField" and r is not "AXTextArea" then return "NONE"
+  set v to ""
+  try
+    set v to value of fe as text
+  end try
+  set p to position of fe
+  return r & tab & v & tab & (item 1 of p as string) & "," & (item 2 of p as string)
+''')
+    raw = out.strip().strip('"')
+    if not raw or raw == "NONE":
+        return None
+    role, sep, rest = raw.partition("\t")
+    if not sep:
+        return None
+    value, _, pos = rest.partition("\t")
+    x_s, _, y_s = pos.partition(",")
+    try:
+        x, y = int(x_s), int(y_s)
+    except ValueError:
+        x, y = 0, 0
+    return {"kind": "FIELD", "value": value, "x": x, "y": y, "role": role}
+
+
+def _group_info_setting_rows() -> list[tuple[int, int, int, int]]:
+    """群详情表格里的设置行。跳过顶部大块成员区,只留 30~50px 的条目。"""
+    out = _osa('''
+  set acc to {}
+  repeat with w in windows
+    set s to size of w
+    if (item 1 of s) ≥ 280 and (item 1 of s) ≤ 360 and (item 2 of s) ≥ 500 then
+      try
+        set tbl to table 1 of scroll area 1 of w
+        repeat with rw in rows of tbl
+          set p to position of rw
+          set sz to size of rw
+          if (item 2 of sz) ≥ 30 and (item 2 of sz) ≤ 50 then
+            set end of acc to (item 1 of p as string) & "," & (item 2 of p as string) & "," & (item 1 of sz as string) & "," & (item 2 of sz as string)
+          end if
+        end repeat
+      end try
+    end if
+  end repeat
+  set AppleScript's text item delimiters to linefeed
+  return acc as text
+''')
+    rows: list[tuple[int, int, int, int]] = []
+    for line in (out or "").splitlines():
+        parts = line.strip().strip('"').split(",")
+        if len(parts) != 4:
+            continue
+        try:
+            rows.append((int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])))
+        except ValueError:
+            continue
+    return rows
+
+
+def _field_in_group_info(focused: dict | None, bounds: tuple[int, int, int, int] | None) -> bool:
+    if not focused:
+        return False
+    fx, fy = focused.get("x", 0), focused.get("y", 0)
+    if fy > 680:
+        return False
+    if bounds is None:
+        return fx >= 800
+    x, y, w, h = bounds
+    return x - 20 <= fx <= x + w + 20 and y <= fy <= y + h - 30
+
+
+def _probe_nickname_in_dialog() -> dict:
+    """群详情对话框是 CEF,常常没有「我在本群的昵称」这行文字。
+
+    只点 30~50px 的设置行右侧(值那一侧)。顶部成员大行点了会把面板关掉。
+    """
+    bounds = _group_info_dialog_bounds()
+    if bounds is None:
+        return {"kind": "NONE", "value": "", "x": 0, "y": 0}
+    x, y, w, h = bounds
+    for rx, ry, rw, rh in _group_info_setting_rows():
+        cy = ry + rh // 2
+        if cy > y + h - 16:
+            continue
+        _real_click(rx + rw - 40, cy)
+        time.sleep(0.45)
+        dialog = _nickname_dialog_field()
+        if dialog is not None:
+            return dialog
+        focused = _focused_text_field()
+        now = _group_info_dialog_bounds() or bounds
+        if _field_in_group_info(focused, now):
+            return {
+                "kind": "FIELD",
+                "value": focused.get("value") or "",
+                "x": focused["x"],
+                "y": focused["y"],
+            }
+        if _group_info_dialog_bounds() is None and _nickname_dialog_field() is None:
+            break
+    return {"kind": "NONE", "value": "", "x": 0, "y": 0}
+
+
+def _nickname_write_verified(nickname: str, focused_before: dict | None = None) -> bool:
+    """CEF 群详情经常不把新昵称暴露成静态文字,所以核验要同时看焦点框和整窗文本。"""
+    if _front_window_mentions(nickname):
+        return True
+    focused = _focused_text_field()
+    if focused and nickname in (focused.get("value") or ""):
+        if focused_before is None:
+            return True
+        return focused.get("x") == focused_before.get("x") and focused.get("y") == focused_before.get("y")
+    return False
+
+
+def _write_nickname_dialog(nickname: str) -> None:
+    """往「我在本群的昵称」小窗的输入框写入并点确定。"""
+    out = _osa(f'''
+  set targetWin to missing value
+  repeat with w in windows
+    try
+      repeat with e in (UI elements of w)
+        set hintText to ""
+        try
+          set hintText to hintText & (value of e as text)
+        end try
+        try
+          set hintText to hintText & (name of e as text)
+        end try
+        if hintText contains "我在本群的昵称" or hintText contains "My Alias" then
+          set targetWin to contents of w
+          exit repeat
+        end if
+      end repeat
+    end try
+    if targetWin is not missing value then exit repeat
+  end repeat
+  if targetWin is missing value then return "NODIALOG"
+  set field to missing value
+  repeat with e in (UI elements of targetWin)
+    set elemRole to ""
+    try
+      set elemRole to role of e as text
+    end try
+    if elemRole is "AXTextField" or elemRole is "AXTextArea" then
+      set field to contents of e
+      exit repeat
+    end if
+  end repeat
+  if field is missing value then return "NOFIELD"
+  set value of attribute "AXFocused" of field to true
+  set value of field to "{_escape(nickname)}"
+  delay 0.25
+  try
+    click (first button of targetWin whose name is "确定")
+    return "OK"
+  on error
+    try
+      perform action "AXPress" of (first button of targetWin whose name is "确定")
+      return "OK"
+    on error
+      try
+        click (first button of targetWin whose name is "OK")
+        return "OK"
+      on error
+        return "NOCONFIRM"
+      end try
+    end try
+  end try
+''')
+    status = out.strip().strip('"')
+    if status == "OK":
+        return
+    if status == "NODIALOG":
+        raise LocalGroupError("找不到「我在本群的昵称」对话框")
+    if status == "NOFIELD":
+        raise LocalGroupError("昵称对话框里没有输入框,已中止,没有改动")
+    raise LocalGroupError(f"写入群昵称失败: {status}")
+
+
+def _write_focused_nickname(nickname: str) -> None:
+    """把已经拿到焦点的昵称输入框改掉。
+
+    和改群名一样先确认真有输入框:否则 Cmd+V + 回车会把昵称当成一条消息发出去。
+    """
+    out = _osa(f'''
+  set fe to missing value
+  try
+    set fe to value of attribute "AXFocusedUIElement"
+  end try
+  if fe is missing value then return "NOFOCUS"
+  set r to ""
+  try
+    set r to role of fe as text
+  end try
+  if r is not "AXTextField" and r is not "AXTextArea" then return "NOTFIELD"
+  set fy to 0
+  try
+    set fy to item 2 of (position of fe)
+  end try
+  if fy > 680 then return "CHATBOX"
+  set value of attribute "AXFocused" of fe to true
+  set value of fe to "{_escape(nickname)}"
+  delay 0.3
+  try
+    perform action "AXConfirm" of fe
+  on error
+    keystroke return
+  end try
+  return "OK"
+''')
+    status = out.strip().strip('"')
+    if status == "OK":
+        return
+    if status in {"NOFOCUS", "NOTFIELD", "CHATBOX"}:
+        raise LocalGroupError("点了群昵称但没有输入框拿到焦点,已中止,没有改动")
+    raise LocalGroupError(f"写入群昵称失败: {status}")
+
+
+def _close_group_info() -> None:
+    try:
+        _osa("  key code 53\n")
+    except LocalGroupError as e:
+        log.warning("关闭群详情失败,客户端上可能留着侧栏: %s", e)
+
+
+def _read_current_title() -> tuple[str, bool]:
+    """读当前会话标题。返回 (title, via_ax)。
+
+    via_ax=False 表示走了旧版点标题路径,调用方如果决定不改名,必须把输入框退掉。
+    """
+    ax_title = _read_ax_title()
+    if ax_title is not None:
+        return ax_title, True
+    return _open_edit_box_and_read_current(), False
+
+
+def _title_matches_expectation(
+    title: str,
+    expect_members: list[str] | None,
+    expect_title: str | None,
+) -> bool:
+    if expect_title is not None:
+        return (title or "").strip() == expect_title.strip()
+    if expect_members is not None:
+        return _looks_like_a_just_created_group(title, expect_members)
+    return True
+
+
+def _set_nickname_locked(
+    rid: int,
+    nickname: str,
+    expect_members: list[str] | None = None,
+    expect_title: str | None = None,
+) -> dict:
+    """在群详情里修改「我在本群的昵称」(调用方须持有 UI 锁)。
+
+    企微没有改群内昵称的官方接口,只能走客户端详情页。昵称也不进本地会话库,
+    所以核验只能回读 AX,不能像改群名那样查库。
+
+    expect_title 给「同一轮已经改过群名」用:标题这时已经不是成员拼名,
+    再拿 expect_members 去对会把刚改好名的新群误判成别人的群。
+    """
+    conv = local_send.get_conversation_by_rid(int(rid))
+    if not conv:
+        return {"success": False, "error": f"本地库里没有 RID={rid} 的会话"}
+
+    opened_info = False
+    _activate()
+    ok, msg = local_send._open_conversation_by_scheme(conv)
+    if not ok:
+        return {"success": False, "error": f"打开会话失败: {msg}"}
+
+    if expect_members is not None or expect_title is not None:
+        was, via_ax = _read_current_title()
+        if not _title_matches_expectation(was, expect_members, expect_title):
+            if not via_ax:
+                _cancel_edit_box()
+            expected = expect_title if expect_title is not None else "、".join(expect_members or [])
+            return {
+                "success": False,
+                "unrelated": True,
+                "rid": int(rid),
+                "error": (
+                    f"RID={rid} 的标题是 {was!r},不是预期的 {expected!r} —— "
+                    "一个字都没改,请手动修改我在本群的昵称。"
+                ),
+            }
+        if not via_ax:
+            _cancel_edit_box()
+
+    try:
+        _open_group_info_panel()
+        opened_info = True
+        found = _scan_nickname_ui()
+        if found["kind"] == "NONE":
+            found = _probe_nickname_in_dialog()
+        if found["kind"] == "NONE":
+            return {"success": False, "rid": int(rid), "error": "群详情中找不到「我在本群的昵称」"}
+        if found["kind"] == "ROW" and _nickname_dialog_field() is None:
+            _real_click(int(found["x"]), int(found["y"]))
+            time.sleep(0.5)
+        if _nickname_dialog_field() is not None:
+            _write_nickname_dialog(nickname)
+            time.sleep(0.5)
+            if _nickname_dialog_field() is None or nickname in ((_nickname_dialog_field() or {}).get("value") or ""):
+                return {"success": True, "rid": int(rid), "nickname": nickname, "error": None}
+            return {
+                "success": False,
+                "rid": int(rid),
+                "error": f"点了确定但昵称对话框还在,读到的是 {(_nickname_dialog_field() or {}).get('value')!r}",
+            }
+        focused_before = _focused_text_field()
+        _write_focused_nickname(nickname)
+        time.sleep(0.6)
+        if _nickname_write_verified(nickname, focused_before):
+            return {"success": True, "rid": int(rid), "nickname": nickname, "error": None}
+        found = _scan_nickname_ui()
+        return {
+            "success": False,
+            "rid": int(rid),
+            "error": (
+                f"改昵称后核验失败: 群详情里没有读到 {nickname!r}"
+                f"(扫到的是 {found.get('value')!r})"
+            ),
+        }
+    except LocalGroupError as e:
+        return {"success": False, "rid": int(rid), "error": str(e)}
+    finally:
+        if opened_info:
+            _close_group_info()
+
+
+def _check_name(name: str, kind: str = "群名") -> str:
     new_name = (name or "").strip()
     if not new_name:
-        raise LocalGroupError("群名为空")
+        raise LocalGroupError(f"{kind}为空")
     if len(new_name) > MAX_NAME_LEN:
-        raise LocalGroupError(f"群名最多 {MAX_NAME_LEN} 个字符,当前 {len(new_name)} 个")
+        raise LocalGroupError(f"{kind}最多 {MAX_NAME_LEN} 个字符,当前 {len(new_name)} 个")
     return new_name
 
 

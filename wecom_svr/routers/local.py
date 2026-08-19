@@ -102,10 +102,13 @@ def local_busy(_: None = Depends(require_token)) -> dict:
 def create_local_group(req: LocalCreateGroupRequest, _: None = Depends(require_token)):
     """能拉外部联系人和微信用户 —— 官方 appchat 做不到这点。
 
-    传了 `name` 就「先建群、再改名」两步走(面板里没有命名输入框);自己自动是群主。
+    传了 `name` 就「先建群、再改名」两步走(面板里没有命名输入框);传了 `nickname`
+    再打开群详情改「我在本群的昵称」。自己自动是群主。
     每个成员在选中前都会核对客户端搜出来的姓名与部门,搜出多条会 400 并列出候选。
     """
-    result = local_group.create_group(req.members, name=req.name)
+    result = local_group.create_group(
+        req.members, name=req.name, nickname=req.nickname
+    )
     return _result_response(result)
 
 

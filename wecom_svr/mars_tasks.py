@@ -149,7 +149,11 @@ async def _send_local_message(req: LocalSendRequest) -> dict:
 
 async def _create_local_group(req: LocalCreateGroupRequest) -> dict:
     result = await asyncio.to_thread(
-        local_group.create_group, req.members, name=req.name, return_rid=True
+        local_group.create_group,
+        req.members,
+        name=req.name,
+        nickname=req.nickname,
+        return_rid=True,
     )
     # mars 的 ack 会把 result 原样写回任务条目。用 group_id 暴露稳定的业务字段,
     # 同时保留 rid 兼容本机接口调用方。
