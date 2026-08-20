@@ -214,3 +214,12 @@ def test_empty_or_broken_extracontent_is_not_fatal(monkeypatch):
     monkeypatch.setattr(messages, "_vendor", lambda: Boom())
     # 引用摘要不值得让整条消息失败
     assert _summary(_pb(1002, b"junk")) == ""
+
+
+def test_int_id_coerces_sqlite_real_and_scientific_strings():
+    rid = 10945118031183243
+    assert messages._int_id(rid) == rid
+    assert messages._int_id(float(rid)) == 10945118031183244
+    assert messages._int_id("1.0945118031183244e+16") == 10945118031183244
+    assert messages._int_id(None) == 0
+    assert messages._int_id("") == 0
