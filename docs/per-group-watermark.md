@@ -48,8 +48,8 @@ V2 hook 里其余副作用(`BigCustomerAlert` / `forwardMessage` / `robotLastAct
 
 ### 1.2 `forwardMessage` 不命中我们
 
-`forwardMessage` 按 `message.Robot` 分支,只认两个写死的 QQ 号;默认的
-`wecom-svr` 落 `default` 分支(`qq/qq.go:314-329`)。
+`forwardMessage` 按 `message.Robot` 分支,只认两个写死的 QQ 号;本机登录企微
+VID(拿不到时退回 `wecom-svr`) 落 `default` 分支(`qq/qq.go:314-329`)。
 
 ### 1.3 ⚠️ hook **不是**幂等的 —— 这条推翻了一个流传已久的说法
 

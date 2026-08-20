@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from wecom_svr import mars_sync, messages
+from wecom_svr import directory, mars_sync, messages
 from wecom_svr.main import create_app
 from wecom_svr.mars_sync import Cursor, GroupState, MarsStateError, MarsSyncError, State
 from wecom_svr.settings import Settings, get_agent_home, get_settings
@@ -24,6 +24,7 @@ def run(coro):
 
 GROUP = {"rid": 20614687431404, "name": "客户群A", "sort_time": 100}
 GROUP2 = {"rid": 3395077687, "name": "kodo-alert-p1", "sort_time": 90}
+SELF_VID = "1688856651864877"
 
 
 def _msg(lid: int, send_time: int, text: str, userid: str = "chenyi", **kw) -> dict:
@@ -46,6 +47,7 @@ def _clean_env(monkeypatch, tmp_path):
               "WECOM_SVR_MARS_GROUP_NAME_PREFIX"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("WECOM_SVR_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(directory, "self_vid_or_none", lambda: SELF_VID)
     get_settings.cache_clear()
     get_agent_home.cache_clear()
     yield
@@ -149,10 +151,36 @@ def test_hook_shape_matches_mars_message_hook(settings):
         "message": "并发限制",
         "timestamp": 1786081838,
         "clientType": "Wework",
-        "robot": "wecom-svr",
+        "robot": SELF_VID,
         "avatar": "https://x/avatar",
         "messageType": "文本",
     }
+
+
+def test_robot_defaults_to_current_wecom_vid(settings):
+    """QQ 机器人填 QQ 号;企微这边填本机登录账号的 VID。"""
+    assert mars_sync.to_hook(_msg(1, 1, "x"), settings)["robot"] == SELF_VID
+    assert mars_sync.robot_id(settings) == SELF_VID
+
+
+def test_explicit_mars_robot_overrides_current_vid(settings):
+    s = settings.model_copy(update={"mars_robot": "1688851136652708"})
+    assert mars_sync.to_hook(_msg(1, 1, "x"), s)["robot"] == "1688851136652708"
+
+
+def test_placeholder_mars_robot_still_uses_current_vid(settings):
+    s = settings.model_copy(update={"mars_robot": "wecom-svr"})
+    assert mars_sync.to_hook(_msg(1, 1, "x"), s)["robot"] == SELF_VID
+
+
+def test_empty_mars_robot_uses_current_vid(settings):
+    s = settings.model_copy(update={"mars_robot": ""})
+    assert mars_sync.to_hook(_msg(1, 1, "x"), s)["robot"] == SELF_VID
+
+
+def test_robot_falls_back_when_current_vid_is_unknown(settings, monkeypatch):
+    monkeypatch.setattr(directory, "self_vid_or_none", lambda: None)
+    assert mars_sync.to_hook(_msg(1, 1, "x"), settings)["robot"] == "wecom-svr"
 
 
 def test_group_name_is_unchanged_by_default(settings):
@@ -974,6 +1002,7 @@ def test_status_reports_config_and_watermark(client, local):
     body = r.json()
     assert body["config"]["hook_url"] == "https://ts.qiniu.io/api/qq/hook/v2/message"
     assert body["config"]["groups"] == ["客户群A"]
+    assert body["config"]["robot"] == SELF_VID
     assert body["running"] is False
 
 

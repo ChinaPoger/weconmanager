@@ -206,3 +206,24 @@ def test_group_create_respects_auth(monkeypatch, fake_directory):
     r = TestClient(create_app()).post("/api/v1/app/group/create",
                                       json={"name": "群", "members": ["陈涛", "陈挺"]})
     assert r.status_code == 401
+
+
+def test_self_vid_is_stringified(fake_directory):
+    assert directory.self_vid_or_none() == str(ME["vid"])
+
+
+def test_self_vid_returns_none_when_unknown(monkeypatch):
+    monkeypatch.setattr(
+        directory, "get_self", lambda: (_ for _ in ()).throw(directory.MemberNotFound("x"))
+    )
+    assert directory.self_vid_or_none() is None
+
+
+def test_self_vid_returns_none_when_record_has_no_vid(monkeypatch):
+    monkeypatch.setattr(directory, "get_self", lambda: {"userid": "me"})
+    assert directory.self_vid_or_none() is None
+
+
+def test_self_vid_returns_none_when_vid_is_blank(monkeypatch):
+    monkeypatch.setattr(directory, "get_self", lambda: {"userid": "me", "vid": "  "})
+    assert directory.self_vid_or_none() is None

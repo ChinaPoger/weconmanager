@@ -156,3 +156,19 @@ def self_userid_or_none() -> str | None:
         return get_self()["userid"]
     except DirectoryError:
         return None
+
+
+def self_vid_or_none() -> str | None:
+    """当前登录用户的企微 VID(USER.RID)。拿不到时返回 None。
+
+    给 mars hook 的 robot 用:QQ 机器人填的是 QQ 号,企微这边对应本机登录账号。
+    同步热路径上不能因为通讯录暂时读不到就整批失败,所以吞掉 LocalSendError。
+    """
+    try:
+        vid = get_self().get("vid")
+    except LocalSendError:
+        return None
+    if vid is None:
+        return None
+    text = str(vid).strip()
+    return text or None

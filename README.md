@@ -591,8 +591,9 @@ pending,直到 `MARS_IMAGE_WAIT` 超时才推占位符。
 
 > ⚠️ **这条 hook 是 mars 的公开路由(无鉴权),且有副作用**:它会 upsert
 > `qq_groups`(等于在 mars 里建了这个群的档案),并触发告警转发、销售工单等
-> 分支。那些分支都按 `robot` 号或群配置命中,默认的 `robot=wecom-svr` 不会撞上
-> 任何一条 —— 但改 `MARS_ROBOT` 前请先读 mars 的 `qq/qq.go: forwardMessage`。
+> 分支。`robot` 默认填本机登录企微账号的 VID(拿不到时退回 `wecom-svr`)。
+> 那些分支按 `robot` 号或群配置命中 —— 改 `MARS_ROBOT` 前请先读 mars 的
+> `qq/qq.go: forwardMessage`。
 
 ### 错误结构
 

@@ -39,7 +39,7 @@ from pathlib import Path
 
 import httpx
 
-from . import media, messages
+from . import directory, media, messages
 from .bgloop import BackgroundLoop
 from .messages import FILE_PLACEHOLDER, IMAGE_PLACEHOLDER, Cursor, media_payloads
 from .settings import Settings, get_settings
@@ -498,12 +498,31 @@ def prune_outbox(cursors: dict[str, Cursor], settings: Settings) -> None:
                 log.warning("清理 mars outbox %s 失败: %s", entry, e)
 
 
+DEFAULT_MARS_ROBOT = "wecom-svr"
+
+
+def robot_id(settings: Settings) -> str:
+    """mars 用 robot 区分消息来源。
+
+    默认填当前登录企微账号的 VID(和 QQ 机器人填 QQ 号同一语义:这条消息
+    是哪个号看到的)。显式配了非占位值的 mars_robot 时尊重配置,方便测试
+    和临时改号;拿不到 VID 时退回配置/占位。
+    """
+    configured = (settings.mars_robot or "").strip()
+    if configured and configured != DEFAULT_MARS_ROBOT:
+        return configured
+    vid = directory.self_vid_or_none()
+    if vid:
+        return vid
+    return configured or DEFAULT_MARS_ROBOT
+
+
 def to_hook(msg: dict, settings: Settings) -> dict:
     """本地消息 → mars models.MessageHook 的 JSON。
 
     senderNumber 使用本地通讯录 RID,userid/corpid 单独传成员的企微身份。
     RID 对内部成员、外部联系人和机器人都存在,不会因为跨企业成员没有本企业
-    userid 而和其他成员混淆。
+    userid 而和其他成员混淆。robot 填本机登录企微账号的 VID。
     """
     userid = str(msg.get("sender_userid") or "")
     corpid = str(msg.get("sender_corpid") or "")
@@ -522,7 +541,7 @@ def to_hook(msg: dict, settings: Settings) -> dict:
         "nickname": name,
         "timestamp": int(msg.get("send_time") or 0),
         "clientType": settings.mars_client_type,
-        "robot": settings.mars_robot,
+        "robot": robot_id(settings),
         "avatar": msg.get("avatar") or "",
         "messageType": msg.get("type") or "",
     }
