@@ -96,7 +96,8 @@ class Settings(BaseSettings):
     #   models.Group.GroupIMCategory(): 名字含 "work-" → 认成 Wework 群
     #   groupmsg.LoadMsgs():   left(name,5) != 'work-' → 未响应告警不管这类群
     mars_group_name_prefix: str = ""
-    # mars 侧用 robot 号区分消息来源,并据此决定要不要转发到 mars_alert / 大数据
+    # mars 侧用 robot 号区分消息来源。默认填当前登录企微账号的 VID;
+    # 显式配置且不是占位值 wecom-svr 时用配置值。拿不到 VID 时退回 wecom-svr。
     mars_robot: str = "wecom-svr"
     mars_client_type: str = "Wework"
 

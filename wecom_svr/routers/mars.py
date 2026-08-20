@@ -100,7 +100,7 @@ async def status(
             "groups": settings.mars_group_selectors,
             "sync_all_groups": settings.mars_sync_all_groups,
             "group_prefix": settings.mars_group_prefix,
-            "robot": settings.mars_robot,
+            "robot": mars_sync.robot_id(settings),
             "client_type": settings.mars_client_type,
         },
         "state": state_summary,
