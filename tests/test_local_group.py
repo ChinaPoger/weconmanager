@@ -134,6 +134,11 @@ class FakeClient:
             return True, f"Initiate a group chat|{self.selected} contact(s) selected|"
         if "count of sheets of mainWin" in script:
             return True, "1" if self.sheet_open else "0"
+        if "return value of target as text" in script:
+            # 确认后窗口已经是新群;单测不模拟切会话延迟
+            return True, "陈涛、陈挺"
+        if "set value of target to" in script and "AXConfirm" in script:
+            return True, "ok"
 
         return True, ""
 
@@ -156,6 +161,7 @@ def _fast_and_macos(monkeypatch, tmp_path):
     get_agent_home.cache_clear()
     monkeypatch.setattr(local_group, "ensure_macos", lambda: None)
     monkeypatch.setattr(local_group, "_picker_click", lambda x, y: None)
+    monkeypatch.setattr(local_group, "_ui_click", lambda x, y: None)
     monkeypatch.setattr(local_group.time, "sleep", lambda _s: None)
     monkeypatch.setattr(local_group, "SHEET_TIMEOUT", 0.1)
     monkeypatch.setattr(local_group, "PROBE_TIMEOUT", 0.1)
@@ -550,6 +556,7 @@ def rename_env(monkeypatch, fake):
         clip["v"] = state["names"][77]      # 输入框打开,全选复制拿到当前群名
 
     monkeypatch.setattr(local_group, "_real_click", click)
+    monkeypatch.setattr(local_group, "_ui_click", click)
 
     orig_osa = local_group._osa
 
@@ -595,6 +602,24 @@ def test_rename_prefers_writable_ax_title(rename_env, monkeypatch):
     assert r["old_name"] == "陈挺、陈涛、任威风"
     assert rename_env["names"][77] == "临时讨论组"
     assert rename_env["clicked"] is False
+
+
+def test_rename_succeeds_when_ax_title_is_ahead_of_the_database(rename_env, monkeypatch):
+    """刚建完的群 Info.db 经常还是空名,AX 标题已经对上就按成功走。"""
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: "临时讨论组")
+    monkeypatch.setattr(local_group, "_write_ax_title", lambda name: None)
+    monkeypatch.setattr(local_group, "_group_names", lambda: {77: ""})
+    monkeypatch.setattr(
+        local_group,
+        "_open_edit_box_and_read_current",
+        lambda: pytest.fail("新版 AX 标题可用时不应走坐标兼容路径"),
+    )
+
+    r = local_group.rename_group(77, "临时讨论组")
+
+    assert r["success"] is True
+    assert r["name"] == "临时讨论组"
+    assert r["old_name"] == "临时讨论组"
 
 
 def test_rename_aborts_when_no_edit_box_took_focus(rename_env, monkeypatch):
@@ -665,6 +690,34 @@ def _snapshots(monkeypatch, *frames):
     monkeypatch.setattr(local_group, "_group_names", next_frame)
 
 
+def test_create_waits_for_the_title_to_switch_before_renaming(fake, monkeypatch):
+    """确认后窗口可能还停在旧群上,标题不像新群就不能改名。"""
+    names = {1: "旧群"}
+    titles = iter(["临时讨论组2-opt4", "陈涛(水淼淼)、SMB售前bot、陈挺"])
+    monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: next(titles, "陈涛(水淼淼)、SMB售前bot、陈挺"))
+    renamed = {}
+    monkeypatch.setattr(
+        local_group,
+        "_rename_locked",
+        lambda rid, name, expect_members=None, already_open=False: (
+            renamed.update(title_seen=True) or {"success": True}
+        ),
+    )
+
+    def confirm():
+        names[42] = ""
+        fake.confirmed = True
+        fake.sheet_open = False
+
+    monkeypatch.setattr(local_group, "_confirm", confirm)
+
+    r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组")
+    assert r["success"] is True
+    assert r["name"] == "临时讨论组"
+    assert renamed.get("title_seen") is True
+
+
 def test_create_with_name_locates_the_new_group_by_diff(fake, monkeypatch):
     names = {1: "旧群"}
     monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
@@ -689,7 +742,8 @@ def test_create_with_name_locates_the_new_group_by_diff(fake, monkeypatch):
     r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组")
     assert r["success"] is True
     assert r["rid"] == 42 and r["name"] == "临时讨论组"
-    assert captured["rid"] == 42 and captured["name"] == "临时讨论组"
+    # 确认后先改当前窗口,这时 RID 还不知道;落库后再回填
+    assert captured["rid"] is None and captured["name"] == "临时讨论组"
     # 改名前要拿成员名核对归属,所以必须把选中的人传下去
     assert captured["expect_members"] == ["陈涛", "陈挺"]
 
@@ -712,24 +766,55 @@ def test_create_with_name_waits_for_delayed_database_visibility(fake, monkeypatc
     assert r["success"] is True
     assert r["rid"] == 42
     assert r["name"] == "临时讨论组"
-    assert captured == {"rid": 42, "name": "临时讨论组"}
+    assert captured == {"rid": None, "name": "临时讨论组"}
 
 
-def test_a_second_conversation_landing_right_after_blocks_the_rename(fake, monkeypatch):
-    """看到一个新会话就立刻改名,会改到别人刚把你拉进的群上 —— 要多等一拍。"""
-    _snapshots(monkeypatch, {1: "旧群"}, {1: "旧群", 42: ""}, {1: "旧群", 42: "", 43: ""})
-    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
+def test_a_second_conversation_landing_right_after_still_renames_the_open_group(
+    fake, monkeypatch,
+):
+    """确认后窗口就是新群,即使这期间又落库了别人拉你进的群,也该改当前窗口。
+    RID 不唯一就宁可空着,不要猜。"""
+    _snapshots(monkeypatch, {1: "旧群"}, {1: "旧群", 42: "", 43: ""})
+    monkeypatch.setattr(local_group, "GROUP_APPEAR_TIMEOUT", 0.0)
+    renamed = {}
     monkeypatch.setattr(
         local_group,
         "_rename_locked",
-        lambda *a, **kw: pytest.fail("新增会话不唯一时不该动任何一个群"),
+        lambda rid, name, expect_members=None, already_open=False: (
+            renamed.update(rid=rid, name=name, already_open=already_open)
+            or {"success": True}
+        ),
     )
 
     r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组")
 
-    assert r["success"] is True          # 群确实建出来了
+    assert r["success"] is True
+    assert r["name"] == "临时讨论组"
+    assert renamed == {"rid": None, "name": "临时讨论组", "already_open": True}
     assert r["rid"] is None
-    assert "新增 2 个" in r["name_error"]
+    assert "没能唯一定位" in r["rid_error"]
+
+
+def test_create_picks_the_new_rid_by_the_name_just_written(fake, monkeypatch):
+    """差集里有两个新会话时,改过的那个名字能把它认出来。"""
+    _snapshots(
+        monkeypatch,
+        {1: "旧群"},
+        {1: "旧群", 42: "", 43: ""},
+        {1: "旧群", 42: "临时讨论组", 43: ""},
+    )
+    monkeypatch.setattr(
+        local_group,
+        "_rename_locked",
+        lambda *a, **kw: {"success": True},
+    )
+
+    r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组")
+
+    assert r["success"] is True
+    assert r["name"] == "临时讨论组"
+    assert r["rid"] == 42
+    assert "rid_error" not in r
 
 
 def test_rename_refuses_a_conversation_that_is_not_the_new_group(rename_env):
@@ -856,7 +941,7 @@ def test_create_with_nickname_opens_group_info_not_the_title(fake, monkeypatch):
     assert r["success"] is True
     assert r["rid"] == 42 and r["nickname"] == "小王"
     assert captured == {
-        "rid": 42,
+        "rid": None,
         "nickname": "小王",
         "expect_members": ["陈涛", "陈挺"],
         "expect_title": None,
@@ -898,19 +983,25 @@ def test_create_with_name_and_nickname_does_both(fake, monkeypatch):
     assert nick["expect_members"] is None
 
 
-def test_create_reports_nickname_error_when_the_new_group_is_not_unique(fake, monkeypatch):
+def test_create_still_sets_nickname_when_the_new_group_is_not_unique(fake, monkeypatch):
+    """RID 不唯一也不该耽误改当前窗口的昵称;只是响应里没有 rid。"""
     _snapshots(monkeypatch, {1: "旧群"}, {1: "旧群", 42: "", 43: ""})
-    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
+    nicked = {}
     monkeypatch.setattr(
         local_group,
         "_set_nickname_locked",
-        lambda *a, **kw: pytest.fail("新增会话不唯一时不该改昵称"),
+        lambda rid, nickname, expect_members=None, expect_title=None, already_open=False: (
+            nicked.update(rid=rid, nickname=nickname, already_open=already_open)
+            or {"success": True}
+        ),
     )
 
     r = local_group.create_group(["陈涛", "陈挺"], nickname="小王")
     assert r["success"] is True
+    assert r["nickname"] == "小王"
+    assert nicked == {"rid": None, "nickname": "小王", "already_open": True}
     assert r["rid"] is None
-    assert "昵称没改成" in r["nickname_error"]
+    assert "没能唯一定位" in r["rid_error"]
 
 
 def test_create_keeps_the_group_when_nickname_fails(fake, monkeypatch):
@@ -956,7 +1047,7 @@ def test_set_nickname_accepts_the_title_after_a_successful_rename(rename_env, mo
         "_scan_nickname_ui",
         lambda: {"kind": "FIELD", "value": f"我在本群的昵称{state['wrote'] or ''}", "x": 1, "y": 1},
     )
-    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda: None)
+    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda **_: None)
     monkeypatch.setattr(local_group, "_write_focused_nickname", lambda name: state.update(wrote=name))
     monkeypatch.setattr(local_group, "_close_group_info", lambda: None)
     monkeypatch.setattr(local_group, "_front_window_mentions", lambda text: text == state["wrote"])
@@ -984,8 +1075,9 @@ def test_set_nickname_writes_the_focused_field_and_verifies(rename_env, monkeypa
 
     monkeypatch.setattr(local_group, "_read_ax_title", lambda: "")
     monkeypatch.setattr(local_group, "_scan_nickname_ui", scan)
-    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda: state.update(opened=True))
+    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda **_: state.update(opened=True))
     monkeypatch.setattr(local_group, "_real_click", lambda x, y: None)
+    monkeypatch.setattr(local_group, "_ui_click", lambda x, y: None)
     monkeypatch.setattr(
         local_group,
         "_write_focused_nickname",
@@ -1014,8 +1106,9 @@ def test_set_nickname_aborts_when_no_editor_took_focus(rename_env, monkeypatch):
         "_scan_nickname_ui",
         lambda: {"kind": "ROW", "value": "我在本群的昵称", "x": 10, "y": 20},
     )
-    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda: None)
+    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda **_: None)
     monkeypatch.setattr(local_group, "_real_click", lambda x, y: None)
+    monkeypatch.setattr(local_group, "_ui_click", lambda x, y: None)
     monkeypatch.setattr(
         local_group,
         "_write_focused_nickname",
@@ -1038,7 +1131,7 @@ def test_set_nickname_writes_the_dedicated_dialog_and_confirms(rename_env, monke
         "_scan_nickname_ui",
         lambda: {"kind": "FIELD", "value": "", "x": 544, "y": 413},
     )
-    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda: None)
+    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda **_: None)
     monkeypatch.setattr(local_group, "_nickname_dialog_field", lambda: state["dialog"])
     monkeypatch.setattr(
         local_group,
