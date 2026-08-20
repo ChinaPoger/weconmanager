@@ -18,16 +18,24 @@ SEP_FIELD = local_group._FIELD_SEP
 
 
 class FakeClient:
-    """够用的假企业微信: 面板开关 + 搜索结果 + 已选计数。"""
+    """够用的假企业微信: 面板开关 + 搜索结果 + 已选计数。
 
-    def __init__(self, directory: dict[str, list[tuple[str, str]]]):
+    空格分隔且每个词都能唯一命中时,写入搜索框就自动勾上 —— 模拟客户端
+    「中文全名完全匹配自动选中」。auto_bulk=False 则关掉这个捷径,用来测逐个搜索。
+    """
+
+    def __init__(self, directory: dict[str, list[tuple[str, str]]], auto_bulk: bool = True):
         self.directory = directory
+        self.auto_bulk = auto_bulk
         self.sheet_open = False
         self.selected = 0
         self.last_search = ""
         self.confirmed = False
         self.scripts: list[str] = []
         self.plus_clicked = False
+
+    def _rows_for(self, keyword: str) -> list[tuple[str, str]]:
+        return self.directory.get(keyword, [])
 
     def __call__(self, script: str, timeout: int = 15) -> tuple[bool, str]:
         """按脚本特征分派。
@@ -51,13 +59,24 @@ class FakeClient:
         if needs_sheet and not self.sheet_open:
             return False, "NO_SHEET"
 
-        if "set value of tf to" in script:     # 搜索: 先总数,再前几行明细
+        if "set value of tf to" in script:     # 只写入,结果要另一次脚本来读
             self.last_search = script.split('set value of tf to "')[1].split('"')[0]
-            rows = self.directory.get(self.last_search, [])
+            parts = [p for p in self.last_search.split() if p]
+            if self.auto_bulk:
+                auto = [
+                    p for p in parts
+                    if local_group._looks_like_chinese_fullname(p)
+                    and len(self._rows_for(p)) == 1
+                ]
+                if auto:
+                    self.selected = len(auto)
+            return True, ""
+        if "count of rows of ol" in script:    # 读当前搜索结果
+            rows = self._rows_for(self.last_search)
             body = "".join(f"{n}{SEP_FIELD}{d}{SEP_ROW}" for n, d in rows[:8])
             return True, f"{len(rows)}{SEP_ROW}{body}"
         if "keystroke return" in script:       # 选中第一条
-            if self.directory.get(self.last_search):
+            if self._rows_for(self.last_search):
                 self.selected += 1
             return True, ""
         if 'button "Cancel"' in script:        # 关面板
@@ -81,6 +100,7 @@ DIRECTORY = {
     "陈涛": [("陈涛(水淼淼)", "增长产品部/业务成功部")],
     "陈挺": [("陈挺", "增长产品部/业务成功部")],
     "王小明": [("王小明", "产品研发部")],
+    "SMB售前bot": [("SMB售前bot", "我的客户")],
     "陈": [("陈涛(水淼淼)", "增长产品部"), ("陈挺", "增长产品部"), ("陈珂", "运营部")],
 }
 
@@ -121,9 +141,12 @@ def test_creates_group_and_reports_who_was_picked(fake):
     r = local_group.create_group(["陈涛", "陈挺"])
     assert r["success"] is True
     assert fake.confirmed is True
-    assert [m["name"] for m in r["members"]] == ["陈涛(水淼淼)", "陈挺"]
+    # 中文全名走空格一次勾选,响应里的 name 就是查询词(不再逐个搜备注名)
+    assert [m["name"] for m in r["members"]] == ["陈涛", "陈挺"]
     assert [m["query"] for m in r["members"]] == ["陈涛", "陈挺"]
     assert r["member_count"] == 3  # 两个人 + 自己
+    enters = [s for s in fake.scripts if "keystroke return" in s]
+    assert enters == []  # 一次勾上就不用回车
 
 
 def test_dedups_and_trims_input(fake):
@@ -183,6 +206,24 @@ def test_count_mismatch_aborts_before_confirming(fake, monkeypatch):
     with pytest.raises(local_group.LocalGroupError, match="已选人数"):
         local_group.create_group(["陈涛", "陈挺"])
     assert fake.confirmed is False
+
+
+def test_space_separated_chinese_names_are_selected_without_enter(fake):
+    r = local_group.create_group(["陈涛", "陈挺", "王小明"])
+    assert r["success"] is True
+    assert fake.selected == 3
+    assert [m["query"] for m in r["members"]] == ["陈涛", "陈挺", "王小明"]
+    assert not any("keystroke return" in s for s in fake.scripts)
+
+
+def test_pinyin_names_are_picked_after_chinese_auto_select(fake):
+    """空格一次搜到所有人;中文自动勾上,英文/拼音还要回车补选。"""
+    r = local_group.create_group(["陈涛", "SMB售前bot", "陈挺"])
+    assert r["success"] is True
+    assert [m["query"] for m in r["members"]] == ["陈涛", "SMB售前bot", "陈挺"]
+    assert fake.selected == 3
+    enters = [s for s in fake.scripts if "keystroke return" in s]
+    assert len(enters) == 1  # 只给 SMB售前bot 补一次回车
 
 
 def test_needs_at_least_two_others(fake):
@@ -374,6 +415,7 @@ class DropsEnter(FakeClient):
 
 def test_lost_enter_is_retried_and_succeeds(monkeypatch):
     client = DropsEnter(DIRECTORY, drop=1)
+    client.auto_bulk = False
     monkeypatch.setattr(local_group, "_run_applescript", client)
 
     r = local_group.create_group(["陈涛", "陈挺"])
@@ -385,6 +427,7 @@ def test_lost_enter_is_retried_and_succeeds(monkeypatch):
 
 def test_gives_up_after_the_retry_budget(monkeypatch):
     client = DropsEnter(DIRECTORY, drop=99)   # 永远落空
+    client.auto_bulk = False
     monkeypatch.setattr(local_group, "_run_applescript", client)
 
     with pytest.raises(local_group.LocalGroupError, match="试了 3 次"):
@@ -402,7 +445,7 @@ def test_a_late_count_does_not_trigger_a_second_enter(fake, monkeypatch):
     assert r["success"] is True
     enters = [s for s in fake.scripts
               if "keystroke return" in s and "splitter group 1 of sheet 1" in s]
-    assert len(enters) == 2      # 一人一次,没有多按
+    assert len(enters) == 0      # 空格一次勾上,等计数涨到 2 即可
 
 
 def test_overshoot_aborts_instead_of_compensating(fake, monkeypatch):
@@ -559,7 +602,7 @@ def test_create_with_name_locates_the_new_group_by_diff(fake, monkeypatch):
     monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
     captured = {}
 
-    def fake_rename(rid, name, expect_members=None):
+    def fake_rename(rid, name, expect_members=None, already_open=False):
         captured.update(rid=rid, name=name, expect_members=expect_members)
         return {"success": True}
 
@@ -579,7 +622,7 @@ def test_create_with_name_locates_the_new_group_by_diff(fake, monkeypatch):
     assert r["rid"] == 42 and r["name"] == "临时讨论组"
     assert captured["rid"] == 42 and captured["name"] == "临时讨论组"
     # 改名前要拿成员名核对归属,所以必须把选中的人传下去
-    assert captured["expect_members"] == ["陈涛(水淼淼)", "陈挺"]
+    assert captured["expect_members"] == ["陈涛", "陈挺"]
 
 
 def test_create_with_name_waits_for_delayed_database_visibility(fake, monkeypatch):
@@ -588,7 +631,7 @@ def test_create_with_name_waits_for_delayed_database_visibility(fake, monkeypatc
     monkeypatch.setattr(
         local_group,
         "_rename_locked",
-        lambda rid, name, expect_members=None: (
+        lambda rid, name, expect_members=None, already_open=False: (
             captured.update(rid=rid, name=name) or {"success": True}
         ),
     )
@@ -719,7 +762,7 @@ def test_create_with_nickname_opens_group_info_not_the_title(fake, monkeypatch):
     monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
     captured = {}
 
-    def fake_nick(rid, nickname, expect_members=None, expect_title=None):
+    def fake_nick(rid, nickname, expect_members=None, expect_title=None, already_open=False):
         captured.update(
             rid=rid, nickname=nickname,
             expect_members=expect_members, expect_title=expect_title,
@@ -746,7 +789,7 @@ def test_create_with_nickname_opens_group_info_not_the_title(fake, monkeypatch):
     assert captured == {
         "rid": 42,
         "nickname": "小王",
-        "expect_members": ["陈涛(水淼淼)", "陈挺"],
+        "expect_members": ["陈涛", "陈挺"],
         "expect_title": None,
     }
 
@@ -759,12 +802,12 @@ def test_create_with_name_and_nickname_does_both(fake, monkeypatch):
     monkeypatch.setattr(
         local_group,
         "_rename_locked",
-        lambda rid, name, expect_members=None: {"success": True},
+        lambda rid, name, expect_members=None, already_open=False: {"success": True},
     )
     monkeypatch.setattr(
         local_group,
         "_set_nickname_locked",
-        lambda rid, nickname, expect_members=None, expect_title=None: (
+        lambda rid, nickname, expect_members=None, expect_title=None, already_open=False: (
             nick.update(
                 rid=rid, nickname=nickname,
                 expect_members=expect_members, expect_title=expect_title,
@@ -951,6 +994,20 @@ def test_nickname_hint_recognizes_chinese_and_english():
     assert not local_group._looks_like_nickname_hint("群聊名称")
 
 
+def test_scan_nickname_ui_uses_labeled_row_instead_of_dumping_the_tree(monkeypatch):
+    monkeypatch.setattr(local_group, "_nickname_dialog_field", lambda: None)
+    monkeypatch.setattr(
+        local_group, "_group_info_labeled_row", lambda _labels: (857, 375, 320, 40)
+    )
+    monkeypatch.setattr(
+        local_group, "_dump_ui_hints", lambda: pytest.fail("不该全树扫描")
+    )
+    found = local_group._scan_nickname_ui()
+    assert found["kind"] == "ROW"
+    assert found["x"] == 857 + 320 - 40
+    assert found["y"] == 375 + 20
+
+
 def test_header_more_uses_leftmost_of_three_buttons(monkeypatch):
     monkeypatch.setattr(
         local_group,
@@ -987,7 +1044,7 @@ def test_nickname_endpoint_success(api, fake, monkeypatch):
     monkeypatch.setattr(
         local_group,
         "_set_nickname_locked",
-        lambda rid, nickname, expect_members=None, expect_title=None: {"success": True},
+        lambda rid, nickname, expect_members=None, expect_title=None, already_open=False: {"success": True},
     )
 
     def confirm():
