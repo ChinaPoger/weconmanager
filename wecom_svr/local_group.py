@@ -9,11 +9,11 @@ userid,外部/微信联系人塞不进去;而「创建客户群」官方压根�
 
   - 面板是主窗口上的一个 AXSheet,搜索框是真 AXTextField(可直接 set value)
   - 搜索结果是 AXOutline,每行能读出姓名与部门 —— **选人前先核对,不靠猜**
-  - 搜索框支持空格一次填多人(「陈涛 陈挺 SMB售前bot」)。中文全名完全匹配会
-    自动勾上;带拼音/英文的不会,再逐个搜索+回车补选。自动勾上的人数对不上
-    就中止,绝不凑合。一个都没勾上则整批退回逐个搜索。
+  - 搜索框支持空格一次填多人,顺序不改(「陈涛 陈挺 SMB售前bot」)。中文全名完全
+    匹配会自动勾上;弹框里还没勾的英文/拼音联系人,用真鼠标点选。自动勾上的
+    人数对不上就中止,绝不凑合。对不上再退回逐个搜索+回车。
   - 逐个搜时:回车 = 选中结果里的第一条(勾选框是 AXImage,没有 action,
-    合成点击也打不进 CEF 自绘控件,回车是唯一可靠的选中方式)
+    合成点击也打不进 CEF 自绘控件;批量结果里用 CoreGraphics 真点)
   - 右侧标题里的「N contact(s) selected」能读出来,每步都能回读校验
 
 坐标依赖只剩不在 AX 树里的 "+" 按钮,按主窗口原点取相对偏移。新版客户端已把
@@ -25,6 +25,7 @@ import logging
 import re
 import subprocess
 import time
+from typing import NoReturn
 
 from . import directory, local_send, messages, ui_offsets
 from .group import MAX_NAME_LEN
@@ -56,6 +57,8 @@ SEARCH_POLL = 0.12
 SEARCH_POLL_TRIES = 15
 # 搜索命中多条时,最多读几行明细用于报错列候选(见 _search 里的性能说明)
 DETAIL_ROWS = 8
+# 批量结果里点选时多读几行,英文名靠前也要看到
+PICKER_ROW_CAP = 24
 
 # 选中一个人最多试几次(回车偶尔落空),以及每次判定前等计数刷新的次数/间隔
 SELECT_ATTEMPTS = 3
@@ -187,6 +190,27 @@ post(2);                // leftMouseUp
     if r.returncode != 0:
         raise LocalGroupError(f"发送鼠标事件失败: {(r.stderr or r.stdout).strip()}")
     time.sleep(0.8)
+
+
+def _picker_click(x: int, y: int) -> None:
+    """选人面板里点一行。跟 _real_click 同样发真鼠标,但不固定睡 0.8s — 点完轮询已选计数。"""
+    jxa = f'''
+ObjC.import('CoreGraphics');
+var pt = $.CGPointMake({int(x)}, {int(y)});
+function post(t) {{ $.CGEventPost(0, $.CGEventCreateMouseEvent($(), t, pt, 0)); }}
+post(5); delay(0.05);
+post(1); delay(0.05);
+post(2);
+'''
+    try:
+        r = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-"],
+            input=jxa, capture_output=True, text=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        raise LocalGroupError("发送鼠标事件超时") from None
+    if r.returncode != 0:
+        raise LocalGroupError(f"发送鼠标事件失败: {(r.stderr or r.stdout).strip()}")
 
 
 def _activate() -> None:
@@ -397,24 +421,37 @@ def _search_rows() -> tuple[int, list[dict]]:
     判重只需要总数,报错列候选只需要前几行。
     """
     out = _osa(_PICKER + f'''
+  -- SEARCH_ROWS
   set ol to outline 1 of scroll area 1 of group 1 of sg
-  set total to count of rows of ol
+  set total to 0
+  try
+    set total to count of rows of ol
+  end try
   set shown to total
   if shown > {DETAIL_ROWS} then set shown to {DETAIL_ROWS}
-  set acc to (total as string) & "{_ROW_SEP}"
+  set acc to ""
+  set n to 0
   repeat with i from 1 to shown
-    set c to UI element 1 of row i of ol
-    set nm to ""
-    set dp to ""
     try
-      set nm to value of UI element 2 of c
+      set rw to row i of ol
+      set c to UI element 1 of rw
+      set nm to ""
+      set dp to ""
+      try
+        set nm to value of UI element 2 of c
+      end try
+      try
+        set dp to value of UI element 7 of c
+      end try
+      if nm is not "" then
+        set n to n + 1
+        set acc to acc & nm & "{_FIELD_SEP}" & dp & "{_ROW_SEP}"
+      end if
     end try
-    try
-      set dp to value of UI element 7 of c
-    end try
-    set acc to acc & nm & "{_FIELD_SEP}" & dp & "{_ROW_SEP}"
   end repeat
-  return acc
+  -- 虚拟列表的 count 经常虚高;真正读到的行更少时,以读到的为准
+  if n > 0 and n < {DETAIL_ROWS} and total > n then set total to n
+  return (total as string) & "{_ROW_SEP}" & acc
 ''')
     parts = out.strip().strip('"').split(_ROW_SEP)
     total = int(parts[0]) if parts and parts[0].strip().isdigit() else 0
@@ -425,20 +462,192 @@ def _search_rows() -> tuple[int, list[dict]]:
         name, _, dept = chunk.partition(_FIELD_SEP)
         # 没有部门的联系人(外部/微信)读回来是 AppleScript 的 missing value
         rows.append({"name": name, "dept": "" if dept == "missing value" else dept})
+    if rows and len(rows) < DETAIL_ROWS and total > len(rows):
+        total = len(rows)
     return total, rows
 
 
 def _search(keyword: str) -> tuple[int, list[dict]]:
-    """把关键词写进搜索框,轮询到有结果(或超时)再读明细。"""
+    """把关键词写进搜索框,等结果从上一批名单里换过来再读。"""
+    _before_total, before_rows = _search_rows()
+    before_names = tuple(r.get("name") for r in before_rows)
     _set_search_text(keyword)
-    total = 0
+    last: tuple[int, list[dict]] = (0, [])
+    for i in range(max(1, SEARCH_POLL_TRIES)):
+        last = _search_rows()
+        names = tuple(r.get("name") for r in last[1])
+        changed = names != before_names or not before_names
+        if last[0] > 0 and (changed or i == SEARCH_POLL_TRIES - 1):
+            return last
+        time.sleep(SEARCH_POLL)
+    return last
+
+
+def _bulk_search_text(queries: list[str]) -> str:
+    """空格一次搜,名字顺序跟调用方给的一样。"""
+    return " ".join(queries)
+
+
+def _picker_result_rows() -> list[dict]:
+    """批量结果里每一行:姓名、部门、是否已选、点击坐标。"""
+    out = _osa(_PICKER + f'''
+  -- PICKER_RESULT_ROWS
+  set ol to outline 1 of scroll area 1 of group 1 of sg
+  set total to 0
+  try
+    set total to count of rows of ol
+  end try
+  set shown to total
+  if shown > {PICKER_ROW_CAP} then set shown to {PICKER_ROW_CAP}
+  set acc to ""
+  set n to 0
+  repeat with i from 1 to shown
+    try
+      set rw to row i of ol
+      set c to UI element 1 of rw
+      set nm to ""
+      set dp to ""
+      try
+        set nm to value of UI element 2 of c
+      end try
+      try
+        set dp to value of UI element 7 of c
+      end try
+      if nm is not "" then
+        set sel to "0"
+        try
+          if selected of rw then set sel to "1"
+        end try
+        set p to position of rw
+        set sz to size of rw
+        set loc to (item 1 of p as string) & "," & (item 2 of p as string)
+        set loc to loc & "," & (item 1 of sz as string) & "," & (item 2 of sz as string)
+        set n to n + 1
+        set acc to acc & nm & "{_FIELD_SEP}" & dp & "{_FIELD_SEP}" & sel & "{_FIELD_SEP}" & loc & "{_ROW_SEP}"
+      end if
+    end try
+  end repeat
+  return (n as string) & "{_ROW_SEP}" & acc
+''')
+    parts = (out or "").strip().strip('"').split(_ROW_SEP)
+    rows: list[dict] = []
+    for chunk in parts[1:]:
+        if not chunk:
+            continue
+        name, _, rest = chunk.partition(_FIELD_SEP)
+        dept, _, rest = rest.partition(_FIELD_SEP)
+        sel, _, pos = rest.partition(_FIELD_SEP)
+        x = y = w = h = 0
+        bits = pos.split(",")
+        try:
+            x, y, w, h = (int(bits[0]), int(bits[1]), int(bits[2]), int(bits[3]))
+        except (ValueError, IndexError):
+            pass
+        rows.append({
+            "name": name,
+            "dept": "" if dept == "missing value" else dept,
+            "selected": sel == "1",
+            "x": x + max(w, 40) // 2,
+            "y": y + max(h, 20) // 2,
+        })
+    return rows
+
+
+def _await_picker_rows(min_rows: int) -> list[dict]:
     rows: list[dict] = []
     for _ in range(max(1, SEARCH_POLL_TRIES)):
-        total, rows = _search_rows()
-        if total > 0:
-            return total, rows
+        rows = _picker_result_rows()
+        if len(rows) >= min_rows:
+            return rows
         time.sleep(SEARCH_POLL)
-    return total, rows
+    return rows
+
+
+def _click_picker_row(row: dict) -> None:
+    """点选人结果里的一行。先走可打桩的 AppleScript 标记,再发真鼠标。"""
+    x, y = int(row.get("x") or 0), int(row.get("y") or 0)
+    if x <= 0 or y <= 0:
+        raise LocalGroupError(
+            f"结果行「{row.get('name') or ''}」没有可点的坐标,已中止,没有建群。"
+        )
+    name = _escape(str(row.get("name") or ""))
+    _osa(_PICKER + f'''
+  -- CLICK_PICKER_ROW
+  set clickName to "{name}"
+''')
+    _picker_click(x, y)
+
+
+def _resolved_display_name(query: str) -> str:
+    try:
+        return str(directory.resolve_member(query).get("name") or "").strip()
+    except LocalSendError:
+        return ""
+
+
+def _row_matches_query(row: dict, query: str) -> bool:
+    name = str(row.get("name") or "").strip()
+    q = (query or "").strip()
+    if not name or not q:
+        return False
+    n, ql = name.lower(), q.lower()
+    if ql == n or ql in n or n in ql:
+        return True
+    resolved = _resolved_display_name(q)
+    if not resolved:
+        return False
+    r = resolved.lower()
+    return r == n or r in n or n in r or n.startswith(r)
+
+
+def _english_candidate_rows(rows: list[dict], queries: list[str]) -> list[dict]:
+    """弹框里对上英文/拼音查询、还没勾上的那几行。一对多就当歧义。"""
+    used: set[int] = set()
+    hits: list[dict] = []
+    for query in queries:
+        matched = [
+            (i, row) for i, row in enumerate(rows)
+            if i not in used and _row_matches_query(row, query)
+        ]
+        if len(matched) > 1:
+            shown = ", ".join(f"{r['name']}({r['dept']})" for _i, r in matched)
+            raise AmbiguousCandidate(
+                f"「{query}」在客户端里搜出多条: {shown}。"
+                "请写得更精确(全名/工号/手机号)。"
+            )
+        if len(matched) == 1:
+            i, row = matched[0]
+            used.add(i)
+            hits.append({**row, "query": query})
+    return hits
+
+
+def _click_english_candidates(targets: list[dict], expect_total: int) -> list[dict]:
+    """点弹框里未勾上的英文/拼音联系人。每点一个人必须看到已选+1,多了就停。"""
+    clicked: list[dict] = []
+    got = _selected_count()
+    for row in targets:
+        if got >= expect_total:
+            break
+        _click_picker_row(row)
+        now = _await_selected_count(got + 1)
+        label = row.get("name") or row.get("query") or ""
+        if now > expect_total:
+            raise LocalGroupError(
+                f"点选「{label}」后已选人数是 {now},超过预期 {expect_total} —— "
+                "可能多选了人,已中止,没有建群。"
+            )
+        if now < got:
+            raise LocalGroupError(
+                f"点选「{label}」把已选人数从 {got} 降到了 {now} —— "
+                "可能点到了已勾上的人,已中止,没有建群。"
+            )
+        if now == got + 1:
+            clicked.append(row)
+            got = now
+            continue
+        log.warning("点选「%s」后已选仍是 %d(预期 %d),跳过", label, now, got + 1)
+    return clicked
 
 
 def _selected_count() -> int:
@@ -531,22 +740,54 @@ def _member_from_query(query: str, row: dict | None = None) -> dict:
     return {"query": query, "name": query, "dept": ""}
 
 
-def _select_members(queries: list[str]) -> list[dict]:
-    """空格一次填入全部名字。中文全名会自动勾上;英文/拼音留在候选里,再逐个回车补选。
+def _members_from_bulk(
+    queries: list[str], auto: list[str], clicked: list[dict],
+) -> list[dict]:
+    by_query: dict[str, dict] = {}
+    for row in clicked:
+        q = str(row.get("query") or "")
+        if q:
+            by_query[q] = _member_from_query(q, row)
+    for q in auto:
+        by_query.setdefault(q, _member_from_query(q))
+    return [by_query.get(q, _member_from_query(q)) for q in queries]
 
-    一个都没勾上 → 这个客户端大概不支持批量,整批退回逐个搜索。
-    勾了但人数对不上中文全名数 → 可能多选了,中止。
+
+def _diagnose_bulk_mismatch(
+    auto: list[str], rest: list[str], got: int, total: int,
+) -> NoReturn:
+    """人数对不上时逐个搜一遍,让「搜不到/歧义」走原来的错误。"""
+    for q in auto + rest:
+        hits, rows = _search(q)
+        if hits == 0:
+            raise LocalGroupError(f"客户端通讯录里搜不到「{q}」")
+        if hits > 1:
+            shown = ", ".join(f"{r['name']}({r['dept']})" for r in rows)
+            more = f" 等 {hits} 条" if hits > len(rows) else ""
+            raise AmbiguousCandidate(
+                f"「{q}」在客户端里搜出多条: {shown}{more}。"
+                "回车只会选中第一条,请写得更精确(全名/工号/手机号)。"
+            )
+    raise LocalGroupError(
+        f"空格一次选人后已选人数是 {got},预期中文全名 {len(auto)} / 全部 {total} —— "
+        "可能多选或少选了人,已中止,没有建群。请把名字写得更精确后重试。"
+    )
+
+
+def _select_members(queries: list[str]) -> list[dict]:
+    """空格一次填入全部名字,顺序不改。中文全名自动勾上;弹框里未勾的英文点选。
+
+    一个都没勾上且点选也没涨 → 退回逐个搜索+回车。
     """
     if len(queries) == 1:
         return [_select_member(queries[0], 1)]
 
     auto = [q for q in queries if _looks_like_chinese_fullname(q)]
     rest = [q for q in queries if q not in auto]
-    _set_search_text(" ".join(queries))
-    # 中文全名会自动勾;英文要再点候选。先等到「至少勾上了中文名那么多」
-    # 或计数稳定,再决定走哪条。
-    target = len(auto) if auto else len(queries)
-    got = _await_selected_count(target)
+    _set_search_text(_bulk_search_text(queries))
+    rows = _await_picker_rows(len(queries))
+    target = len(auto) if auto else 0
+    got = _await_selected_count(target) if target else _selected_count()
 
     if got > len(queries):
         raise LocalGroupError(
@@ -556,34 +797,35 @@ def _select_members(queries: list[str]) -> list[dict]:
     if got == len(queries):
         log.info("拉群空格一次选中全部 %d 人", got)
         return [_member_from_query(q) for q in queries]
+
+    names = [str(r.get("name") or "") for r in rows]
+    clicked: list[dict] = []
+    if rest and rows:
+        targets = _english_candidate_rows(rows, rest)
+        if targets:
+            log.info(
+                "拉群空格一次选中 %d 人,点选未勾英文联系人 %s",
+                got, [t.get("name") for t in targets],
+            )
+            clicked = _click_english_candidates(targets, expect_total=len(queries))
+            got = _selected_count()
+            if got == len(queries):
+                return _members_from_bulk(queries, auto, clicked)
+            if got > len(queries):
+                raise LocalGroupError(
+                    f"点选后已选人数是 {got},超过预期 {len(queries)} —— "
+                    "可能多选了人,已中止,没有建群。"
+                )
+            raise LocalGroupError(
+                f"点选未勾英文联系人后已选 {got}/{len(queries)},看到的结果是 {names} —— "
+                "已中止,没有建群。"
+            )
+
     if got == 0:
         log.info("拉群空格一次选人未生效,改走逐个搜索")
         return [_select_member(q, i + 1) for i, q in enumerate(queries)]
-    if auto and got == len(auto):
-        log.info("拉群空格一次选中 %d 个中文名,其余逐个补选", got)
-        picked = [_member_from_query(q) for q in auto]
-        for q in rest:
-            picked.append(_select_member(q, len(picked) + 1))
-        by_query = {p["query"]: p for p in picked}
-        return [by_query[q] for q in queries]
 
-    # 中文全名数对不上:有的名字可能根本不存在。逐个搜一遍,让「搜不到/歧义」
-    # 走原来的错误,而不是笼统报人数不对。
-    for q in auto:
-        total, rows = _search(q)
-        if total == 0:
-            raise LocalGroupError(f"客户端通讯录里搜不到「{q}」")
-        if total > 1:
-            shown = ", ".join(f"{r['name']}({r['dept']})" for r in rows)
-            more = f" 等 {total} 条" if total > len(rows) else ""
-            raise AmbiguousCandidate(
-                f"「{q}」在客户端里搜出多条: {shown}{more}。"
-                "回车只会选中第一条,请写得更精确(全名/工号/手机号)。"
-            )
-    raise LocalGroupError(
-        f"空格一次选人后已选人数是 {got},预期中文全名 {len(auto)} / 全部 {len(queries)} —— "
-        "可能多选或少选了人,已中止,没有建群。请把名字写得更精确后重试。"
-    )
+    _diagnose_bulk_mismatch(auto, rest, got, len(queries))
 
 
 def _wait_sheet_closed(timeout: float = 2.0) -> None:
