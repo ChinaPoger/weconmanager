@@ -221,6 +221,37 @@ def test_group_number_is_prefixed_to_avoid_colliding_with_qq_groups(settings):
     assert "20614687431404" in hook["groupNumber"]
 
 
+def test_id_text_never_emits_scientific_notation():
+    rid = 10945118031183243
+    assert mars_sync.id_text(rid) == "10945118031183243"
+    assert mars_sync.id_text(float(rid)) == "10945118031183244"  # IEEE-754 最近偶数
+    assert mars_sync.id_text("1.0945118031183244e+16") == "10945118031183244"
+    assert mars_sync.id_text("10945118031183243") == "10945118031183243"
+    assert "e" not in mars_sync.id_text(float(rid)).lower()
+    assert mars_sync.group_number_text("R:", float(rid)) == "R:10945118031183244"
+    assert mars_sync.normalize_group_number("R:1.0945118031183244e+16") == "R:10945118031183244"
+    assert mars_sync.normalize_group_number("wework-1.0945118031183244e+16") == "wework-10945118031183244"
+
+
+def test_large_float_rid_is_decimal_in_group_number(settings):
+    """sqlite REAL / JSON number 会把 17 位 RID 变成 float,绝不能 f-string 成 e+16。"""
+    rid = 10945118031183243.0
+    msg = {**_msg(1, 1, "x"), "rid": rid, "group_name": ""}
+    s = settings.model_copy(update={"mars_group_prefix": "R:"})
+    hook = mars_sync.to_hook(msg, s)
+    assert hook["groupNumber"] == "R:10945118031183244"
+    assert "e+" not in hook["groupNumber"].lower()
+    assert hook["groupName"] == "未命名群-10945118031183244"
+    assert hook["senderNumber"] == "5629500548464930"
+
+
+def test_float_sender_id_is_decimal_not_scientific(settings):
+    msg = {**_msg(1, 1, "x"), "sender_id": 5629500548464930.0}
+    hook = mars_sync.to_hook(msg, settings)
+    assert hook["senderNumber"] == "5629500548464930"
+    assert "e" not in hook["senderNumber"].lower()
+
+
 def test_sendernumber_uses_local_rid_even_when_userid_exists(settings):
     hook = mars_sync.to_hook(_msg(1, 1, "x", userid=""), settings)
     assert hook["senderNumber"] == "5629500548464930"
@@ -435,6 +466,24 @@ def test_old_outbox_normalizes_numeric_member_identity_fields(settings):
         "userid": "708781594",
         "corpid": "1970325276990586",
     }
+
+
+def test_old_outbox_rewrites_scientific_group_number(settings):
+    msg = {**_msg(7, 100, "[图片]"), "raw": b"tree", "rid": 10945118031183243.0}
+    path = mars_sync._outbox_path(msg, settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "message": "frozen",
+            "groupNumber": "R:1.0945118031183244e+16",
+            "senderNumber": 5.62950054846493e+15,
+        }),
+        encoding="utf-8",
+    )
+    hook = mars_sync.peek_outbox(msg, settings)
+    assert hook["groupNumber"] == "R:10945118031183244"
+    assert hook["senderNumber"] == "5629500548464930"
+    assert "e" not in hook["groupNumber"].lower()
 
 
 def test_a_message_without_media_is_not_written_to_the_outbox(settings):

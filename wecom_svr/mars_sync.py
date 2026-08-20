@@ -70,6 +70,54 @@ def _error_text(value: object) -> str:
     return str(value or "")[:MAX_ERROR_LENGTH]
 
 
+def id_text(value: object) -> str:
+    """企微 RID 等大整数身份 → 十进制字符串。
+
+    绝不能直接 `str(float)` / `f"{float}"`: 17 位 RID 会变成 `1.09...e+16`,
+    再拼上 `R:` / `wework-` 就会把脏群号推给 mars(前端 query 也会跟着坏掉)。
+    已经脏成科学计数法的字符串,这里尽量收回成十进制;float 精度本身丢了
+    的救不回,只能保证不再继续写出 `e+`。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return format(int(value), "d")
+    text = str(value).strip()
+    if not text:
+        return ""
+    compact = text.replace("_", "")
+    lower = compact.lower()
+    if "e" in lower or "." in compact:
+        try:
+            return format(int(float(compact)), "d")
+        except (TypeError, ValueError, OverflowError):
+            return text
+    if compact.isdigit() or (compact[:1] == "-" and compact[1:].isdigit()):
+        return compact
+    return text
+
+
+def group_number_text(prefix: str, rid: object) -> str:
+    """前缀 + RID。RID 统一走 id_text,避免 `R:1.09e+16`。"""
+    return f"{prefix or ''}{id_text(rid)}"
+
+
+def normalize_group_number(value: object) -> str:
+    """修正已经脏掉的群号(前缀保留,只收数字段)。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lower = text.lower()
+    for p in ("wework-", "wecom-", "r:"):
+        if lower.startswith(p):
+            return f"{text[:len(p)]}{id_text(text[len(p):])}"
+    return id_text(text)
+
+
 def _summarize_errors(errors) -> str:
     """多个群的报错收成一句。只有一个群挂时给出原文,那才是能直接排查的信息。
 
@@ -253,7 +301,8 @@ def group_name(name: str, settings: Settings, rid: int | str | None = None) -> s
     """
     name = (name or "").strip()
     if not name:
-        name = f"{UNNAMED_GROUP_FALLBACK}-{rid}" if rid is not None else UNNAMED_GROUP_FALLBACK
+        rid_text = id_text(rid)
+        name = f"{UNNAMED_GROUP_FALLBACK}-{rid_text}" if rid_text else UNNAMED_GROUP_FALLBACK
     prefix = settings.mars_group_name_prefix
     if not prefix or name.startswith(prefix):
         return name
@@ -399,8 +448,8 @@ def message_body(msg: dict, settings: Settings) -> str:
 
 
 def _outbox_path(msg: dict, settings: Settings) -> Path:
-    rid, lid = int(msg.get("rid") or 0), int(msg.get("lid") or 0)
-    return settings.mars_outbox_dir / str(rid) / f"{int(msg.get('send_time') or 0)}-{lid}.json"
+    rid, lid = id_text(msg.get("rid") or 0), id_text(msg.get("lid") or 0)
+    return settings.mars_outbox_dir / rid / f"{int(msg.get('send_time') or 0)}-{lid}.json"
 
 
 def peek_outbox(msg: dict, settings: Settings) -> dict | None:
@@ -422,9 +471,15 @@ def peek_outbox(msg: dict, settings: Settings) -> dict | None:
             raise TypeError("hook 格式无效")
         # 早期 outbox 可能把 SQLite 的数字身份原样冻结下来。正文必须保持首次
         # 决定,但身份字段只是 JSON 契约适配,重试时归一化不会改变消息去重键。
+        # groupNumber / senderNumber 一旦写成科学计数法,mars 会建出脏群号,
+        # 这里同样收回成十进制(checksum 含这两项,所以这是在修已经写坏的身份)。
         for field in ("userid", "corpid"):
             if field in hook:
                 hook[field] = str(hook[field] or "")
+        if "groupNumber" in hook:
+            hook["groupNumber"] = normalize_group_number(hook.get("groupNumber"))
+        if "senderNumber" in hook:
+            hook["senderNumber"] = id_text(hook.get("senderNumber"))
         return hook
     except (json.JSONDecodeError, TypeError) as e:
         raise MarsStateError(f"mars outbox 损坏 {path}: {e}") from e
@@ -526,13 +581,13 @@ def to_hook(msg: dict, settings: Settings) -> dict:
     """
     userid = str(msg.get("sender_userid") or "")
     corpid = str(msg.get("sender_corpid") or "")
-    sender_number = str(msg.get("sender_id") or "")
+    sender_number = id_text(msg.get("sender_id"))
     name = msg.get("sender_name") or userid or sender_number
     return {
         "message": message_body(msg, settings),
         # 本地消息没有客户 UID 时保持 0,与 Mars MessageHook 的默认值一致。
         "uid": int(msg.get("uid") or 0),
-        "groupNumber": f"{settings.mars_group_prefix}{msg['rid']}",
+        "groupNumber": group_number_text(settings.mars_group_prefix, msg.get("rid")),
         "groupName": group_name(msg.get("group_name") or "", settings, msg.get("rid")),
         "senderNumber": sender_number,
         "userid": userid,

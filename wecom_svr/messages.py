@@ -34,6 +34,32 @@ from .settings import get_agent_home
 
 log = logging.getLogger(__name__)
 
+
+def _int_id(value: object, default: int = 0) -> int:
+    """sqlite / JSON 里的会话 RID、发送人 RID → Python int。
+
+    sqlite 列一旦是 REAL,Python 拿到的就是 float;再 `f"{rid}"` 就会变成
+    `1.09e+16` 这种科学计数法,mars 群号跟着脏掉。这里统一收成 int。
+    """
+    if value is None or value is False:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip().replace("_", "")
+    if not text:
+        return default
+    try:
+        if "e" in text.lower() or "." in text:
+            return int(float(text))
+        return int(text)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 # CONVERSATION.conversationtype —— 1 是群聊(0 单聊,3/6/7/10x 是各类应用会话)
 GROUP_CONV_TYPE = 1
 
@@ -354,7 +380,7 @@ def _load_senders() -> dict[int, dict]:
 
     senders = {}
     for r in rows:
-        senders[r[0]] = {
+        senders[_int_id(r[0])] = {
             "name": r[1] or "",
             "userid": r[2] or "",
             "corpid": (r[3] if has_corpid else "") or "",
@@ -670,7 +696,7 @@ def list_groups(
         sql += " LIMIT ?"
         params += (int(limit),)
     return [
-        {"rid": r["RID"], "name": r["name"] or "", "sort_time": r["sort_time"]}
+        {"rid": _int_id(r["RID"]), "name": r["name"] or "", "sort_time": r["sort_time"]}
         for r in _rows(sql, params)
     ]
 
@@ -709,12 +735,12 @@ def latest_cursor(rid: int | None = None) -> Cursor:
     params: tuple = ()
     if rid is not None:
         sql += " WHERE conv_id = ?"
-        params = (int(rid),)
+        params = (_int_id(rid),)
     sql += " ORDER BY send_time DESC, LID DESC LIMIT 1"
     rows = _rows(sql, params)
     if not rows:
         return Cursor()
-    return Cursor(int(rows[0]["send_time"] or 0), int(rows[0]["LID"] or 0))
+    return Cursor(int(rows[0]["send_time"] or 0), _int_id(rows[0]["LID"]))
 
 
 MAX_GROUPS_PER_QUERY = 400  # sqlite 默认 compound SELECT 上限是 500
@@ -793,8 +819,8 @@ def fetch_since(
     scan_end: dict[int, Cursor] = {}
     scan_counts: dict[int, int] = {}
     for r in rows:
-        rid = int(r["conv_id"])
-        scan_end[rid] = Cursor(int(r["send_time"] or 0), int(r["LID"]))
+        rid = _int_id(r["conv_id"])
+        scan_end[rid] = Cursor(int(r["send_time"] or 0), _int_id(r["LID"]))
         scan_counts[rid] = scan_counts.get(rid, 0) + 1
         ctype = r["content_type"]
         rich_image = _rich_image_text(ctype, r["content"])
@@ -819,14 +845,14 @@ def fetch_since(
         if skipped and not include_skipped:
             continue
 
-        sender = senders.get(r["sender_id"], {})
+        sender = senders.get(_int_id(r["sender_id"]), {})
         out.append({
-            "lid": r["LID"],
-            "rid": r["conv_id"],
+            "lid": _int_id(r["LID"]),
+            "rid": rid,
             "group_name": r["conv_name"] or "",
             "send_time": int(r["send_time"] or 0),
             "time": v.export.fmt_time(r["send_time"] or 0),
-            "sender_id": r["sender_id"],
+            "sender_id": _int_id(r["sender_id"]),
             "sender_name": sender.get("name") or v.export.resolve_sender(r["sender_id"], names),
             "sender_userid": sender.get("userid", ""),
             "sender_corpid": sender.get("corpid", ""),
@@ -859,9 +885,9 @@ def count_since(cursors: dict[int, Cursor]) -> dict[int, int]:
     params: list = []
     for rid, cursor in cursors.items():
         clauses.append("(conv_id = ? AND (send_time > ? OR (send_time = ? AND LID > ?)))")
-        params.extend((int(rid), cursor.send_time, cursor.send_time, cursor.lid))
+        params.extend((_int_id(rid), cursor.send_time, cursor.send_time, cursor.lid))
     rows = _rows(
         f"SELECT conv_id, COUNT(*) AS n FROM MESSAGE WHERE {' OR '.join(clauses)} GROUP BY conv_id",
         params,
     )
-    return {int(r["conv_id"]): int(r["n"]) for r in rows}
+    return {_int_id(r["conv_id"]): int(r["n"]) for r in rows}
