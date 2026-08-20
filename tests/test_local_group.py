@@ -33,9 +33,37 @@ class FakeClient:
         self.confirmed = False
         self.scripts: list[str] = []
         self.plus_clicked = False
+        self.clicked_names: set[str] = set()
 
     def _rows_for(self, keyword: str) -> list[tuple[str, str]]:
-        return self.directory.get(keyword, [])
+        parts = [p for p in (keyword or "").split() if p]
+        if not parts:
+            return []
+        if len(parts) > 1 and not self.auto_bulk:
+            return []
+        if len(parts) == 1:
+            return list(self.directory.get(parts[0], []))
+        seen: set[str] = set()
+        out: list[tuple[str, str]] = []
+        for part in parts:
+            for row in self.directory.get(part, []):
+                if row[0] in seen:
+                    continue
+                seen.add(row[0])
+                out.append(row)
+        return out
+
+    def _auto_selected_names(self) -> set[str]:
+        names = set(self.clicked_names)
+        if not self.auto_bulk:
+            return names
+        for part in (self.last_search or "").split():
+            if not local_group._looks_like_chinese_fullname(part):
+                continue
+            rows = self.directory.get(part, [])
+            if len(rows) == 1:
+                names.add(rows[0][0])
+        return names
 
     def __call__(self, script: str, timeout: int = 15) -> tuple[bool, str]:
         """按脚本特征分派。
@@ -66,12 +94,26 @@ class FakeClient:
                 auto = [
                     p for p in parts
                     if local_group._looks_like_chinese_fullname(p)
-                    and len(self._rows_for(p)) == 1
+                    and len(self.directory.get(p, [])) == 1
                 ]
                 if auto:
                     self.selected = len(auto)
             return True, ""
-        if "count of rows of ol" in script:    # 读当前搜索结果
+        if "PICKER_RESULT_ROWS" in script:
+            rows = self._rows_for(self.last_search)
+            selected = self._auto_selected_names()
+            body = "".join(
+                f"{n}{SEP_FIELD}{d}{SEP_FIELD}{'1' if n in selected else '0'}"
+                f"{SEP_FIELD}10,20,120,28{SEP_ROW}"
+                for n, d in rows[: local_group.PICKER_ROW_CAP]
+            )
+            return True, f"{len(rows)}{SEP_ROW}{body}"
+        if "CLICK_PICKER_ROW" in script:
+            name = script.split('set clickName to "')[1].split('"')[0]
+            self.clicked_names.add(name)
+            self.selected += 1
+            return True, ""
+        if "SEARCH_ROWS" in script or "count of rows of ol" in script:
             rows = self._rows_for(self.last_search)
             body = "".join(f"{n}{SEP_FIELD}{d}{SEP_ROW}" for n, d in rows[:8])
             return True, f"{len(rows)}{SEP_ROW}{body}"
@@ -113,6 +155,7 @@ def _fast_and_macos(monkeypatch, tmp_path):
     get_settings.cache_clear()
     get_agent_home.cache_clear()
     monkeypatch.setattr(local_group, "ensure_macos", lambda: None)
+    monkeypatch.setattr(local_group, "_picker_click", lambda x, y: None)
     monkeypatch.setattr(local_group.time, "sleep", lambda _s: None)
     monkeypatch.setattr(local_group, "SHEET_TIMEOUT", 0.1)
     monkeypatch.setattr(local_group, "PROBE_TIMEOUT", 0.1)
@@ -203,7 +246,7 @@ def test_unknown_name_aborts(fake):
 def test_count_mismatch_aborts_before_confirming(fake, monkeypatch):
     """客户端没真的选上时,计数对不上 —— 必须中止,不能硬按「完成」。"""
     monkeypatch.setattr(local_group, "_selected_count", lambda: 0)
-    with pytest.raises(local_group.LocalGroupError, match="已选人数"):
+    with pytest.raises(local_group.LocalGroupError, match=r"试了 3 次|已选人数"):
         local_group.create_group(["陈涛", "陈挺"])
     assert fake.confirmed is False
 
@@ -216,14 +259,40 @@ def test_space_separated_chinese_names_are_selected_without_enter(fake):
     assert not any("keystroke return" in s for s in fake.scripts)
 
 
-def test_pinyin_names_are_picked_after_chinese_auto_select(fake):
-    """空格一次搜到所有人;中文自动勾上,英文/拼音还要回车补选。"""
+def test_bulk_search_keeps_caller_order():
+    assert local_group._bulk_search_text(["陈涛", "SMB售前bot", "陈挺"]) == (
+        "陈涛 SMB售前bot 陈挺"
+    )
+    assert local_group._bulk_search_text(["chenting01", "chentao", "梁超"]) == (
+        "chenting01 chentao 梁超"
+    )
+
+
+def test_pinyin_names_are_clicked_after_chinese_auto_select(fake):
+    """空格一次搜到所有人;中文自动勾上,弹框里未勾的英文/拼音点选,不用回车。"""
     r = local_group.create_group(["陈涛", "SMB售前bot", "陈挺"])
     assert r["success"] is True
     assert [m["query"] for m in r["members"]] == ["陈涛", "SMB售前bot", "陈挺"]
     assert fake.selected == 3
-    enters = [s for s in fake.scripts if "keystroke return" in s]
-    assert len(enters) == 1  # 只给 SMB售前bot 补一次回车
+    assert fake.last_search == "陈涛 SMB售前bot 陈挺"
+    assert not any("keystroke return" in s for s in fake.scripts)
+    clicks = [s for s in fake.scripts if "CLICK_PICKER_ROW" in s]
+    assert len(clicks) == 1
+    assert "SMB售前bot" in clicks[0]
+
+
+def test_english_candidate_rows_match_query_or_resolved_name(monkeypatch):
+    monkeypatch.setattr(
+        directory, "resolve_member", lambda q: {"name": "陈挺"} if q == "chenting01" else {"name": q},
+    )
+    rows = [
+        {"name": "陈挺", "dept": "增长产品部"},
+        {"name": "陈涛(水淼淼)", "dept": "增长产品部"},
+        {"name": "梁超", "dept": ""},
+    ]
+    hits = local_group._english_candidate_rows(rows, ["chenting01"])
+    assert [h["name"] for h in hits] == ["陈挺"]
+    assert hits[0]["query"] == "chenting01"
 
 
 def test_needs_at_least_two_others(fake):
