@@ -73,6 +73,9 @@ GROUP_APPEAR_POLL_MAX = 8.0
 # 看到第一个新会话后还要再等一会儿才下结论: 这段等待期里落库的会话会一起进差集,
 # 「同时冒出来两个」就能被识别成不唯一而放弃改名,而不是抓到谁就改谁。
 GROUP_APPEAR_SETTLE = 4.0
+# 确认后客户端切到新群可能慢于面板关掉。改名/改昵称前先等标题变成新群。
+TITLE_SWITCH_TIMEOUT = 8.0
+TITLE_SWITCH_POLL = 0.2
 
 
 class LocalGroupError(LocalSendError):
@@ -192,8 +195,8 @@ post(2);                // leftMouseUp
     time.sleep(0.8)
 
 
-def _picker_click(x: int, y: int) -> None:
-    """选人面板里点一行。跟 _real_click 同样发真鼠标,但不固定睡 0.8s — 点完轮询已选计数。"""
+def _ui_click(x: int, y: int) -> None:
+    """发一次真鼠标,立刻返回。点完由调用方轮询成功信号,别固定睡。"""
     jxa = f'''
 ObjC.import('CoreGraphics');
 var pt = $.CGPointMake({int(x)}, {int(y)});
@@ -211,6 +214,11 @@ post(2);
         raise LocalGroupError("发送鼠标事件超时") from None
     if r.returncode != 0:
         raise LocalGroupError(f"发送鼠标事件失败: {(r.stderr or r.stdout).strip()}")
+
+
+def _picker_click(x: int, y: int) -> None:
+    """选人面板里点一行。跟 _real_click 同样发真鼠标,但不固定睡 0.8s — 点完轮询已选计数。"""
+    _ui_click(x, y)
 
 
 def _activate() -> None:
@@ -884,7 +892,7 @@ def create_group(
         name: 群名。选人面板里没有命名输入框,所以是「先建群、再改名」两步;
               改名失败不会回滚群 —— 群已经建出来了,回滚反而更吓人。
         return_rid: 是否定位并返回新群的本地会话 RID。
-        nickname: 我在该群中的昵称。建群成功并定位到 RID 后设置。
+        nickname: 我在该群中的昵称。建群确认后当前窗口就是新群,先改界面再等 RID。
 
     Returns:
         {"success": bool, "members": [...], "member_count": int, "rid": ..., "error": ...}
@@ -916,13 +924,11 @@ def create_group(
     if nickname and nickname.strip():
         wanted_nickname = _check_name(nickname, "群昵称")
 
-    # 快照 → 建群 → 差集 → 核对标题 → 改名,全程一次持锁。差集是靠「新出现的群
-    # RID」认新群(新群的 name 是空的,只能这么认),中间放开锁的话,另一个并发
-    # 建群会让差集出现两个新 RID —— 两边都只能放弃改名。
+    # 确认后客户端已停在新群上。改名/改昵称只看当前窗口,不等 RID。
+    # 等 RID 放到最后: 改界面这几秒里 Info.db 几乎已经写出新会话。
     #
-    # 但锁只管本机: 这期间别人也可能把你拉进一个群,那个会话同样是「新出现的
-    # RID」。所以差集选出来的候选还要再过一道标题核对(_rename_locked 的
-    # expect_members),对不上就不改名。
+    # 快照仍要,用来最后定位 RID。锁只管本机并发; 别人这会儿把你拉进群
+    # 时差集可能不唯一,但当前窗口仍是刚建的群,改名不该因此放弃。
     t0 = time.monotonic()
 
     def _phase(label: str, started: float) -> None:
@@ -964,34 +970,29 @@ def create_group(
             log.info("拉群完成 %.1fs", time.monotonic() - t0)
             return result
 
-        t = time.monotonic()
-        new_rids = _wait_new_group_rids(before)
-        _phase("wait_rid", t)
-        if len(new_rids) != 1:
-            locate_err = (
-                f"等待本地会话落库后仍没能唯一定位新建的会话(新增 {len(new_rids)} 个)"
-            )
-            if wanted_name:
-                result["name_error"] = f"群建好了,{locate_err},群名没改成。请手动改名。"
-            if wanted_nickname:
-                result["nickname_error"] = (
-                    f"群建好了,{locate_err},我在本群的昵称没改成。请手动修改。"
-                )
-            if not wanted_name and not wanted_nickname:
-                result["rid_error"] = f"群建好了,但{locate_err}"
-            log.info("拉群完成 %.1fs (未定位 RID)", time.monotonic() - t0)
-            return result
-
-        result["rid"] = new_rids[0]
         expected = [p["name"] for p in picked]
-        # 改完群名后标题就不再是成员拼名。后面改昵称必须改核「现在这个标题」,
-        # 不能再用「像刚建出来的群」去拦,否则会把已经改好名的新群误判成别人的群。
-        # 按「完成」后客户端已经停在新群上,不必再 _activate / 用 scheme 打开一遍。
+        # 确认后先等标题切到新群,再改界面。RID 放到最后再查:改名/改昵称
+        # 这几秒里 Info.db 几乎已经写出新会话,等 RID 多半变成一次查库。
+        t = time.monotonic()
+        if not _await_new_group_title(expected):
+            what = "群名" if wanted_name else "昵称"
+            result["name_error" if wanted_name else "nickname_error"] = (
+                f"群建好了,但当前窗口标题还没切到新群,{what}没改成。请手动修改。"
+            )
+            rid = _unique_new_rid(before, prefer_name=None)
+            _phase("wait_rid", t)
+            if rid is not None:
+                result["rid"] = rid
+            else:
+                result["rid_error"] = "群建好了,但等待本地会话落库后仍没能唯一定位新建的会话"
+            log.info("拉群完成 %.1fs (标题未切到新群)", time.monotonic() - t0)
+            return result
+        _phase("title", t)
         expect_title = None
         if wanted_name:
             t = time.monotonic()
             renamed = _rename_locked(
-                new_rids[0], wanted_name, expect_members=expected, already_open=True,
+                None, wanted_name, expect_members=expected, already_open=True,
             )
             _phase("rename", t)
             if renamed.get("success"):
@@ -1000,13 +1001,16 @@ def create_group(
             else:
                 result["name_error"] = f"群建好了,但改名失败: {renamed.get('error')}"
                 if renamed.get("unrelated"):
+                    t = time.monotonic()
+                    result["rid"] = _unique_new_rid(before, prefer_name=None)
+                    _phase("wait_rid", t)
                     log.info("拉群完成 %.1fs (改名拒绝)", time.monotonic() - t0)
                     return result
 
         if wanted_nickname:
             t = time.monotonic()
             nicked = _set_nickname_locked(
-                new_rids[0],
+                None,
                 wanted_nickname,
                 expect_members=None if expect_title else expected,
                 expect_title=expect_title,
@@ -1017,6 +1021,17 @@ def create_group(
                 result["nickname"] = wanted_nickname
             else:
                 result["nickname_error"] = f"群建好了,但设置我在本群的昵称失败: {nicked.get('error')}"
+
+        t = time.monotonic()
+        rid = _unique_new_rid(before, prefer_name=expect_title)
+        _phase("wait_rid", t)
+        if rid is not None:
+            result["rid"] = rid
+        else:
+            locate_err = "等待本地会话落库后仍没能唯一定位新建的会话"
+            result["rid_error"] = f"群建好了,但{locate_err}"
+            log.info("拉群完成 %.1fs (未定位 RID)", time.monotonic() - t0)
+            return result
         log.info("拉群完成 %.1fs", time.monotonic() - t0)
         return result
 
@@ -1067,7 +1082,7 @@ def _write_ax_title(new_name: str) -> None:
   if target is missing value then return "{_AX_TITLE_MISSING}"
   set value of attribute "AXFocused" of target to true
   set value of target to "{_escape(new_name)}"
-  delay 0.4
+  delay 0.12
   try
     perform action "AXConfirm" of target
   on error
@@ -1077,6 +1092,21 @@ def _write_ax_title(new_name: str) -> None:
 ''')
     if out.strip().strip('"') == _AX_TITLE_MISSING:
         raise LocalGroupError("刚才还读到的会话标题不见了(界面被切走?),改名已中止")
+
+
+def _await_ax_title(expected: str, timeout: float = 1.2) -> bool:
+    """改名写完后轮询 AX 标题,替代固定 sleep。"""
+    deadline = time.monotonic() + timeout
+    for _ in range(12):
+        current = _read_ax_title()
+        if current is not None and current.strip() == expected.strip():
+            return True
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.12)
+    return False
+
+
 
 
 def _name_variants(name: str) -> set[str]:
@@ -1217,24 +1247,65 @@ def _group_names() -> dict[int, str]:
 def _wait_new_group_rids(before: set[int]) -> list[int]:
     """等待新建会话写入本地库,返回相对 before 新出现的 RID。
 
-    看到差集非空**不能立刻返回**: ui_session 只挡得住本机并发,挡不住「别人这会儿
-    正好把你拉进一个群」。抓到第一个就走,那个远端会话会被当成本次建的群。所以再
-    等 GROUP_APPEAR_SETTLE 重新取一次差集,两个一起冒出来时调用方就能看到「新增 2
-    个」而放弃改名。这只覆盖得住时间挨得近的情况,真正认群的证据在改名前那一步
-    (见 _looks_like_a_just_created_group)。
+    建群主路径已经先改完界面再来等,不再固定 settle 4 秒。差集不唯一时交给
+    _unique_new_rid 用新群名再筛一次。
     """
     deadline = time.monotonic() + GROUP_APPEAR_TIMEOUT
     poll = GROUP_APPEAR_POLL
     while True:
         new_rids = sorted(set(_group_names()) - before)
         if new_rids:
-            time.sleep(GROUP_APPEAR_SETTLE)
-            return sorted(set(_group_names()) - before)
+            return new_rids
         if time.monotonic() >= deadline:
             return []
         time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
         # 每轮 _group_names() 都可能触发一次全量重解密,而整个循环跑在 ui_session
         # 里 —— 空等期间每多问一次就多占一次 UI 闸门。等满一分半只要十来轮就够。
+        poll = min(poll * 2, GROUP_APPEAR_POLL_MAX)
+
+
+def _await_new_group_title(member_names: list[str], timeout: float = TITLE_SWITCH_TIMEOUT) -> bool:
+    """确认后等当前窗口标题变成刚建的群(成员拼名)。
+
+    面板关掉不等于焦点已经切走。空标题也不能算数: 切会话的间隙标题经常是空的,
+    上一轮的群还开着时立刻改名会改到旧群上。
+    """
+    deadline = time.monotonic() + timeout
+    for _ in range(40):
+        title = _read_ax_title()
+        if title and title.strip() and _looks_like_a_just_created_group(title, member_names):
+            return True
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(TITLE_SWITCH_POLL)
+    title = _read_ax_title()
+    return bool(title and title.strip() and _looks_like_a_just_created_group(title, member_names))
+
+
+def _unique_new_rid(before: set[int], prefer_name: str | None = None) -> int | None:
+    """改名/改昵称之后再认 RID。界面已经耗了几秒,库多半写好了。
+
+    差集只有一个就认它;改过名时优先用新名字在差集里筛。筛不唯一就放弃,
+    不要猜 —— 把别人刚拉你进的群 RID 交回去比不交更糟。
+    """
+    deadline = time.monotonic() + GROUP_APPEAR_TIMEOUT
+    poll = GROUP_APPEAR_POLL
+    while True:
+        names = _group_names()
+        new_rids = sorted(set(names) - before)
+        if prefer_name:
+            named = [r for r in new_rids if names.get(r) == prefer_name]
+            if len(named) == 1:
+                return named[0]
+            if len(named) > 1:
+                return None
+        if len(new_rids) == 1:
+            return new_rids[0]
+        if len(new_rids) > 1 and not prefer_name:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
         poll = min(poll * 2, GROUP_APPEAR_POLL_MAX)
 
 
@@ -1246,8 +1317,12 @@ def _cancel_edit_box() -> None:
         log.warning("退出改名输入框失败,客户端上可能留着一个打开的输入框: %s", e)
 
 
+def _rid_label(rid: int | None) -> str:
+    return f"RID={rid}" if rid is not None else "当前会话"
+
+
 def _rename_locked(
-    rid: int,
+    rid: int | None,
     new_name: str,
     expect_members: list[str] | None = None,
     already_open: bool = False,
@@ -1255,16 +1330,19 @@ def _rename_locked(
     """改名的界面部分 —— **调用方必须已经持有 ui_session**(锁不可重入)。
 
     expect_members 给了值就先核对归属: 打开的这个会话的标题必须是这些成员名拼出来
-    的,否则一个键都不敲就返回(带 unrelated 标记)。建群流程用它挡住「差集里那个
-    新会话其实是别人刚把你拉进的群」—— 那种情况下改名会改到别人的群上,而事后的
-    回库核验查的是同一个错 RID,兜不住。
+    的,否则一个键都不敲就返回(带 unrelated 标记)。建群刚完成时窗口就是新群,
+    用它挡住「确认后焦点跑到了别的会话」。
 
-    already_open=True 表示当前会话已经是这个群(建群刚完成),跳过 activate 和
-    scheme 打开,省掉一次焦点抖动。
+    already_open=True 表示当前会话已经是这个群(建群刚完成),跳过 activate、
+    scheme 打开,也不查本地库 —— 这时 RID 经常还没落库。
     """
-    conv = local_send.get_conversation_by_rid(int(rid))
-    if not conv:
-        return {"success": False, "error": f"本地库里没有 RID={rid} 的会话"}
+    conv = None
+    if not already_open:
+        if rid is None:
+            return {"success": False, "error": "改名需要会话 RID"}
+        conv = local_send.get_conversation_by_rid(int(rid))
+        if not conv:
+            return {"success": False, "error": f"本地库里没有 RID={rid} 的会话"}
 
     old_clipboard = ""
     try:
@@ -1273,6 +1351,7 @@ def _rename_locked(
         pass
     try:
         if not already_open:
+            assert conv is not None
             _activate()
             ok, msg = local_send._open_conversation_by_scheme(conv)
             if not ok:
@@ -1290,27 +1369,34 @@ def _rename_locked(
             return {
                 "success": False,
                 "unrelated": True,
-                "rid": int(rid),
+                "rid": rid,
                 "old_name": was,
                 "error": (
-                    f"RID={rid} 的标题是 {was!r},不像刚用「{'、'.join(expect_members)}」"
+                    f"{_rid_label(rid)} 的标题是 {was!r},不像刚用「{'、'.join(expect_members)}」"
                     "建出来的新群(这期间可能有别人把你拉进了新群)—— "
                     "一个字都没改,请手动改名。"
                 ),
             }
 
         if via_ax:
-            _write_ax_title(new_name)
+            attempts = 3 if already_open else 1
+            ax_ok = False
+            for i in range(attempts):
+                _write_ax_title(new_name)
+                ax_ok = _await_ax_title(new_name, timeout=1.2 if already_open else 0.8)
+                if ax_ok:
+                    break
+                log.info("改名第 %d 次写入后标题仍是 %r,再试", i + 1, _read_ax_title())
         else:
             _set_clipboard(new_name)
             _osa('''
   keystroke "a" using command down
-  delay 0.2
+  delay 0.12
   keystroke "v" using command down
-  delay 0.4
+  delay 0.15
   keystroke return
 ''')
-        time.sleep(1.5)
+            ax_ok = _await_ax_title(new_name, timeout=1.5 if rid is None else 0.8)
     finally:
         if old_clipboard:
             try:
@@ -1318,18 +1404,42 @@ def _rename_locked(
             except Exception:
                 pass
 
-    # 回库核验: 只信数据库,不信「脚本没报错」
-    names = _group_names()
-    actual = names.get(int(rid))
-    if actual == new_name:
-        return {"success": True, "rid": int(rid), "name": new_name, "old_name": was, "error": None}
-
-    wrong = [r for r, n in names.items() if n == new_name and r != int(rid)]
-    hint = f" —— 名字落到了 RID={wrong[0]} 上,请手动改回去" if wrong else ""
+    # 回库核验只问一次:全量重解密不便宜,刚改完库里经常还是空名。
+    # AX 标题已经对上就按成功走,除非这个新名字落到了另一个 RID 上。
+    # already_open 且还没有 RID 时只信 AX,库名可能还没跟上。
+    names = _group_names() if rid is not None else {}
+    if rid is not None:
+        actual = names.get(int(rid))
+        if actual == new_name:
+            return {"success": True, "rid": int(rid), "name": new_name, "old_name": was, "error": None}
+        wrong = [r for r, n in names.items() if n == new_name and r != int(rid)]
+        if wrong:
+            return {
+                "success": False,
+                "rid": int(rid),
+                "error": (
+                    f"改名后核验失败: RID={rid} 的群名仍是 {actual!r},不是 {new_name!r}"
+                    f" —— 名字落到了 RID={wrong[0]} 上,请手动改回去"
+                ),
+            }
+    else:
+        actual = None
+    if ax_ok:
+        if rid is None:
+            log.info("改名 AX 已是 %r,还没有 RID,按成功继续", new_name)
+        elif actual != new_name:
+            log.info("改名 AX 已是 %r,本地库还是 %r,按成功继续", new_name, actual)
+        return {"success": True, "rid": rid, "name": new_name, "old_name": was, "error": None}
+    title_now = _read_ax_title()
+    if (title_now or "").strip() == new_name.strip():
+        return {"success": True, "rid": rid, "name": new_name, "old_name": was, "error": None}
+    seen = title_now if rid is None else actual
     return {
         "success": False,
-        "rid": int(rid),
-        "error": f"改名后核验失败: RID={rid} 的群名仍是 {actual!r},不是 {new_name!r}{hint}",
+        "rid": rid,
+        "error": (
+            f"改名后核验失败: {_rid_label(rid)} 的群名仍是 {seen!r},不是 {new_name!r}"
+        ),
     }
 
 
@@ -1483,38 +1593,43 @@ def _nickname_dialog_field() -> dict | None:
     """
     out = _osa('''
   repeat with w in windows
-    set hit to false
-    try
-      repeat with e in (UI elements of w)
-        set hintText to ""
-        try
-          set hintText to hintText & (value of e as text)
-        end try
-        try
-          set hintText to hintText & (name of e as text)
-        end try
-        if hintText contains "我在本群的昵称" or hintText contains "My Alias" then
-          set hit to true
-          exit repeat
-        end if
-      end repeat
-    end try
-    if hit then
-      repeat with e in (UI elements of w)
-        set elemRole to ""
-        try
-          set elemRole to role of e as text
-        end try
-        if elemRole is "AXTextField" or elemRole is "AXTextArea" then
-          set v to ""
+    set s to size of w
+    -- 昵称小窗约 360x190;跳过主窗口和 320x699 的群详情
+    if (item 1 of s) ≥ 300 and (item 1 of s) ≤ 420 and (item 2 of s) ≥ 140 and (item 2 of s) ≤ 260 then
+      set fieldRole to ""
+      set fieldVal to ""
+      set fieldPos to "0,0"
+      set hit to false
+      try
+        repeat with e in (UI elements of w)
+          set hintText to ""
           try
-            set v to value of e as text
+            set hintText to hintText & (value of e as text)
           end try
-          set p to position of e
-          return elemRole & tab & v & tab & (item 1 of p as string) & "," & (item 2 of p as string)
-        end if
-      end repeat
-      return "ROW\t\t0,0"
+          try
+            set hintText to hintText & (name of e as text)
+          end try
+          if hintText contains "我在本群的昵称" or hintText contains "My Alias" then set hit to true
+          set elemRole to ""
+          try
+            set elemRole to role of e as text
+          end try
+          if elemRole is "AXTextField" or elemRole is "AXTextArea" then
+            set fieldRole to elemRole
+            try
+              set fieldVal to value of e as text
+            end try
+            try
+              set p to position of e
+              set fieldPos to (item 1 of p as string) & "," & (item 2 of p as string)
+            end try
+          end if
+        end repeat
+      end try
+      if hit then
+        if fieldRole is not "" then return fieldRole & tab & fieldVal & tab & fieldPos
+        return "ROW\t\t0,0"
+      end if
     end if
   end repeat
   return "NONE"
@@ -1533,6 +1648,33 @@ def _nickname_dialog_field() -> dict | None:
         x, y = 0, 0
     kind = "FIELD" if role in {"AXTextField", "AXTextArea"} else "ROW"
     return {"kind": kind, "value": value, "x": x, "y": y, "role": role}
+
+
+def _await_nickname_dialog(timeout: float = 1.2) -> dict | None:
+    deadline = time.monotonic() + timeout
+    last = None
+    for _ in range(8):
+        last = _nickname_dialog_field()
+        if last is not None:
+            return last
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.12)
+    return last
+
+
+def _await_nickname_dialog_gone(timeout: float = 1.0) -> dict | None:
+    """写完确定后等小窗关掉。超时仍在就返回当前字段,给调用方报错。"""
+    deadline = time.monotonic() + timeout
+    last = _nickname_dialog_field()
+    for _ in range(6):
+        last = _nickname_dialog_field()
+        if last is None:
+            return None
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.12)
+    return last
 
 
 def _scan_nickname_ui() -> dict:
@@ -1657,12 +1799,8 @@ def _group_info_dialog_open() -> bool:
 
 
 def _nickname_ui_ready() -> bool:
-    """群详情是否已经打开。先问便宜信号,别一上来就全树 AX 扫描。"""
-    return (
-        _nickname_dialog_field() is not None
-        or _group_info_labeled_row(("我在本群的昵称", "My Alias")) is not None
-        or _group_info_dialog_open()
-    )
+    """群详情是否已经打开。先问窗口尺寸,别每次都扫表格。"""
+    return _group_info_dialog_open() or _nickname_dialog_field() is not None
 
 
 def _close_stray_windows() -> None:
@@ -1674,13 +1812,14 @@ def _close_stray_windows() -> None:
     """
     try:
         _osa('''
+  if (count of windows) ≤ 1 then return
   set mainArea to -1
   repeat with w in windows
     set s to size of w
     set a to (item 1 of s) * (item 2 of s)
     if a > mainArea then set mainArea to a
   end repeat
-  repeat 6 times
+  repeat 3 times
     set closedOne to false
     repeat with w in windows
       set s to size of w
@@ -1723,31 +1862,41 @@ def _header_more_click_point() -> tuple[int, int] | None:
     return points[0]
 
 
-def _open_group_info_panel() -> None:
+def _open_group_info_panel(*, skip_stray_close: bool = False) -> None:
     """打开群详情。成功信号是扫到昵称行,或出现约 320 宽的详情对话框。
 
     不能点会话标题:那是改群名的入口,会把昵称写进群名。也不能点最右按钮:
     那是添加成员。入口是标题栏右侧那排里最左边的「更多」。
+    skip_stray_close=True 给建群刚完成用:这时只有主窗口,关残留窗口是空转。
     """
-    _close_stray_windows()
-    if _nickname_ui_ready():
+    if _group_info_dialog_open() or _nickname_dialog_field() is not None:
         return
+    if not skip_stray_close:
+        _close_stray_windows()
+        if _group_info_dialog_open() or _nickname_dialog_field() is not None:
+            return
 
     more = _header_more_click_point()
     if more is None:
         raise LocalGroupError(
             "找不到聊天区标题栏的「更多」按钮,无法打开群详情改昵称"
         )
-    _real_click(*more)
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        if _nickname_ui_ready():
+    _ui_click(*more)
+    deadline = time.monotonic() + 1.6
+    for _ in range(14):
+        if _group_info_dialog_open() or _nickname_dialog_field() is not None:
             return
-        time.sleep(0.2)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.12)
     if _try_press_named_menu_item(("群聊信息", "Chat Info", "群信息")):
-        time.sleep(0.5)
-        if _nickname_ui_ready():
-            return
+        deadline = time.monotonic() + 0.8
+        for _ in range(8):
+            if _nickname_ui_ready():
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.12)
     raise LocalGroupError(
         f"点了标题栏「更多」({more[0]},{more[1]}) 后仍找不到群详情。"
         "请确认会话已打开,且右上角没有挡住「更多」的面板。"
@@ -1867,7 +2016,7 @@ def _group_info_labeled_row(labels: tuple[str, ...]) -> tuple[int, int, int, int
     """按文字找群详情里的某一行,返回行矩形。找不到返回 None。
 
     必须按文字点:上面「群聊名称」也是 40px 行,按高度盲点会先打开改群名对话框,
-    然后把真正的昵称行挡住。
+    然后把真正的昵称行挡住。只读每行第一个静态文字,别把整棵单元格树扫一遍。
     """
     quoted = ", ".join(f'"{_escape(n)}"' for n in labels)
     out = _osa(f'''
@@ -1878,37 +2027,30 @@ def _group_info_labeled_row(labels: tuple[str, ...]) -> tuple[int, int, int, int
       try
         set tbl to table 1 of scroll area 1 of w
         repeat with rw in rows of tbl
-          set txt to ""
-          try
-            repeat with c in UI elements of rw
+          set sz to size of rw
+          if (item 2 of sz) ≥ 30 and (item 2 of sz) ≤ 50 then
+            set txt to ""
+            try
+              set txt to value of static text 1 of UI element 1 of rw as text
+            end try
+            if txt is "" then
               try
-                set txt to txt & (value of c as text)
+                set txt to value of static text 1 of rw as text
               end try
-              try
-                repeat with c2 in UI elements of c
-                  try
-                    set txt to txt & (value of c2 as text)
-                  end try
-                  try
-                    set txt to txt & (name of c2 as text)
-                  end try
-                end repeat
-              end try
-            end repeat
-          end try
-          set hit to false
-          repeat with needle in wanted
-            if txt contains needle then
-              set hit to true
-              exit repeat
             end if
-          end repeat
-          if hit then
-            set p to position of rw
-            set sz to size of rw
-            set hitLine to (item 1 of p as string) & "," & (item 2 of p as string)
-            set hitLine to hitLine & "," & (item 1 of sz as string) & "," & (item 2 of sz as string)
-            return hitLine
+            set hit to false
+            repeat with needle in wanted
+              if txt contains needle then
+                set hit to true
+                exit repeat
+              end if
+            end repeat
+            if hit then
+              set p to position of rw
+              set hitLine to (item 1 of p as string) & "," & (item 2 of p as string)
+              set hitLine to hitLine & "," & (item 1 of sz as string) & "," & (item 2 of sz as string)
+              return hitLine
+            end if
           end if
         end repeat
       end try
@@ -1948,9 +2090,8 @@ def _probe_nickname_in_dialog() -> dict:
         return {"kind": "NONE", "value": "", "x": 0, "y": 0}
     x, y, w, h = row
     cx, cy = x + w - 40, y + h // 2
-    _real_click(cx, cy)
-    time.sleep(0.45)
-    dialog = _nickname_dialog_field()
+    _ui_click(cx, cy)
+    dialog = _await_nickname_dialog(timeout=1.2)
     if dialog is not None:
         return dialog
     focused = _focused_text_field()
@@ -1981,21 +2122,24 @@ def _write_nickname_dialog(nickname: str) -> None:
     out = _osa(f'''
   set targetWin to missing value
   repeat with w in windows
-    try
-      repeat with e in (UI elements of w)
-        set hintText to ""
-        try
-          set hintText to hintText & (value of e as text)
-        end try
-        try
-          set hintText to hintText & (name of e as text)
-        end try
-        if hintText contains "我在本群的昵称" or hintText contains "My Alias" then
-          set targetWin to contents of w
-          exit repeat
-        end if
-      end repeat
-    end try
+    set s to size of w
+    if (item 1 of s) ≥ 300 and (item 1 of s) ≤ 420 and (item 2 of s) ≥ 140 and (item 2 of s) ≤ 260 then
+      try
+        repeat with e in (UI elements of w)
+          set hintText to ""
+          try
+            set hintText to hintText & (value of e as text)
+          end try
+          try
+            set hintText to hintText & (name of e as text)
+          end try
+          if hintText contains "我在本群的昵称" or hintText contains "My Alias" then
+            set targetWin to contents of w
+            exit repeat
+          end if
+        end repeat
+      end try
+    end if
     if targetWin is not missing value then exit repeat
   end repeat
   if targetWin is missing value then return "NODIALOG"
@@ -2111,7 +2255,7 @@ def _title_matches_expectation(
 
 
 def _set_nickname_locked(
-    rid: int,
+    rid: int | None,
     nickname: str,
     expect_members: list[str] | None = None,
     expect_title: str | None = None,
@@ -2124,18 +2268,21 @@ def _set_nickname_locked(
 
     expect_title 给「同一轮已经改过群名」用:标题这时已经不是成员拼名,
     再拿 expect_members 去对会把刚改好名的新群误判成别人的群。
-    already_open=True 跳过 activate / scheme 打开(建群刚完成时已经停在新群上)。
+    already_open=True 跳过 activate / scheme 打开,也不查本地库
+    (建群刚完成时已经停在新群上,RID 经常还没落库)。
     """
-    conv = local_send.get_conversation_by_rid(int(rid))
-    if not conv:
-        return {"success": False, "error": f"本地库里没有 RID={rid} 的会话"}
-
-    opened_info = False
     if not already_open:
+        if rid is None:
+            return {"success": False, "error": "改昵称需要会话 RID"}
+        conv = local_send.get_conversation_by_rid(int(rid))
+        if not conv:
+            return {"success": False, "error": f"本地库里没有 RID={rid} 的会话"}
         _activate()
         ok, msg = local_send._open_conversation_by_scheme(conv)
         if not ok:
             return {"success": False, "error": f"打开会话失败: {msg}"}
+
+    opened_info = False
 
     if expect_members is not None or expect_title is not None:
         was, via_ax = _read_current_title()
@@ -2146,9 +2293,9 @@ def _set_nickname_locked(
             return {
                 "success": False,
                 "unrelated": True,
-                "rid": int(rid),
+                "rid": rid,
                 "error": (
-                    f"RID={rid} 的标题是 {was!r},不是预期的 {expected!r} —— "
+                    f"{_rid_label(rid)} 的标题是 {was!r},不是预期的 {expected!r} —— "
                     "一个字都没改,请手动修改我在本群的昵称。"
                 ),
             }
@@ -2156,44 +2303,43 @@ def _set_nickname_locked(
             _cancel_edit_box()
 
     try:
-        _open_group_info_panel()
+        _open_group_info_panel(skip_stray_close=already_open)
         opened_info = True
         found = _scan_nickname_ui()
         if found["kind"] == "NONE":
             found = _probe_nickname_in_dialog()
         if found["kind"] == "NONE":
-            return {"success": False, "rid": int(rid), "error": "群详情中找不到「我在本群的昵称」"}
+            return {"success": False, "rid": rid, "error": "群详情中找不到「我在本群的昵称」"}
         if found["kind"] == "ROW" and _nickname_dialog_field() is None:
-            _real_click(int(found["x"]), int(found["y"]))
-            time.sleep(0.5)
+            _ui_click(int(found["x"]), int(found["y"]))
+            _await_nickname_dialog(timeout=1.2)
         if _nickname_dialog_field() is not None:
             _write_nickname_dialog(nickname)
-            time.sleep(0.5)
-            dialog = _nickname_dialog_field()
-            current = (dialog or {}).get("value") or ""
-            if dialog is None or nickname in current:
-                return {"success": True, "rid": int(rid), "nickname": nickname, "error": None}
+            leftover = _await_nickname_dialog_gone(timeout=0.8)
+            current = (leftover or {}).get("value") or ""
+            if leftover is None or nickname in current:
+                return {"success": True, "rid": rid, "nickname": nickname, "error": None}
             return {
                 "success": False,
-                "rid": int(rid),
+                "rid": rid,
                 "error": f"点了确定但昵称对话框还在,读到的是 {current!r}",
             }
         focused_before = _focused_text_field()
         _write_focused_nickname(nickname)
-        time.sleep(0.6)
+        time.sleep(0.25)
         if _nickname_write_verified(nickname, focused_before):
-            return {"success": True, "rid": int(rid), "nickname": nickname, "error": None}
+            return {"success": True, "rid": rid, "nickname": nickname, "error": None}
         found = _scan_nickname_ui()
         return {
             "success": False,
-            "rid": int(rid),
+            "rid": rid,
             "error": (
                 f"改昵称后核验失败: 群详情里没有读到 {nickname!r}"
                 f"(扫到的是 {found.get('value')!r})"
             ),
         }
     except LocalGroupError as e:
-        return {"success": False, "rid": int(rid), "error": str(e)}
+        return {"success": False, "rid": rid, "error": str(e)}
     finally:
         if opened_info:
             _close_group_info()
