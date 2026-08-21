@@ -187,7 +187,8 @@ async def push_one(client: httpx.AsyncClient, payload: dict, settings: Settings)
     try:
         resp = await client.put(group_info_url(settings), json=payload)
     except httpx.HTTPError as e:
-        raise mars_sync.MarsSyncError(f"调用 mars 群信息接口失败: {e}") from e
+        detail = str(e).strip() or type(e).__name__
+        raise mars_sync.MarsSyncError(f"调用 mars 群信息接口失败: {detail}") from e
     if resp.status_code != 200:
         body = resp.text.strip()[:200]
         raise mars_sync.MarsSyncError(f"mars 群信息接口返回 {resp.status_code}: {body}")
@@ -240,7 +241,10 @@ async def sync_once(
     errors: list[str] = []
     now = time.time()
     if due:
-        async with mars_sync.loop.http_client(settings.mars_timeout) as client:
+        # 不能复用消息循环那个 10s 客户端:BackgroundLoop.http_client 在循环
+        # 跑着时会忽略传入的 timeout。500 人快照上过 20s。
+        timeout = max(1.0, float(settings.mars_group_info_timeout))
+        async with httpx.AsyncClient(timeout=timeout) as client:
             for rid, payload, fp in due:
                 try:
                     await push_one(client, payload, settings)
