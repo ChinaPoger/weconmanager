@@ -100,6 +100,9 @@ class Settings(BaseSettings):
     # 显式配置且不是占位值 wecom-svr 时用配置值。拿不到 VID 时退回 wecom-svr。
     mars_robot: str = "wecom-svr"
     mars_client_type: str = "Wework"
+    # 群信息(成员快照 / 以后的群公告)跟消息共用白名单,但有自己的指纹水位。
+    # 默认开:消息同步在跑时顺手把花名册补上。关掉不影响消息。
+    mars_group_info_enabled: bool = True
 
     # ── 从 mars 拉任务(mars → 本机的反向通道)────────────────────────
     # 设计见 docs/mars-task-queue.md。token 留空 = 整个功能关闭。
@@ -157,6 +160,10 @@ class Settings(BaseSettings):
     @property
     def mars_state_file(self) -> Path:
         return self.data_dir / "mars_sync_state.json"
+
+    @property
+    def mars_group_info_state_file(self) -> Path:
+        return self.data_dir / "mars_group_info_state.json"
 
     @property
     def mars_tasks_state_file(self) -> Path:

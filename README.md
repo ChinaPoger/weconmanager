@@ -417,6 +417,9 @@ curl http://127.0.0.1:8090/api/v1/mars/sync/status
 | `POST /api/v1/mars/sync/run` | 立即跑一轮,`{"dry_run": true}` 只看不推 |
 | `POST /api/v1/mars/sync/watermark` | 重设水位:回补历史或跳过积压 |
 | `POST /api/v1/mars/sync/start` \| `/stop` | 起停后台循环 |
+| `GET /api/v1/mars/sync/group-info/status` | 群信息指纹水位、上次推送 |
+| `POST /api/v1/mars/sync/group-info/preview` | 预览待推的群档案/成员快照 |
+| `POST /api/v1/mars/sync/group-info/run` | 立即推一轮群信息 |
 
 ### 时效性
 
@@ -434,6 +437,11 @@ curl http://127.0.0.1:8090/api/v1/mars/sync/status
   全量同步和按 RID 点名白名单都会带上无名群;推给 mars 的群名用 `未命名群-{rid}`,
   改名后下一条消息会把档案更新成真名。空串不能原样推 —— mars 用 GroupName 派生
   Slack channel,会撞到一起。
+- **群信息另走一条资源接口。** 消息 hook 只会顺手 upsert 群档案和当前发送人,
+  完整成员快照(以后还有群公告)走 `PUT {mars}/api/qq/group-infos`。两边在 mars 里
+  共用同一套写群规则(已有 UID 不覆盖、空 note 不改公告、空 members 不改花名册);
+  差别只是消息增量补发送人,群信息整表替换成员。跟消息共用白名单,但用指纹跳过
+  没变化的群。本地库目前还没定位到可靠的群公告字段,`note` 先留空。
 - **默认不倒灌历史。** 首次同步的水位贴着当前最新一条。要回补用
   `MARS_SYNC_BACKFILL` 或 `/watermark`。
 - **重推是安全的。** mars 落库前算 `md5(群号+发送人+发送时间+正文)` 作唯一索引

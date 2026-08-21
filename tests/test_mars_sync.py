@@ -106,6 +106,12 @@ def local(monkeypatch):
     monkeypatch.setattr(messages, "fetch_since", fetch_since)
     monkeypatch.setattr(messages, "list_groups", lambda search="", **kw: [GROUP, GROUP2])
     monkeypatch.setattr(messages, "latest_cursor", lambda rid=None: Cursor(9000, 9))
+    # 群信息默认开,但消息测试不该去读真实 member_bin。空成员 = 跳过推送。
+    monkeypatch.setattr(
+        messages, "group_profile",
+        lambda rid: {"rid": rid, "name": GROUP["name"] if rid == GROUP["rid"] else "", "sort_time": 0},
+    )
+    monkeypatch.setattr(messages, "group_members", lambda rid: [])
     monkeypatch.setattr(
         messages,
         "count_since",
