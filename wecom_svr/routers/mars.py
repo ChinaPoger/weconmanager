@@ -8,7 +8,7 @@ import asyncio
 
 from fastapi import APIRouter, Depends, Query
 
-from .. import mars_sync, messages
+from .. import mars_group_info, mars_sync, messages
 from ..mars_sync import Cursor
 from ..schemas_mars import SyncRunRequest, WatermarkRequest
 from ..security import require_token
@@ -102,6 +102,8 @@ async def status(
             "group_prefix": settings.mars_group_prefix,
             "robot": mars_sync.robot_id(settings),
             "client_type": settings.mars_client_type,
+            "group_info_enabled": settings.mars_group_info_enabled,
+            "group_info_url": settings.mars_base_url and mars_group_info.group_info_url(settings),
         },
         "state": state_summary,
         "state_error": state_error,
@@ -242,6 +244,44 @@ async def set_watermark(req: WatermarkRequest, _: None = Depends(require_token))
         "cursor": state.cursor.to_dict(),
         "changes": changes,
     }
+
+
+@router.get("/group-info/status", summary="群信息同步状态(指纹/上次推送)")
+async def group_info_status(_: None = Depends(require_token)) -> dict:
+    settings = get_settings()
+    try:
+        state = mars_group_info.load_state(settings)
+        state_error = ""
+    except mars_sync.MarsStateError as e:
+        state = None
+        state_error = str(e)
+    return {
+        "errcode": 0,
+        "errmsg": "ok",
+        "enabled": settings.mars_group_info_enabled,
+        "config": {
+            "mars_base_url": settings.mars_base_url,
+            "group_info_url": settings.mars_base_url and mars_group_info.group_info_url(settings),
+            "groups": settings.mars_group_selectors,
+            "sync_all_groups": settings.mars_sync_all_groups,
+        },
+        "state": state.to_dict() if state else None,
+        "state_error": state_error,
+    }
+
+
+@router.post("/group-info/preview", summary="预览待推的群信息(不推、不动指纹)")
+async def group_info_preview(_: None = Depends(require_token)) -> dict:
+    async with mars_sync.sync_lock:
+        result = await mars_group_info.sync_once(dry_run=True)
+    return {"errcode": 0, "errmsg": "ok", **result.to_dict()}
+
+
+@router.post("/group-info/run", summary="立即推一轮群信息(可 dry_run)")
+async def group_info_run(req: SyncRunRequest, _: None = Depends(require_token)) -> dict:
+    async with mars_sync.sync_lock:
+        result = await mars_group_info.sync_once(dry_run=req.dry_run)
+    return {"errcode": 0, "errmsg": "ok", **result.to_dict()}
 
 
 @router.post("/start", summary="启动后台同步循环")

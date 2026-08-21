@@ -46,6 +46,7 @@ DESCRIPTION = """
 - **/api/v1/app/group/create** — 拉群(官方 appchat),成员可直接写中文名和「我」
 - **/api/v1/app/contact/search** — 查通讯录
 - **/api/v1/mars/sync/** — 把本地群消息同步到 mars 的群消息接口
+- **/api/v1/mars/sync/group-info/** — 把本地群档案/成员快照推给 mars
 - **/api/v1/mars/tasks/** — 反过来:从 mars 拉任务并执行(mars 让本机发消息)
 
 鉴权可选: 配了 `api_token` 后,请求需带 `Authorization: Bearer <token>`。

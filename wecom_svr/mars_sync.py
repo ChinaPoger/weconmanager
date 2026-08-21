@@ -722,6 +722,7 @@ class SyncResult:
     dry_run: bool = False
     partial: bool = False
     error: str = ""
+    group_info: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -985,6 +986,21 @@ async def _sync_once(
     result.cursor = state.cursor
     result.error = round_error
     result.partial = bool(errors) and len(errors) < len(rids)
+
+    # 群信息跟消息共用白名单,但失败不影响消息水位。指纹没变就几乎是空转。
+    if not dry_run:
+        from . import mars_group_info
+
+        try:
+            info = await mars_group_info.sync_once(
+                settings, rids=rids, names=names,
+            )
+            result.group_info = info.to_dict()
+            if info.error and not result.error:
+                result.error = info.error
+        except MarsSyncError as e:
+            result.group_info = {"error": _error_text(e)}
+            log.warning("群信息同步失败: %s", e)
     return result
 
 

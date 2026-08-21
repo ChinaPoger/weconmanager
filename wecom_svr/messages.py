@@ -671,6 +671,117 @@ def _quote_summary(payload: bytes | None) -> str:
     return ""
 
 
+def _read_varint(buf: bytes, i: int) -> tuple[int, int] | None:
+    """从 `i` 读一个 protobuf varint;截断或溢出返回 None。"""
+    n = len(buf)
+    value = shift = 0
+    while i < n:
+        b = buf[i]
+        i += 1
+        value |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return value, i
+        shift += 7
+        if shift > 63:
+            return None
+    return None
+
+
+def parse_member_bin(blob: bytes | None) -> list[int]:
+    """解 CONVERSATION / CONV_MEMBER_DATA 的 member_bin → 成员 VID 列表。
+
+    本地库不是标准 protobuf 顶层重复字段,而是自定义分帧:
+    每个成员 `[0x02][varint 长度][成员 protobuf]`,成员 protobuf 的 field 1 是 VID。
+    解不出完整一帧就停,已经认出的 VID 仍返回 —— 半截花名册也比空列表有用。
+    """
+    if not blob:
+        return []
+    out: list[int] = []
+    seen: set[int] = set()
+    i, n = 0, len(blob)
+    while i < n:
+        if blob[i] != 0x02:
+            break
+        parsed = _read_varint(blob, i + 1)
+        if parsed is None:
+            break
+        size, nxt = parsed
+        end = nxt + size
+        if size < 0 or end > n:
+            break
+        vids = _pb_varints(blob[nxt:end]).get(1) or []
+        i = end
+        if not vids:
+            continue
+        vid = _int_id(vids[0])
+        if vid and vid not in seen:
+            seen.add(vid)
+            out.append(vid)
+    return out
+
+
+def _member_bin_for(rid: int) -> bytes:
+    """取一个群的成员二进制。优先 CONV_MEMBER_DATA,没有再退回会话行。"""
+    rid = _int_id(rid)
+    try:
+        rows = _rows(
+            "SELECT CAST(member_bin AS BLOB) AS member_bin "
+            "FROM CONV_MEMBER_DATA WHERE conv_key = ?",
+            (f"1_{rid}_0",),
+        )
+        blob = bytes(rows[0]["member_bin"] or b"") if rows else b""
+        if blob:
+            return blob
+    except LocalDataError:
+        pass
+    rows = _rows(
+        "SELECT CAST(member_bin AS BLOB) AS member_bin FROM CONVERSATION "
+        "WHERE conversationtype = ? AND RID = ? LIMIT 1",
+        (GROUP_CONV_TYPE, rid),
+    )
+    if not rows:
+        return b""
+    return bytes(rows[0]["member_bin"] or b"")
+
+
+def group_profile(rid: int) -> dict:
+    """一个群的档案(名 / 活跃时间)。会话不存在时仍返回 rid,调用方好拼占位名。"""
+    rid = _int_id(rid)
+    rows = _rows(
+        "SELECT RID, name, sort_time FROM CONVERSATION "
+        "WHERE conversationtype = ? AND RID = ? ORDER BY sort_time DESC LIMIT 1",
+        (GROUP_CONV_TYPE, rid),
+    )
+    if not rows:
+        return {"rid": rid, "name": "", "sort_time": 0}
+    r = rows[0]
+    return {
+        "rid": _int_id(r["RID"]),
+        "name": r["name"] or "",
+        "sort_time": int(r["sort_time"] or 0),
+    }
+
+
+def group_members(rid: int) -> list[dict]:
+    """一个群的当前成员快照,身份字段对齐 mars GroupInfoReportMember。
+
+    USER 表没有的人(外部联系人、已退群残留)仍保留 VID,名字用 VID 占位;
+    空 userid/corpid 让 mars 侧自己决定怎么展示,这里不编造。
+    """
+    senders = _load_senders()
+    out: list[dict] = []
+    for vid in parse_member_bin(_member_bin_for(rid)):
+        sender = senders.get(vid, {})
+        out.append({
+            "member_id": str(vid),
+            "name": sender.get("name") or str(vid),
+            "userid": str(sender.get("userid") or ""),
+            "corpid": str(sender.get("corpid") or ""),
+            "avatar": str(sender.get("avatar") or ""),
+        })
+    return out
+
+
 def list_groups(
     search: str = "",
     include_unnamed: bool = False,

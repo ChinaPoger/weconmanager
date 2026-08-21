@@ -223,3 +223,35 @@ def test_int_id_coerces_sqlite_real_and_scientific_strings():
     assert messages._int_id("1.0945118031183244e+16") == 10945118031183244
     assert messages._int_id(None) == 0
     assert messages._int_id("") == 0
+
+
+def _varint(v: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        out.append(b | (0x80 if v else 0))
+        if not v:
+            return bytes(out)
+
+
+def _member_frame(vid: int) -> bytes:
+    inner = b"\x08" + _varint(vid)   # protobuf field 1, varint
+    return b"\x02" + _varint(len(inner)) + inner
+
+
+def test_parse_member_bin_reads_repeated_frames():
+    blob = _member_frame(1688851653323840) + _member_frame(1688858207733961)
+    assert messages.parse_member_bin(blob) == [1688851653323840, 1688858207733961]
+
+
+def test_parse_member_bin_skips_duplicate_and_empty():
+    blob = _member_frame(11) + _member_frame(11) + _member_frame(0)
+    assert messages.parse_member_bin(blob) == [11]
+    assert messages.parse_member_bin(b"") == []
+    assert messages.parse_member_bin(None) == []
+
+
+def test_parse_member_bin_stops_on_truncated_frame():
+    good = _member_frame(42)
+    assert messages.parse_member_bin(good + b"\x02\x20") == [42]
