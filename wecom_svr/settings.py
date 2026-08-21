@@ -103,6 +103,8 @@ class Settings(BaseSettings):
     # 群信息(成员快照 / 以后的群公告)跟消息共用白名单,但有自己的指纹水位。
     # 默认开:消息同步在跑时顺手把花名册补上。关掉不影响消息。
     mars_group_info_enabled: bool = True
+    # 群信息 HTTP 超时。500 人快照实测约 23s,不能复用消息 hook 的 10s。
+    mars_group_info_timeout: float = 30.0
 
     # ── 从 mars 拉任务(mars → 本机的反向通道)────────────────────────
     # 设计见 docs/mars-task-queue.md。token 留空 = 整个功能关闭。
