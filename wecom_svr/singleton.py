@@ -32,13 +32,16 @@ class InstanceTaken(RuntimeError):
         self.ours = ours
 
 
+# 本机没有 fcntl 时 try_lock 的返回值:不是「被别人占了」,而是「这台机器不上锁」。
+LOCK_DISABLED = -1
+
+
 @dataclass
 class ClaimedInstance:
     host: str
     port: int
     sock: socket.socket
     lock_fd: int | None
-    lock_path: Path | None
 
     def close(self) -> None:
         try:
@@ -57,9 +60,9 @@ def lock_path(data_dir: Path) -> Path:
 
 
 def try_lock(data_dir: Path) -> int | None:
-    """非阻塞独占锁。拿不到返回 None;没有 fcntl 则跳过(返回 -1 表示未启用)。"""
+    """非阻塞独占锁。拿不到返回 None;没有 fcntl 则跳过(返回 LOCK_DISABLED)。"""
     if fcntl is None:
-        return -1
+        return LOCK_DISABLED
     path = lock_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -129,7 +132,7 @@ def claim(host: str, port: int, data_dir: Path) -> ClaimedInstance:
     try:
         sock = listen_socket(host, port)
     except OSError as e:
-        if lock_fd is not None and lock_fd >= 0:
+        if lock_fd != LOCK_DISABLED:
             os.close(lock_fd)
         ours, detail = describe_listener(host, port)
         raise InstanceTaken(f"{detail} ({e})", ours=ours) from e
@@ -138,6 +141,5 @@ def claim(host: str, port: int, data_dir: Path) -> ClaimedInstance:
         host=host,
         port=port,
         sock=sock,
-        lock_fd=None if lock_fd == -1 else lock_fd,
-        lock_path=path,
+        lock_fd=None if lock_fd == LOCK_DISABLED else lock_fd,
     )

@@ -29,35 +29,14 @@ from dataclasses import dataclass, field
 from types import ModuleType
 
 from . import media, wal
-from .localdb import NOT_SYNCED, LocalDataError
+from .localdb import NOT_SYNCED, LocalDataError, int_id
 from .settings import get_agent_home
 
 log = logging.getLogger(__name__)
 
 
-def _int_id(value: object, default: int = 0) -> int:
-    """sqlite / JSON 里的会话 RID、发送人 RID → Python int。
-
-    sqlite 列一旦是 REAL,Python 拿到的就是 float;再 `f"{rid}"` 就会变成
-    `1.09e+16` 这种科学计数法,mars 群号跟着脏掉。这里统一收成 int。
-    """
-    if value is None or value is False:
-        return default
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    text = str(value).strip().replace("_", "")
-    if not text:
-        return default
-    try:
-        if "e" in text.lower() or "." in text:
-            return int(float(text))
-        return int(text)
-    except (TypeError, ValueError, OverflowError):
-        return default
+# 身份列的收敛规则在 localdb —— directory 也要用同一份(见 self_vid_or_none)。
+_int_id = int_id
 
 
 # CONVERSATION.conversationtype —— 1 是群聊(0 单聊,3/6/7/10x 是各类应用会话)

@@ -9,9 +9,6 @@ from uvicorn import Config, Server
 from .settings import get_settings
 from .singleton import InstanceTaken, claim, try_lock
 
-# --reload 路径里 uvicorn 自己先 bind;文件锁的 fd 必须一直活着,关掉就等于放锁。
-_HELD_LOCK_FDS: list[int] = []
-
 
 def main() -> None:
     settings = get_settings()
@@ -70,8 +67,8 @@ def _claim_lock_or_exit(data_dir) -> None:
             "本次启动已放弃,不会再去操控企业微信"
         )
         sys.exit(0)
-    if fd >= 0:
-        _HELD_LOCK_FDS.append(fd)
+    # 故意不关 fd:--reload 路径里 uvicorn 自己先 bind,文件锁要一直握到进程退出,
+    # 由内核在退出时释放。裸 fd 不是 Python 对象,不存在被 GC 提前收走的问题。
 
 
 if __name__ == "__main__":

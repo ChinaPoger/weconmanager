@@ -160,7 +160,6 @@ def _fast_and_macos(monkeypatch, tmp_path):
     get_settings.cache_clear()
     get_agent_home.cache_clear()
     monkeypatch.setattr(local_group, "ensure_macos", lambda: None)
-    monkeypatch.setattr(local_group, "_picker_click", lambda x, y: None)
     monkeypatch.setattr(local_group, "_ui_click", lambda x, y: None)
     monkeypatch.setattr(local_group.time, "sleep", lambda _s: None)
     monkeypatch.setattr(local_group, "SHEET_TIMEOUT", 0.1)
@@ -721,7 +720,6 @@ def test_create_waits_for_the_title_to_switch_before_renaming(fake, monkeypatch)
 def test_create_with_name_locates_the_new_group_by_diff(fake, monkeypatch):
     names = {1: "旧群"}
     monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
-    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
     captured = {}
 
     def fake_rename(rid, name, expect_members=None, already_open=False):
@@ -759,7 +757,6 @@ def test_create_with_name_waits_for_delayed_database_visibility(fake, monkeypatc
         ),
     )
     monkeypatch.setattr(local_group, "GROUP_APPEAR_TIMEOUT", 5.0)
-    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
 
     r = local_group.create_group(["陈涛", "陈挺"], name="临时讨论组")
 
@@ -913,7 +910,6 @@ def test_rename_endpoint_rejects_empty_and_overlong_names(api, rename_env):
 def test_create_with_nickname_opens_group_info_not_the_title(fake, monkeypatch):
     names = {1: "旧群"}
     monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
-    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
     captured = {}
 
     def fake_nick(rid, nickname, expect_members=None, expect_title=None, already_open=False):
@@ -951,7 +947,6 @@ def test_create_with_nickname_opens_group_info_not_the_title(fake, monkeypatch):
 def test_create_with_name_and_nickname_does_both(fake, monkeypatch):
     names = {1: "旧群"}
     monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
-    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
     nick = {}
     monkeypatch.setattr(
         local_group,
@@ -1007,7 +1002,6 @@ def test_create_still_sets_nickname_when_the_new_group_is_not_unique(fake, monke
 def test_create_keeps_the_group_when_nickname_fails(fake, monkeypatch):
     names = {1: "旧群"}
     monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
-    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
     monkeypatch.setattr(
         local_group,
         "_set_nickname_locked",
@@ -1150,12 +1144,6 @@ def test_set_nickname_writes_the_dedicated_dialog_and_confirms(rename_env, monke
     assert state["wrote"] == "小王"
 
 
-def test_nickname_hint_recognizes_chinese_and_english():
-    assert local_group._looks_like_nickname_hint("我在本群的昵称")
-    assert local_group._looks_like_nickname_hint("My Alias in Group")
-    assert not local_group._looks_like_nickname_hint("群聊名称")
-
-
 def test_scan_nickname_ui_uses_labeled_row_instead_of_dumping_the_tree(monkeypatch):
     monkeypatch.setattr(local_group, "_nickname_dialog_field", lambda: None)
     monkeypatch.setattr(
@@ -1202,7 +1190,6 @@ def test_nickname_verify_accepts_focused_field_when_window_text_is_empty(monkeyp
 def test_nickname_endpoint_success(api, fake, monkeypatch):
     names = {1: "旧群"}
     monkeypatch.setattr(local_group, "_group_names", lambda: dict(names))
-    monkeypatch.setattr(local_group, "GROUP_APPEAR_SETTLE", 0.0)
     monkeypatch.setattr(
         local_group,
         "_set_nickname_locked",

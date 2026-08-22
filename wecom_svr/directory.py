@@ -10,7 +10,7 @@
 import functools
 import re
 
-from .localdb import LocalSendError, batch, query
+from .localdb import LocalSendError, batch, parse_id, query
 
 # 请求里可以直接写「我」,省得先查自己的 userid
 SELF_ALIASES = {"我", "自己", "本人", "me", "self"}
@@ -168,7 +168,7 @@ def self_vid_or_none() -> str | None:
         vid = get_self().get("vid")
     except LocalSendError:
         return None
-    if vid is None:
-        return None
-    text = str(vid).strip()
-    return text or None
+    # USER.RID 可能是 REAL:直接 str() 会写出 `1.09e+16`,而这个值会变成每条
+    # hook 的 robot 和每份群信息的 source。必须过 parse_id。
+    n = parse_id(vid)
+    return None if n is None else format(n, "d")

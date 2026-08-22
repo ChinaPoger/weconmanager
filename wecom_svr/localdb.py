@@ -20,6 +20,39 @@ NOT_SYNCED = (
 )
 
 
+def parse_id(value: object) -> int | None:
+    """sqlite / JSON 里的身份列(RID、LID、sender_id)→ int,认不出来返回 None。
+
+    sqlite 列一旦是 REAL,Python 拿到的就是 float;再 `f"{rid}"` 就会变成
+    `1.09e+16` 这种科学计数法,推给 mars 的群号跟着脏掉。凡是从库里取身份
+    列的地方都该过这一道,所以放在连接层 —— directory 和 messages 都能用,
+    不产生循环 import。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip().replace("_", "")
+    if not text:
+        return None
+    try:
+        if "e" in text.lower() or "." in text:
+            return int(float(text))
+        return int(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def int_id(value: object, default: int = 0) -> int:
+    """parse_id 的「认不出来就给默认值」版本。"""
+    n = parse_id(value)
+    return default if n is None else n
+
+
 class LocalSendError(RuntimeError):
     """本地数据/客户端操作的可预期错误(向客户端回报文案,不是 500)。"""
 

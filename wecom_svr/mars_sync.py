@@ -41,6 +41,7 @@ import httpx
 
 from . import directory, media, messages
 from .bgloop import BackgroundLoop
+from .localdb import parse_id
 from .messages import FILE_PLACEHOLDER, IMAGE_PLACEHOLDER, Cursor, media_payloads
 from .settings import Settings, get_settings
 
@@ -66,7 +67,7 @@ class MarsStateError(MarsSyncError):
 MAX_ERROR_LENGTH = 500
 
 
-def _error_text(value: object) -> str:
+def error_text(value: object) -> str:
     return str(value or "")[:MAX_ERROR_LENGTH]
 
 
@@ -78,27 +79,11 @@ def id_text(value: object) -> str:
     已经脏成科学计数法的字符串,这里尽量收回成十进制;float 精度本身丢了
     的救不回,只能保证不再继续写出 `e+`。
     """
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return format(int(value), "d")
-    text = str(value).strip()
-    if not text:
-        return ""
-    compact = text.replace("_", "")
-    lower = compact.lower()
-    if "e" in lower or "." in compact:
-        try:
-            return format(int(float(compact)), "d")
-        except (TypeError, ValueError, OverflowError):
-            return text
-    if compact.isdigit() or (compact[:1] == "-" and compact[1:].isdigit()):
-        return compact
-    return text
+    n = parse_id(value)
+    if n is not None:
+        return format(n, "d")
+    # 不是数字的身份(理论上不该出现)原样带过去,别把它变成 "0" 那种假 ID。
+    return str(value).strip() if value is not None else ""
 
 
 def group_number_text(prefix: str, rid: object) -> str:
@@ -118,7 +103,7 @@ def normalize_group_number(value: object) -> str:
     return id_text(text)
 
 
-def _summarize_errors(errors) -> str:
+def summarize_errors(errors) -> str:
     """多个群的报错收成一句。只有一个群挂时给出原文,那才是能直接排查的信息。
 
     这个字符串是 `SyncResult.error` 和 `State.last_error` 的共同格式(见
@@ -190,7 +175,7 @@ class GroupState:
             cursor=Cursor.from_dict(d.get("cursor")),
             media_cutover=Cursor.from_dict(cutover) if cutover else None,
             active=bool(d.get("active", True)),
-            last_error=_error_text(d.get("last_error")),
+            last_error=error_text(d.get("last_error")),
             fail_streak=int(d.get("fail_streak") or 0),
             last_success=float(d.get("last_success") or 0),
             last_seen=float(d.get("last_seen") or 0),
@@ -234,7 +219,7 @@ class State:
             pushed=int(d.get("pushed") or 0),
             last_run=float(d.get("last_run") or 0),
             last_push=float(d.get("last_push") or 0),
-            last_error=_error_text(d.get("last_error")),
+            last_error=error_text(d.get("last_error")),
             round_robin=int(d.get("round_robin") or 0),
         )
 
@@ -243,33 +228,47 @@ class State:
         self.cursor = min(active) if active else Cursor()
 
 
-def load_state(settings: Settings | None = None) -> State:
-    path = (settings or get_settings()).mars_state_file
+def read_json_state(path: Path, what: str) -> dict | None:
+    """读一个水位文件。不存在返回 None;读不动或不是 JSON object 一律 MarsStateError。
+
+    水位文件的读写契约(原子替换、损坏即中止)对消息同步和群信息同步是同一套,
+    只写一遍 —— 否则「给写路径加 fsync」这种改动只会落到其中一份上。
+    """
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return State()
+        return None
     except OSError as e:
-        raise MarsStateError(f"读取同步水位失败 {path}: {e}") from e
+        raise MarsStateError(f"读取{what}失败 {path}: {e}") from e
     try:
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
             raise TypeError("顶层不是 JSON object")
-        return State.from_dict(parsed)
+        return parsed
     except (AttributeError, json.JSONDecodeError, TypeError, ValueError) as e:
-        raise MarsStateError(f"同步水位文件损坏 {path}: {e}") from e
+        raise MarsStateError(f"{what}文件损坏 {path}: {e}") from e
 
 
-def save_state(state: State, settings: Settings | None = None) -> None:
+def write_json_state(path: Path, data: dict, what: str) -> None:
     """原子写水位。失败必须中止同步,不能把本轮伪装成成功。"""
-    path = (settings or get_settings()).mars_state_file
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state.to_dict(), ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
     except OSError as e:
-        raise MarsStateError(f"写同步水位失败 {path}: {e}") from e
+        raise MarsStateError(f"写{what}失败 {path}: {e}") from e
+
+
+def load_state(settings: Settings | None = None) -> State:
+    path = (settings or get_settings()).mars_state_file
+    parsed = read_json_state(path, "同步水位")
+    return State() if parsed is None else State.from_dict(parsed)
+
+
+def save_state(state: State, settings: Settings | None = None) -> None:
+    path = (settings or get_settings()).mars_state_file
+    write_json_state(path, state.to_dict(), "同步水位")
 
 
 def _backup_v1_state(settings: Settings) -> None:
@@ -621,15 +620,24 @@ def hook_url(settings: Settings) -> str:
     return mars_base(settings) + HOOK_PATH
 
 
-async def push_one(client: httpx.AsyncClient, hook: dict, settings: Settings) -> None:
-    """推一条。失败抛 MarsSyncError —— 调用方据此停在当前水位,下轮重来。"""
+async def put_json(client: httpx.AsyncClient, url: str, payload: dict, what: str) -> None:
+    """PUT 一份 JSON 给 mars。非 200 或传输失败一律抛 MarsSyncError。
+
+    「只认 200、报错正文截 200 字」是 mars 这几个接口共用的约定,写一份。
+    """
     try:
-        resp = await client.put(hook_url(settings), json=hook)
+        resp = await client.put(url, json=payload)
     except httpx.HTTPError as e:
-        raise MarsSyncError(f"调用 mars 失败: {e}") from e
+        detail = str(e).strip() or type(e).__name__
+        raise MarsSyncError(f"调用 {what} 失败: {detail}") from e
     if resp.status_code != 200:
         body = resp.text.strip()[:200]
-        raise MarsSyncError(f"mars 返回 {resp.status_code}: {body}")
+        raise MarsSyncError(f"{what} 返回 {resp.status_code}: {body}")
+
+
+async def push_one(client: httpx.AsyncClient, hook: dict, settings: Settings) -> None:
+    """推一条。失败抛 MarsSyncError —— 调用方据此停在当前水位,下轮重来。"""
+    await put_json(client, hook_url(settings), hook, "mars")
 
 
 # ─── 一轮同步 ───────────────────────────────────────────────────────────
@@ -931,7 +939,7 @@ async def _sync_once(
                 try:
                     await push_one(client, hook, settings)
                 except MarsSyncError as e:
-                    errors[rid] = _error_text(e)
+                    errors[rid] = error_text(e)
                     log.warning("群 %s 推送中断于 LID=%s: %s", rid, msg["lid"], e)
                     continue
                 state.groups[str(rid)].cursor = Cursor(msg["send_time"], msg["lid"])
@@ -969,8 +977,8 @@ async def _sync_once(
     state.round_robin = batch.next_offset
     if result.pushed:
         state.last_push = now
-    round_error = _summarize_errors(errors.values())
-    state.last_error = _summarize_errors(
+    round_error = summarize_errors(errors.values())
+    state.last_error = summarize_errors(
         group.last_error for group in state.groups.values() if group.active and group.last_error
     )
     state.refresh_shadow_cursor()
@@ -999,7 +1007,7 @@ async def _sync_once(
             if info.error and not result.error:
                 result.error = info.error
         except MarsSyncError as e:
-            result.group_info = {"error": _error_text(e)}
+            result.group_info = {"error": error_text(e)}
             log.warning("群信息同步失败: %s", e)
     return result
 

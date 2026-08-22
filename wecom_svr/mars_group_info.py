@@ -21,7 +21,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import time
 from dataclasses import asdict, dataclass, field
 
@@ -55,7 +54,7 @@ class GroupInfoState:
         return cls(
             fingerprint=str(d.get("fingerprint") or ""),
             last_push=float(d.get("last_push") or 0),
-            last_error=mars_sync._error_text(d.get("last_error")),
+            last_error=mars_sync.error_text(d.get("last_error")),
             member_count=int(d.get("member_count") or 0),
         )
 
@@ -90,7 +89,7 @@ class InfoState:
             pushed=int(d.get("pushed") or 0),
             last_run=float(d.get("last_run") or 0),
             last_push=float(d.get("last_push") or 0),
-            last_error=mars_sync._error_text(d.get("last_error")),
+            last_error=mars_sync.error_text(d.get("last_error")),
         )
 
 
@@ -111,30 +110,13 @@ class GroupInfoResult:
 
 def load_state(settings: Settings | None = None) -> InfoState:
     path = (settings or get_settings()).mars_group_info_state_file
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return InfoState()
-    except OSError as e:
-        raise mars_sync.MarsStateError(f"读取群信息水位失败 {path}: {e}") from e
-    try:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            raise TypeError("顶层不是 JSON object")
-        return InfoState.from_dict(parsed)
-    except (AttributeError, json.JSONDecodeError, TypeError, ValueError) as e:
-        raise mars_sync.MarsStateError(f"群信息水位文件损坏 {path}: {e}") from e
+    parsed = mars_sync.read_json_state(path, "群信息水位")
+    return InfoState() if parsed is None else InfoState.from_dict(parsed)
 
 
 def save_state(state: InfoState, settings: Settings | None = None) -> None:
     path = (settings or get_settings()).mars_group_info_state_file
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state.to_dict(), ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError as e:
-        raise mars_sync.MarsStateError(f"写群信息水位失败 {path}: {e}") from e
+    mars_sync.write_json_state(path, state.to_dict(), "群信息水位")
 
 
 def fingerprint(payload: dict) -> str:
@@ -163,7 +145,12 @@ def fingerprint(payload: dict) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def build_payload(rid: int, settings: Settings) -> dict:
+def round_source(settings: Settings) -> str:
+    """本轮的 source。整轮是同一个值,别在每个群里重算 —— 它要查通讯录。"""
+    return directory.self_vid_or_none() or mars_sync.robot_id(settings)
+
+
+def build_payload(rid: int, settings: Settings, source: str | None = None) -> dict:
     conv = messages.group_profile(rid)
     members = sorted(messages.group_members(rid), key=lambda m: m.get("member_id") or "")
     return {
@@ -171,7 +158,7 @@ def build_payload(rid: int, settings: Settings) -> dict:
         "group_name": mars_sync.group_name(conv.get("name") or "", settings, rid),
         "uid": 0,
         "client_type": settings.mars_client_type,
-        "source": directory.self_vid_or_none() or mars_sync.robot_id(settings),
+        "source": round_source(settings) if source is None else source,
         # 还没从本地库稳定解出群公告时留空。mars 侧约定:空串 = 本次不改公告。
         "note": "",
         "members": members,
@@ -183,15 +170,23 @@ def should_push(payload: dict) -> bool:
     return bool(payload.get("members") or str(payload.get("note") or "").strip())
 
 
+def build_round(rids: list[int], settings: Settings) -> list[tuple[int, dict, str]]:
+    """一次线程切换里算完整轮的 payload 和指纹,返回 (rid, payload, 指纹)。
+
+    指纹为空串表示这个群没什么可推。逐群 to_thread 在 sync_all_groups 打开时
+    是几百次空转派发(plan_round 已经因为同样的理由合并过一次),而这个循环
+    每 mars_sync_interval 秒就要来一遍。
+    """
+    source = round_source(settings)
+    built: list[tuple[int, dict, str]] = []
+    for rid in rids:
+        payload = build_payload(rid, settings, source)
+        built.append((rid, payload, fingerprint(payload) if should_push(payload) else ""))
+    return built
+
+
 async def push_one(client: httpx.AsyncClient, payload: dict, settings: Settings) -> None:
-    try:
-        resp = await client.put(group_info_url(settings), json=payload)
-    except httpx.HTTPError as e:
-        detail = str(e).strip() or type(e).__name__
-        raise mars_sync.MarsSyncError(f"调用 mars 群信息接口失败: {detail}") from e
-    if resp.status_code != 200:
-        body = resp.text.strip()[:200]
-        raise mars_sync.MarsSyncError(f"mars 群信息接口返回 {resp.status_code}: {body}")
+    await mars_sync.put_json(client, group_info_url(settings), payload, "mars 群信息接口")
 
 
 async def sync_once(
@@ -222,20 +217,19 @@ async def sync_once(
     before = state.to_dict()
     due: list[tuple[int, dict, str]] = []
 
-    for rid in rids:
-        payload = await asyncio.to_thread(build_payload, rid, settings)
-        if not should_push(payload):
+    for rid, payload, fp in await asyncio.to_thread(build_round, rids, settings):
+        if not fp:
             result.skipped += 1
             continue
-        fp = fingerprint(payload)
         prev = state.groups.get(str(rid))
         if prev and prev.fingerprint == fp:
             result.unchanged += 1
             continue
         due.append((rid, payload, fp))
 
-    result.pending = [payload for _rid, payload, _fp in due]
     if dry_run:
+        # 只有试运行会看 pending。真同步里带上它等于把整份成员名单再回传一遍。
+        result.pending = [payload for _rid, payload, _fp in due]
         return result
 
     errors: list[str] = []
@@ -249,7 +243,7 @@ async def sync_once(
                 try:
                     await push_one(client, payload, settings)
                 except mars_sync.MarsSyncError as e:
-                    err = mars_sync._error_text(e)
+                    err = mars_sync.error_text(e)
                     errors.append(err)
                     group = state.groups.setdefault(str(rid), GroupInfoState())
                     group.last_error = err
@@ -265,7 +259,7 @@ async def sync_once(
     if result.pushed:
         state.pushed += result.pushed
         state.last_push = now
-    state.last_error = mars_sync._summarize_errors(errors)
+    state.last_error = mars_sync.summarize_errors(errors)
     result.error = state.last_error
 
     if state.to_dict() != before or result.pushed or errors:

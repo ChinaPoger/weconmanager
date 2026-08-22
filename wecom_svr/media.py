@@ -775,7 +775,7 @@ def upload_bytes(data: bytes, ext: str, settings: Settings, rid="", send_time: i
 
 # content-type → 扩展名。不用 mimetypes.guess_extension: 它对 image/jpeg 的
 # 返回值随 Python 版本变过(.jpe/.jpg),而这个值会进对象 key,不能飘
-_CDN_EXT = {
+CONTENT_TYPE_EXT = {
     "image/gif": ".gif", "image/png": ".png", "image/jpeg": ".jpg",
     "image/webp": ".webp", "image/bmp": ".bmp", "image/heic": ".heic",
 }
@@ -797,7 +797,7 @@ def download(url: str, timeout: float) -> tuple[bytes, str]:
         raise MediaError(f"图片过大: {len(data)} 字节")
 
     ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-    return data, _CDN_EXT.get(ctype, ".jpg")
+    return data, CONTENT_TYPE_EXT.get(ctype, ".jpg")
 
 
 @dataclass(frozen=True)

@@ -71,7 +71,7 @@ async def status(
             backlog_error = ""
         except Exception as e:  # 状态接口不能因为本地解密库暂时不可用而整体失败
             backlog = {}
-            backlog_error = mars_sync._error_text(e)
+            backlog_error = mars_sync.error_text(e)
         for key in keys:
             item = state.groups[key].to_dict()
             item.update({

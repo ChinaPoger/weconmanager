@@ -70,9 +70,6 @@ GROUP_APPEAR_TIMEOUT = 90.0
 # 轮询间隔逐次翻倍到上限: 每一轮都是一次全量重解密,密集轮询换不来更早的答案。
 GROUP_APPEAR_POLL = 1.0
 GROUP_APPEAR_POLL_MAX = 8.0
-# 看到第一个新会话后还要再等一会儿才下结论: 这段等待期里落库的会话会一起进差集,
-# 「同时冒出来两个」就能被识别成不唯一而放弃改名,而不是抓到谁就改谁。
-GROUP_APPEAR_SETTLE = 4.0
 # 确认后客户端切到新群可能慢于面板关掉。改名/改昵称前先等标题变成新群。
 TITLE_SWITCH_TIMEOUT = 8.0
 TITLE_SWITCH_POLL = 0.2
@@ -168,20 +165,22 @@ def _osa(body: str, timeout: int = 20) -> str:
     return out
 
 
-def _real_click(x: int, y: int) -> None:
+def _post_click(x: int, y: int, *, move_delay: float, down_delay: float, settle: float) -> None:
     """在屏幕坐标发一次**真实**鼠标点击。
 
     System Events 的 `click at` 是合成点击,CEF 自绘的区域收不到 —— 会话标题和
     成员勾选框都实测过,点上去毫无反应。这里用 JXA 的 ObjC 桥直接调 CoreGraphics
     发真事件: 不引入任何依赖,还是同一个 osascript 二进制。
+
+    延迟和点完的静置时间由调用方给:能轮询成功信号的路径不该固定睡。
     """
     jxa = f'''
 ObjC.import('CoreGraphics');
 var pt = $.CGPointMake({int(x)}, {int(y)});
 function post(t) {{ $.CGEventPost(0, $.CGEventCreateMouseEvent($(), t, pt, 0)); }}
-post(5); delay(0.15);   // mouseMoved
-post(1); delay(0.08);   // leftMouseDown
-post(2);                // leftMouseUp
+post(5); delay({move_delay});   // mouseMoved
+post(1); delay({down_delay});   // leftMouseDown
+post(2);                        // leftMouseUp
 '''
     try:
         r = subprocess.run(
@@ -192,33 +191,18 @@ post(2);                // leftMouseUp
         raise LocalGroupError("发送鼠标事件超时") from None
     if r.returncode != 0:
         raise LocalGroupError(f"发送鼠标事件失败: {(r.stderr or r.stdout).strip()}")
-    time.sleep(0.8)
+    if settle:
+        time.sleep(settle)
+
+
+def _real_click(x: int, y: int) -> None:
+    """发一次真鼠标,再固定静置 —— 给没有成功信号可轮询的路径。"""
+    _post_click(x, y, move_delay=0.15, down_delay=0.08, settle=0.8)
 
 
 def _ui_click(x: int, y: int) -> None:
     """发一次真鼠标,立刻返回。点完由调用方轮询成功信号,别固定睡。"""
-    jxa = f'''
-ObjC.import('CoreGraphics');
-var pt = $.CGPointMake({int(x)}, {int(y)});
-function post(t) {{ $.CGEventPost(0, $.CGEventCreateMouseEvent($(), t, pt, 0)); }}
-post(5); delay(0.05);
-post(1); delay(0.05);
-post(2);
-'''
-    try:
-        r = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-"],
-            input=jxa, capture_output=True, text=True, timeout=15,
-        )
-    except subprocess.TimeoutExpired:
-        raise LocalGroupError("发送鼠标事件超时") from None
-    if r.returncode != 0:
-        raise LocalGroupError(f"发送鼠标事件失败: {(r.stderr or r.stdout).strip()}")
-
-
-def _picker_click(x: int, y: int) -> None:
-    """选人面板里点一行。跟 _real_click 同样发真鼠标,但不固定睡 0.8s — 点完轮询已选计数。"""
-    _ui_click(x, y)
+    _post_click(x, y, move_delay=0.05, down_delay=0.05, settle=0.0)
 
 
 def _activate() -> None:
@@ -583,7 +567,7 @@ def _click_picker_row(row: dict) -> None:
   -- CLICK_PICKER_ROW
   set clickName to "{name}"
 ''')
-    _picker_click(x, y)
+    _ui_click(x, y)
 
 
 def _resolved_display_name(query: str) -> str:
@@ -593,7 +577,8 @@ def _resolved_display_name(query: str) -> str:
         return ""
 
 
-def _row_matches_query(row: dict, query: str) -> bool:
+def _row_matches_query(row: dict, query: str, resolved: str) -> bool:
+    """`resolved` 是这个查询在通讯录里的显示名(查不到给空串),由调用方先解好。"""
     name = str(row.get("name") or "").strip()
     q = (query or "").strip()
     if not name or not q:
@@ -601,7 +586,6 @@ def _row_matches_query(row: dict, query: str) -> bool:
     n, ql = name.lower(), q.lower()
     if ql == n or ql in n or n in ql:
         return True
-    resolved = _resolved_display_name(q)
     if not resolved:
         return False
     r = resolved.lower()
@@ -612,10 +596,14 @@ def _english_candidate_rows(rows: list[dict], queries: list[str]) -> list[dict]:
     """弹框里对上英文/拼音查询、还没勾上的那几行。一对多就当歧义。"""
     used: set[int] = set()
     hits: list[dict] = []
+    # 每个查询只解一次通讯录:resolve_member 不带缓存,一次要发好几条 SQL,
+    # 放在行循环里就是「查询数 * 行数」次 open/close,而这条路上有人在等界面。
+    with directory.batch():
+        resolved = {q: _resolved_display_name(q) for q in queries}
     for query in queries:
         matched = [
             (i, row) for i, row in enumerate(rows)
-            if i not in used and _row_matches_query(row, query)
+            if i not in used and _row_matches_query(row, query, resolved.get(query, ""))
         ]
         if len(matched) > 1:
             shown = ", ".join(f"{r['name']}({r['dept']})" for _i, r in matched)
@@ -1161,20 +1149,6 @@ def _window_point(dx: int, dy: int) -> tuple[int, int]:
     return int(x), int(y)
 
 
-def _window_point_from_right(dx: int, dy: int) -> tuple[int, int]:
-    """把「相对主窗口右上角往里的偏移」换算成屏幕坐标。
-
-    「更多」钉在聊天区标题栏最右侧,窗口一拉宽,相对左上角的 x 就废了。
-    """
-    out = _osa(_MAIN_WINDOW + f'''
-  set p to position of mainWin
-  set s to size of mainWin
-  return ((item 1 of p) + (item 1 of s) - {dx} as string) & "," & ((item 2 of p) + {dy} as string)
-''')
-    x, _, y = out.strip().strip('"').partition(",")
-    return int(x), int(y)
-
-
 def _probe_title(dx: int, dy: int) -> str:
     """点一次标题候选位置,把输入框里的当前群名读回来;不对劲就抛错。
 
@@ -1242,26 +1216,6 @@ def _group_names() -> dict[int, str]:
     """
     messages.refresh()
     return {g["rid"]: g["name"] for g in messages.list_groups(include_unnamed=True, limit=None)}
-
-
-def _wait_new_group_rids(before: set[int]) -> list[int]:
-    """等待新建会话写入本地库,返回相对 before 新出现的 RID。
-
-    建群主路径已经先改完界面再来等,不再固定 settle 4 秒。差集不唯一时交给
-    _unique_new_rid 用新群名再筛一次。
-    """
-    deadline = time.monotonic() + GROUP_APPEAR_TIMEOUT
-    poll = GROUP_APPEAR_POLL
-    while True:
-        new_rids = sorted(set(_group_names()) - before)
-        if new_rids:
-            return new_rids
-        if time.monotonic() >= deadline:
-            return []
-        time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
-        # 每轮 _group_names() 都可能触发一次全量重解密,而整个循环跑在 ui_session
-        # 里 —— 空等期间每多问一次就多占一次 UI 闸门。等满一分半只要十来轮就够。
-        poll = min(poll * 2, GROUP_APPEAR_POLL_MAX)
 
 
 def _await_new_group_title(member_names: list[str], timeout: float = TITLE_SWITCH_TIMEOUT) -> bool:
@@ -1443,23 +1397,6 @@ def _rename_locked(
     }
 
 
-_NICK_HINTS = (
-    "本群的昵称",
-    "群昵称",
-    "My Alias",
-    "Alias in Group",
-    "nickname",
-    "Nick name",
-)
-
-
-def _looks_like_nickname_hint(text: str) -> bool:
-    raw = text or ""
-    lowered = raw.lower()
-    return any(
-        (hint.lower() in lowered) if hint.isascii() else (hint in raw)
-        for hint in _NICK_HINTS
-    )
 
 
 def _dump_ui_hints() -> str:
@@ -1574,16 +1511,26 @@ end lineOf
     return out
 
 
-def _parse_hint_line(line: str) -> tuple[str, str, int, int] | None:
-    role, sep, rest = line.partition("\t")
+def _parse_field_line(out: str | None) -> dict | None:
+    """解 `role \t value \t x,y` 这行 AppleScript 回包。"NONE"/空 → None。
+
+    这个行格式是几个 AX 探测脚本共用的,解析只写一份 —— 加字段或换分隔符时
+    不至于只改到其中一个。role 不是文本框就当作「找到了那一行」(ROW)。
+    """
+    raw = (out or "").strip().strip('"')
+    if not raw or raw == "NONE":
+        return None
+    role, sep, rest = raw.partition("\t")
     if not sep:
         return None
-    hint, _, pos = rest.partition("\t")
+    value, _, pos = rest.partition("\t")
     x_s, _, y_s = pos.partition(",")
     try:
-        return role, hint, int(x_s), int(y_s)
+        x, y = int(x_s), int(y_s)
     except ValueError:
-        return role, hint, 0, 0
+        x, y = 0, 0
+    kind = "FIELD" if role in {"AXTextField", "AXTextArea"} else "ROW"
+    return {"kind": kind, "value": value, "x": x, "y": y, "role": role}
 
 
 def _nickname_dialog_field() -> dict | None:
@@ -1634,20 +1581,7 @@ def _nickname_dialog_field() -> dict | None:
   end repeat
   return "NONE"
 ''')
-    raw = (out or "").strip().strip('"')
-    if not raw or raw == "NONE":
-        return None
-    role, sep, rest = raw.partition("\t")
-    if not sep:
-        return None
-    value, _, pos = rest.partition("\t")
-    x_s, _, y_s = pos.partition(",")
-    try:
-        x, y = int(x_s), int(y_s)
-    except ValueError:
-        x, y = 0, 0
-    kind = "FIELD" if role in {"AXTextField", "AXTextArea"} else "ROW"
-    return {"kind": kind, "value": value, "x": x, "y": y, "role": role}
+    return _parse_field_line(out)
 
 
 def _await_nickname_dialog(timeout: float = 1.2) -> dict | None:
@@ -1705,28 +1639,6 @@ def _front_window_mentions(text: str) -> bool:
     return text in blob
 
 
-def _try_press_named_button(names: tuple[str, ...]) -> bool:
-    quoted = ", ".join(f'"{_escape(n)}"' for n in names)
-    out = _osa(f'''
-  set wanted to {{{quoted}}}
-  set target to missing value
-  repeat with b in (buttons of front window)
-    set n to ""
-    try
-      set n to name of b as text
-    end try
-    if n is in wanted then
-      set target to contents of b
-      exit repeat
-    end if
-  end repeat
-  if target is missing value then return "NONE"
-  perform action "AXPress" of target
-  return "OK"
-''')
-    return out.strip().strip('"') == "OK"
-
-
 def _header_action_button_points() -> list[tuple[int, int]]:
     """聊天区标题栏右侧那排约 28x28 的按钮,按从左到右排序。
 
@@ -1756,11 +1668,6 @@ def _header_action_button_points() -> list[tuple[int, int]]:
             continue
     points.sort(key=lambda p: p[0])
     return points
-
-
-def _header_more_button_point() -> tuple[int, int] | None:
-    points = _header_action_button_points()
-    return points[0] if points else None
 
 
 def _try_press_named_menu_item(names: tuple[str, ...]) -> bool:
@@ -1903,31 +1810,6 @@ def _open_group_info_panel(*, skip_stray_close: bool = False) -> None:
     )
 
 
-def _group_info_dialog_bounds() -> tuple[int, int, int, int] | None:
-    out = _osa('''
-  repeat with w in windows
-    set s to size of w
-    if (item 1 of s) ≥ 280 and (item 1 of s) ≤ 360 and (item 2 of s) ≥ 500 then
-      set p to position of w
-      set px to item 1 of p as string
-      set py to item 2 of p as string
-      set sx to item 1 of s as string
-      set sy to item 2 of s as string
-      return px & "," & py & "," & sx & "," & sy
-    end if
-  end repeat
-  return "NONE"
-''')
-    raw = out.strip().strip('"')
-    if not raw or raw == "NONE":
-        return None
-    parts = raw.split(",")
-    try:
-        return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-    except (ValueError, IndexError):
-        return None
-
-
 def _focused_text_field() -> dict | None:
     out = _osa('''
   set fe to missing value
@@ -1947,69 +1829,7 @@ def _focused_text_field() -> dict | None:
   set p to position of fe
   return r & tab & v & tab & (item 1 of p as string) & "," & (item 2 of p as string)
 ''')
-    raw = out.strip().strip('"')
-    if not raw or raw == "NONE":
-        return None
-    role, sep, rest = raw.partition("\t")
-    if not sep:
-        return None
-    value, _, pos = rest.partition("\t")
-    x_s, _, y_s = pos.partition(",")
-    try:
-        x, y = int(x_s), int(y_s)
-    except ValueError:
-        x, y = 0, 0
-    return {"kind": "FIELD", "value": value, "x": x, "y": y, "role": role}
-
-
-def _group_info_setting_rows() -> list[tuple[int, int, int, int]]:
-    """群详情表格里的设置行。跳过顶部大块成员区,只留 30~50px 的条目。"""
-    rows: list[tuple[int, int, int, int]] = []
-    for _x, _y, _w, _h, px, py, sx, sy in _group_info_table_rows():
-        if 30 <= sy <= 50:
-            rows.append((px, py, sx, sy))
-    return rows
-
-
-def _group_info_table_rows() -> list[tuple[int, int, int, int, int, int, int, int]]:
-    """群详情窗口里每一行:(窗x,窗y,窗w,窗h, 行x,行y,行w,行h)。
-
-    群详情是独立的约 320 宽窗口;行文字嵌在表格单元格里,顶层 UI 元素读不到
-    「我在本群的昵称」,必须下到 row。
-    """
-    out = _osa('''
-  set acc to {}
-  repeat with w in windows
-    set s to size of w
-    if (item 1 of s) ≥ 280 and (item 1 of s) ≤ 360 and (item 2 of s) ≥ 500 then
-      set wp to position of w
-      try
-        set tbl to table 1 of scroll area 1 of w
-        repeat with rw in rows of tbl
-          set p to position of rw
-          set sz to size of rw
-          set line to (item 1 of wp as string) & "," & (item 2 of wp as string)
-          set line to line & "," & (item 1 of s as string) & "," & (item 2 of s as string)
-          set line to line & "," & (item 1 of p as string) & "," & (item 2 of p as string)
-          set line to line & "," & (item 1 of sz as string) & "," & (item 2 of sz as string)
-          set end of acc to line
-        end repeat
-      end try
-    end if
-  end repeat
-  set AppleScript's text item delimiters to linefeed
-  return acc as text
-''')
-    rows: list[tuple[int, int, int, int, int, int, int, int]] = []
-    for line in (out or "").splitlines():
-        parts = line.strip().strip('"').split(",")
-        if len(parts) != 8:
-            continue
-        try:
-            rows.append(tuple(int(p) for p in parts))  # type: ignore[arg-type]
-        except ValueError:
-            continue
-    return rows
+    return _parse_field_line(out)
 
 
 def _group_info_labeled_row(labels: tuple[str, ...]) -> tuple[int, int, int, int] | None:
@@ -2066,18 +1886,6 @@ def _group_info_labeled_row(labels: tuple[str, ...]) -> tuple[int, int, int, int
         return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
     except (ValueError, IndexError):
         return None
-
-
-def _field_in_group_info(focused: dict | None, bounds: tuple[int, int, int, int] | None) -> bool:
-    if not focused:
-        return False
-    fx, fy = focused.get("x", 0), focused.get("y", 0)
-    if fy > 680:
-        return False
-    if bounds is None:
-        return fx >= 800
-    x, y, w, h = bounds
-    return x - 20 <= fx <= x + w + 20 and y <= fy <= y + h - 30
 
 
 def _probe_nickname_in_dialog() -> dict:
