@@ -12,14 +12,14 @@ from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 
+from . import media
 from .schemas import LocalSendRequest
 from .settings import get_settings
 
 MAX_BASE64_CHARS = 40 * 1024 * 1024
-MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024
+MAX_IMAGE_URL_BYTES = 30 * 1024 * 1024
 MAX_REDIRECTS = 5
 DOWNLOAD_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
-_IMAGE_SUFFIXES = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
 
 
 def _validate_public_url(url: str) -> None:
@@ -65,21 +65,21 @@ def _download_image(url: str, directory: Path) -> str:
                 if not content_type.startswith("image/"):
                     raise ValueError(f"image_url 返回的不是图片: {content_type or '缺少 Content-Type'}")
                 length = response.headers.get("content-length")
-                if length and int(length) > MAX_DOWNLOAD_BYTES:
-                    raise ValueError(f"image_url 图片超过 {MAX_DOWNLOAD_BYTES // 1024 // 1024} MB")
+                if length and int(length) > MAX_IMAGE_URL_BYTES:
+                    raise ValueError(f"image_url 图片超过 {MAX_IMAGE_URL_BYTES // 1024 // 1024} MB")
 
                 suffix = Path(unquote(urlsplit(current).path)).suffix.lower()
                 if not suffix or len(suffix) > 10:
-                    suffix = _IMAGE_SUFFIXES.get(content_type, ".img")
+                    suffix = media.CONTENT_TYPE_EXT.get(content_type, ".img")
                 fd, path = tempfile.mkstemp(prefix="wecom-image-", suffix=suffix, dir=directory)
                 try:
                     size = 0
                     with os.fdopen(fd, "wb") as f:
                         for chunk in response.iter_bytes():
                             size += len(chunk)
-                            if size > MAX_DOWNLOAD_BYTES:
+                            if size > MAX_IMAGE_URL_BYTES:
                                 raise ValueError(
-                                    f"image_url 图片超过 {MAX_DOWNLOAD_BYTES // 1024 // 1024} MB"
+                                    f"image_url 图片超过 {MAX_IMAGE_URL_BYTES // 1024 // 1024} MB"
                                 )
                             f.write(chunk)
                     return path

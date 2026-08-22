@@ -135,8 +135,6 @@ class Settings(BaseSettings):
     # 不该被程序的猜测盖过去。
     ui_plus_offset: str = ""
     ui_title_offset: str = ""
-    # 「更多」相对窗口右上角往里的偏移,用来打开群详情改「我在本群的昵称」。
-    ui_more_offset: str = ""
     # 自动校准:记住的点没点中时,在附近按候选试,试中了记到 ui_offsets.json。
     # 关掉 = 只点那一个点,点不中直接报错。
     ui_calibrate: bool = True
