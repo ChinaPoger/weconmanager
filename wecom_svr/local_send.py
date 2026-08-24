@@ -799,7 +799,7 @@ def _mention_candidates() -> list[str]:
         if attempt < 11:
             time.sleep(0.15)
     detail = f": {last_error}" if last_error else ""
-    raise LocalSendError(f"读取 @ 候选失败{detail}（候选窗口未出现或无法读取）")
+    raise LocalSendError(f"读取 @ 候选失败{detail}(候选窗口未出现或无法读取)")
 
 
 def _dismiss_mention_picker() -> None:
@@ -862,7 +862,7 @@ def _infer_mentions(content: str) -> list[str]:
 def _mention_spans(content: str, mentions: list[str] | None) -> list[tuple[int, int, str]]:
     """校验显式 mentions 并按正文位置返回跨度。
 
-    mentions=None 表示正文中的 ``@`` 全部按普通文本发送；只有调用方显式
+    mentions=None 表示正文中的 ``@`` 全部按普通文本发送;只有调用方显式
     提供姓名列表时,对应的 @ 才会转换成企业微信真实提及。
     """
     wanted = list(mentions or [])
