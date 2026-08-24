@@ -624,8 +624,8 @@ def canonicalize_mars_payload(payload: dict, group_prefix: str = "") -> dict:
     """统一两条写入路径发给 Mars 的身份字段。
 
     群信息定时同步和消息 hook 都会触发 Mars 的群档案 upsert。最终在 HTTP
-    边界再归一遍，避免任一路径/旧调用方把大 RID 以科学计数法写进去。
-    不直接修改调用方对象，便于 outbox 和指纹继续使用原始 payload。
+    边界再归一遍,避免任一路径/旧调用方把大 RID 以科学计数法写进去。
+    不直接修改调用方对象,便于 outbox 和指纹继续使用原始 payload。
     """
     body = dict(payload)
     def group_value(value: object) -> str:
