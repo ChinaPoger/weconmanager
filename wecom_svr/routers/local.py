@@ -107,8 +107,18 @@ def create_local_group(req: LocalCreateGroupRequest, _: None = Depends(require_t
     每个成员在选中前都会核对客户端搜出来的姓名与部门,搜出多条会 400 并列出候选。
     """
     result = local_group.create_group(
-        req.members, name=req.name, nickname=req.nickname
+        req.members, name=req.name, nickname=req.nickname, return_rid=True
     )
+    if result.get("success"):
+        rid = result.get("rid")
+        if rid is None:
+            # 群已建成,但本地会话还没落库;不能猜 RID,否则可能把“1”发到别的群。
+            result["message_error"] = "群已建好,但尚未定位到会话 RID,未发送初始化消息"
+        else:
+            message = local_send.send_message(conv_rid=rid, content="1")
+            result["message_result"] = message
+            if not message.get("success"):
+                result["message_error"] = message.get("error") or "发送初始化消息失败"
     return _result_response(result)
 
 

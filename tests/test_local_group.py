@@ -871,6 +871,48 @@ def test_endpoint_success(api, fake):
     assert r.json()["member_count"] == 3
 
 
+def test_endpoint_sends_initial_message_after_group_creation(api, monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        local_group,
+        "create_group",
+        lambda members, name="", nickname="", return_rid=False: {
+            "success": True, "rid": 3395103030, "member_count": 3,
+        },
+    )
+    monkeypatch.setattr(
+        local_send,
+        "send_message",
+        lambda **kwargs: sent.append(kwargs) or {
+            "success": True, "conv_rid": kwargs["conv_rid"],
+        },
+    )
+
+    r = api.post("/api/v1/group/create", json={"members": ["陈涛", "陈挺"]})
+
+    assert r.status_code == 200
+    assert sent == [{"conv_rid": 3395103030, "content": "1"}]
+    assert r.json()["message_result"]["success"] is True
+
+
+def test_endpoint_does_not_guess_rid_for_initial_message(api, monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        local_group,
+        "create_group",
+        lambda members, name="", nickname="", return_rid=False: {
+            "success": True, "rid": None, "member_count": 3,
+        },
+    )
+    monkeypatch.setattr(local_send, "send_message", lambda **kwargs: sent.append(kwargs))
+
+    r = api.post("/api/v1/group/create", json={"members": ["陈涛", "陈挺"]})
+
+    assert r.status_code == 200
+    assert sent == []
+    assert "尚未定位" in r.json()["message_error"]
+
+
 def test_endpoint_rejects_single_member(api, fake):
     r = api.post("/api/v1/group/create", json={"members": ["陈涛"]})
     assert r.status_code == 400
