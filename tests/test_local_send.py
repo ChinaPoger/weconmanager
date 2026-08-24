@@ -386,10 +386,14 @@ def test_submit_current_input_has_no_default_settle_delay(monkeypatch):
     assert local_send._submit_current_input() == (True, "ok")
 
 
-def test_mention_spans_are_inferred_and_ordered():
-    assert local_send._mention_spans("请 @abz 和 @任威风 测试", None) == [
-        (2, 6, "abz"),
-        (9, 13, "任威风"),
+def test_missing_mentions_keeps_at_text_plain():
+    assert local_send._mention_spans("请 @abz 和 @任威风 测试", None) == []
+
+
+def test_explicit_mentions_support_hyphenated_name():
+    content = "请 @七牛-牛来 协助跟进"
+    assert local_send._mention_spans(content, ["七牛-牛来"]) == [
+        (2, 8, "七牛-牛来"),
     ]
 
 
@@ -441,7 +445,9 @@ def test_rich_message_selects_mentions_before_sending(monkeypatch):
         lambda **kwargs: pytest.fail("富文本 @ 消息不应触发剪贴板粘贴"),
     )
 
-    assert local_send._type_rich_message("请 @abz 和 @任威风 测试", None) == (True, "ok")
+    assert local_send._type_rich_message(
+        "请 @abz 和 @任威风 测试", ["abz", "任威风"]
+    ) == (True, "ok")
     assert calls == [
         "focus", "clear", "请 ", ("mention", "abz"), " 和 ",
         ("mention", "任威风"), " 测试", ("sleep", 0.1), "submit",
