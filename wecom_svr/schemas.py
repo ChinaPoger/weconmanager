@@ -59,8 +59,8 @@ class LocalSendRequest(BaseModel):
     mentions: list[str] | None = Field(
         None,
         description=(
-            "text 消息中要转换为真实提及的姓名。正文中须出现对应的 @姓名;留空时"
-            "服务会从正文中自动识别 @英文/数字/中文姓名"
+            "text 消息中要转换为真实提及的姓名。正文中须出现对应的 @姓名;不传时"
+            "正文中的 @ 按普通文本发送"
         ),
     )
     image_path: str = Field("", description="image 消息的服务端本地图片路径")

@@ -745,34 +745,61 @@ def _post_unicode_text(text: str) -> tuple[bool, str]:
 
 
 def _mention_candidates() -> list[str]:
-    """读取当前 @ 候选窗的第一列姓名。"""
+    """读取当前 @ 候选窗的第一列姓名。
+
+    候选窗是 CEF 异步创建的,不能把“这一次 AX 树还没出现”当成最终失败。
+    另外不同企微版本会把它挂在独立 window 或主窗口的 sheet 下,两种都扫。
+    脚本本身返回 NONE 而不是在扫描某个普通窗口时抛错,避免错误处理提前结束。
+    """
     script = r'''
     tell application "System Events"
         tell process "企业微信"
+            set containers to {}
             repeat with w in windows
+                set end of containers to contents of w
                 try
-                    set ws to size of w
-                    if (item 1 of ws) > 600 or (item 2 of ws) > 500 then
-                        error "不是 @ 候选窗口"
-                    end if
-                    set tb to table 1 of scroll area 1 of w
-                    set acc to ""
-                    repeat with r in rows of tb
-                        try
-                            set acc to acc & (value of static text 1 of r as text) & linefeed
-                        end try
+                    repeat with sh in sheets of w
+                        set end of containers to contents of sh
                     end repeat
-                    return acc
                 end try
             end repeat
-            error "找不到 @ 成员候选窗口"
+            repeat with c in containers
+                try
+                    set ws to size of c
+                    -- 候选浮层在新版客户端可能约 728x742;旧的 600x500
+                    -- 硬限制会把它过滤掉。主聊天窗口通常更宽,仍保留宽度上限。
+                    if (item 1 of ws) ≤ 900 and (item 2 of ws) ≤ 900 then
+                        set tb to table 1 of scroll area 1 of c
+                        set acc to ""
+                        repeat with r in rows of tb
+                            try
+                                set acc to acc & (value of static text 1 of r as text) & linefeed
+                            end try
+                        end repeat
+                        if acc is not "" then return acc
+                    end if
+                end try
+            end repeat
+            return "NONE"
         end tell
     end tell
     '''
-    ok, out = _run_applescript(script, timeout=15)
-    if not ok:
-        raise LocalSendError(f"读取 @ 候选失败: {out}")
-    return [line for line in out.splitlines() if line.strip()]
+    # 输入搜索词后候选列表不是立即可读;实测 0.35s 偶尔仍只有输入框。
+    # 轮询只读 AX,不重复输入,不会造成副作用。首次扫描失败不能直接判定
+    # 输入无效:候选窗经常要等 CEF 完成一次渲染才挂到 AX 树。
+    last_error = ""
+    for attempt in range(12):
+        ok, out = _run_applescript(script, timeout=3)
+        if ok:
+            candidates = [line for line in out.splitlines() if line.strip() and line.strip() != "NONE"]
+            if candidates:
+                return candidates
+        else:
+            last_error = out
+        if attempt < 11:
+            time.sleep(0.15)
+    detail = f": {last_error}" if last_error else ""
+    raise LocalSendError(f"读取 @ 候选失败{detail}(候选窗口未出现或无法读取)")
 
 
 def _dismiss_mention_picker() -> None:
@@ -825,13 +852,20 @@ def _type_mention(name: str) -> None:
 
 
 def _infer_mentions(content: str) -> list[str]:
-    """从常见的 @中文/英文/数字姓名写法推断提及列表。"""
-    return re.findall(r"(?<![\w@])@([A-Za-z0-9_\u3400-\u9fff]+)", content)
+    """从常见的 @中文/英文/数字/连字符姓名写法推断提及列表。"""
+    # 企微姓名允许使用连字符,例如「@七牛-牛来」。连字符放在字符类末尾,
+    # 避免被解释成范围符号。mentions 未传时必须和正文中的完整 token 对齐,
+    # 不能把这个名字误截成「七牛」后再去查候选。
+    return re.findall(r"(?<![\w@])@([A-Za-z0-9_\u3400-\u9fff-]+)", content)
 
 
 def _mention_spans(content: str, mentions: list[str] | None) -> list[tuple[int, int, str]]:
-    """校验正文里的 @姓名并按正文位置返回跨度。"""
-    wanted = list(mentions) if mentions is not None else _infer_mentions(content)
+    """校验显式 mentions 并按正文位置返回跨度。
+
+    mentions=None 表示正文中的 ``@`` 全部按普通文本发送;只有调用方显式
+    提供姓名列表时,对应的 @ 才会转换成企业微信真实提及。
+    """
+    wanted = list(mentions or [])
     seen: set[str] = set()
     spans: list[tuple[int, int, str]] = []
     for name in wanted:
@@ -1203,7 +1237,7 @@ def send_message(
         to: 接收人/群名称(模糊搜索),与 conv_rid 二选一
         conv_rid: 会话 RID(服务端 ID),精准定位
         content: 消息正文
-        mentions: 要转换为真实提及的姓名;不传时自动识别常见的 @姓名
+        mentions: 要转换为真实提及的姓名;不传时正文中的 @ 按普通文本发送
 
     Returns:
         {"success": bool, "conv_name": str, "conv_rid": int, "error": ...}
