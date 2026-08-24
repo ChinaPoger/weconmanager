@@ -158,7 +158,36 @@ async def _create_local_group(req: LocalCreateGroupRequest) -> dict:
     # mars 的 ack 会把 result 原样写回任务条目。用 group_id 暴露稳定的业务字段,
     # 同时保留 rid 兼容本机接口调用方。
     if isinstance(result, dict) and result.get("success") and result.get("rid") is not None:
-        result = {**result, "group_id": result["rid"]}
+        rid = int(result["rid"])
+        result = {**result, "group_id": rid}
+        # /local/group/create 的 HTTP 路径会补发初始化消息,但 mars 的
+        # group.create 之前漏了这一步,导致新群里没有约定的第一条 "1"。
+        # 建群刚结束时会话索引可能尚未落库,沿用 HTTP 路径的短暂重试策略。
+        message: dict = {"success": False, "error": "新群会话尚未完成落库"}
+        for attempt in range(10):
+            try:
+                message = await asyncio.to_thread(
+                    local_send.send_message, conv_rid=rid, content="1"
+                )
+            except Exception as e:  # UI/本地库短暂未就绪,继续重试
+                log.warning(
+                    "mars 新群 RID=%s 初始化消息第 %d 次发送异常: %s",
+                    rid, attempt + 1, e,
+                )
+                message = {"success": False, "error": str(e) or type(e).__name__}
+            log.info(
+                "mars 新群 RID=%s 初始化消息第 %d 次发送结果 success=%s",
+                rid, attempt + 1, message.get("success"),
+            )
+            if message.get("success"):
+                break
+            if attempt < 9:
+                await asyncio.sleep(0.5)
+        result["message_result"] = message
+        if not message.get("success"):
+            result["message_error"] = message.get("error") or "发送初始化消息失败"
+    elif isinstance(result, dict) and result.get("success"):
+        result["message_error"] = "群已建好,但尚未定位到会话 RID,未发送初始化消息"
     return result
 
 
