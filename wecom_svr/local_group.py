@@ -1692,11 +1692,15 @@ def _try_press_named_menu_item(names: tuple[str, ...]) -> bool:
 
 
 def _group_info_dialog_open() -> bool:
-    """群详情是独立的约 320 宽对话框,不是主窗口里的侧栏。"""
+    """群详情是独立的小窗。
+
+    不要把尺寸写死成某一个客户端版本的 320x699: 新版会因为缩放、字体或
+    屏幕高度变成 300/400 多宽。真正的成功信号仍是昵称行,这里只是快速路径。
+    """
     out = _osa('''
   repeat with w in windows
     set s to size of w
-    if (item 1 of s) ≥ 280 and (item 1 of s) ≤ 360 and (item 2 of s) ≥ 500 then
+    if (item 1 of s) ≥ 260 and (item 1 of s) ≤ 460 and (item 2 of s) ≥ 400 then
       return "YES"
     end if
   end repeat
@@ -1770,43 +1774,55 @@ def _header_more_click_point() -> tuple[int, int] | None:
 
 
 def _open_group_info_panel(*, skip_stray_close: bool = False) -> None:
-    """打开群详情。成功信号是扫到昵称行,或出现约 320 宽的详情对话框。
+    """可靠地打开群详情,成功信号是昵称行/详情小窗出现。
 
-    不能点会话标题:那是改群名的入口,会把昵称写进群名。也不能点最右按钮:
-    那是添加成员。入口是标题栏右侧那排里最左边的「更多」。
-    skip_stray_close=True 给建群刚完成用:这时只有主窗口,关残留窗口是空转。
+    这里以前只点一次坐标。建群刚完成时尤其容易失败:确认面板刚消失、主窗口
+    还没真正成为 front window,或者上一次留下的菜单盖住了标题栏。坐标是最后
+    手段,每次重试都会重新取 AX 按钮位置,绝不盲点固定屏幕坐标。
     """
     if _group_info_dialog_open() or _nickname_dialog_field() is not None:
         return
-    if not skip_stray_close:
-        _close_stray_windows()
-        if _group_info_dialog_open() or _nickname_dialog_field() is not None:
-            return
 
-    more = _header_more_click_point()
-    if more is None:
-        raise LocalGroupError(
-            "找不到聊天区标题栏的「更多」按钮,无法打开群详情改昵称"
-        )
-    _ui_click(*more)
-    deadline = time.monotonic() + 1.6
-    for _ in range(14):
-        if _group_info_dialog_open() or _nickname_dialog_field() is not None:
-            return
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(0.12)
-    if _try_press_named_menu_item(("群聊信息", "Chat Info", "群信息")):
-        deadline = time.monotonic() + 0.8
-        for _ in range(8):
-            if _nickname_ui_ready():
+    # 即使 already_open 也要 raise。该参数只代表“不要重新打开会话”,不代表
+    # 当前已经是 front window；这是建群后昵称设置最常见的竞态。
+    _activate()
+    _close_stray_windows()
+    if _group_info_dialog_open() or _nickname_dialog_field() is not None:
+        return
+
+    last_more: tuple[int, int] | None = None
+    for attempt in range(3):
+        # 菜单/浮层可能还在，先收掉再重新把主窗口抬到最前。
+        if attempt:
+            try:
+                _osa("  key code 53\n")
+            except LocalGroupError:
+                pass
+            _activate()
+        more = _header_more_click_point()
+        if more is None:
+            time.sleep(0.2)
+            continue
+        last_more = more
+        _ui_click(*more)
+        deadline = time.monotonic() + 1.8
+        while time.monotonic() < deadline:
+            if _group_info_dialog_open() or _nickname_dialog_field() is not None:
                 return
-            if time.monotonic() >= deadline:
+            # 有些版本点击“更多”只打开菜单,入口不是详情窗口本身。
+            if _try_press_named_menu_item(("群聊信息", "Chat Info", "群信息")):
+                inner = time.monotonic() + 1.2
+                while time.monotonic() < inner:
+                    if _nickname_ui_ready():
+                        return
+                    time.sleep(0.1)
                 break
             time.sleep(0.12)
+
+    point = f"({last_more[0]},{last_more[1]})" if last_more else "未知位置"
     raise LocalGroupError(
-        f"点了标题栏「更多」({more[0]},{more[1]}) 后仍找不到群详情。"
-        "请确认会话已打开,且右上角没有挡住「更多」的面板。"
+        f"点了标题栏「更多」{point} 后仍找不到群详情。已自动重试3次；"
+        "请确认会话已打开，且右上角没有挡住「更多」的面板。"
     )
 
 
