@@ -186,7 +186,9 @@ def build_round(rids: list[int], settings: Settings) -> list[tuple[int, dict, st
 
 
 async def push_one(client: httpx.AsyncClient, payload: dict, settings: Settings) -> None:
-    await mars_sync.put_json(client, group_info_url(settings), payload, "mars 群信息接口")
+    await mars_sync.put_json(
+        client, group_info_url(settings), payload, "mars 群信息接口", settings.mars_group_prefix
+    )
 
 
 async def sync_once(

@@ -620,11 +620,41 @@ def hook_url(settings: Settings) -> str:
     return mars_base(settings) + HOOK_PATH
 
 
-async def put_json(client: httpx.AsyncClient, url: str, payload: dict, what: str) -> None:
+def canonicalize_mars_payload(payload: dict, group_prefix: str = "") -> dict:
+    """统一两条写入路径发给 Mars 的身份字段。
+
+    群信息定时同步和消息 hook 都会触发 Mars 的群档案 upsert。最终在 HTTP
+    边界再归一遍,避免任一路径/旧调用方把大 RID 以科学计数法写进去。
+    不直接修改调用方对象,便于 outbox 和指纹继续使用原始 payload。
+    """
+    body = dict(payload)
+    def group_value(value: object) -> str:
+        text = normalize_group_number(value)
+        lower = text.lower()
+        has_prefix = lower.startswith(("wework-", "wecom-", "r:"))
+        return f"{group_prefix}{text}" if group_prefix and not has_prefix else text
+
+    if "groupNumber" in body:
+        body["groupNumber"] = group_value(body["groupNumber"])
+    if "group_number" in body:
+        body["group_number"] = group_value(body["group_number"])
+    if "senderNumber" in body:
+        body["senderNumber"] = id_text(body["senderNumber"])
+    return body
+
+
+async def put_json(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: dict,
+    what: str,
+    group_prefix: str = "",
+) -> None:
     """PUT 一份 JSON 给 mars。非 200 或传输失败一律抛 MarsSyncError。
 
     「只认 200、报错正文截 200 字」是 mars 这几个接口共用的约定,写一份。
     """
+    payload = canonicalize_mars_payload(payload, group_prefix)
     try:
         resp = await client.put(url, json=payload)
     except httpx.HTTPError as e:
@@ -637,7 +667,7 @@ async def put_json(client: httpx.AsyncClient, url: str, payload: dict, what: str
 
 async def push_one(client: httpx.AsyncClient, hook: dict, settings: Settings) -> None:
     """推一条。失败抛 MarsSyncError —— 调用方据此停在当前水位,下轮重来。"""
-    await put_json(client, hook_url(settings), hook, "mars")
+    await put_json(client, hook_url(settings), hook, "mars", settings.mars_group_prefix)
 
 
 # ─── 一轮同步 ───────────────────────────────────────────────────────────

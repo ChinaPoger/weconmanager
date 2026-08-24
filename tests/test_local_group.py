@@ -857,7 +857,8 @@ def test_auto_composed_title_recognition(title, members, expected):
 
 # ─── HTTP 层 ───────────────────────────────────────────────────────────
 
-def test_endpoint_returns_local_error_shape(api, fake):
+def test_endpoint_returns_local_error_shape(api, fake, monkeypatch):
+    monkeypatch.setattr(local_group, "_group_names", lambda: {})
     r = api.post("/api/v1/group/create", json={"members": ["陈", "陈挺"]})
     assert r.status_code == 400
     body = r.json()
@@ -865,7 +866,9 @@ def test_endpoint_returns_local_error_shape(api, fake):
     assert "陈珂" in body["error"]
 
 
-def test_endpoint_success(api, fake):
+def test_endpoint_success(api, fake, monkeypatch):
+    monkeypatch.setattr(local_group, "_group_names", lambda: {})
+    monkeypatch.setattr(local_send, "send_message", lambda **kwargs: {"success": True})
     r = api.post("/api/v1/group/create", json={"members": ["陈涛", "陈挺"]})
     assert r.status_code == 200
     assert r.json()["member_count"] == 3
@@ -1243,6 +1246,7 @@ def test_nickname_endpoint_success(api, fake, monkeypatch):
         fake.sheet_open = False
 
     monkeypatch.setattr(local_group, "_confirm", confirm)
+    monkeypatch.setattr(local_send, "send_message", lambda **kwargs: {"success": True})
     r = api.post("/api/v1/group/create", json={"members": ["陈涛", "陈挺"], "nickname": "小王"})
     assert r.status_code == 200
     assert r.json()["nickname"] == "小王"

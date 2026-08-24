@@ -227,6 +227,19 @@ def test_group_number_is_prefixed_to_avoid_colliding_with_qq_groups(settings):
     assert "20614687431404" in hook["groupNumber"]
 
 
+def test_http_payload_canonicalization_covers_both_group_fields():
+    payload = mars_sync.canonicalize_mars_payload({
+        "groupNumber": "1.0883245789880156e+16",
+        "group_number": "R:1.0883245789880156e+16",
+        "senderNumber": "1.0883245789880156e+16",
+    })
+    assert payload == {
+        "groupNumber": "10883245789880156",
+        "group_number": "R:10883245789880156",
+        "senderNumber": "10883245789880156",
+    }
+
+
 def test_id_text_never_emits_scientific_notation():
     rid = 10945118031183243
     assert mars_sync.id_text(rid) == "10945118031183243"
