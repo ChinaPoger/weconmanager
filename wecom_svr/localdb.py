@@ -9,6 +9,7 @@ HTTP 映射(LocalSendError→400,LocalDataError→503),又不产生循环 import
 """
 import sqlite3
 import threading
+from decimal import Decimal, InvalidOperation
 from contextlib import contextmanager
 
 from .paths import find_db
@@ -40,10 +41,12 @@ def parse_id(value: object) -> int | None:
     if not text:
         return None
     try:
+        # 科学计数法字符串不能再经过 float:17 位 RID 可能因此被四舍五入。
+        # Decimal 只用于字符串输入,保留已有 float 输入的 SQLite 语义。
         if "e" in text.lower() or "." in text:
-            return int(float(text))
+            return int(Decimal(text))
         return int(text)
-    except (TypeError, ValueError, OverflowError):
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
         return None
 
 
