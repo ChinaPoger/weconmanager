@@ -39,7 +39,7 @@ from .bgloop import BackgroundLoop
 from .group import GroupError
 from .images import materialized_image
 from .local_send import LocalDataError, LocalSendError
-from .mars_sync import MarsNotConfigured, MarsSyncError, mars_base
+from .mars_sync import MarsNotConfigured, MarsSyncError, group_number_text, mars_base
 from .paths import AgentHomeError
 from .schemas import (
     LocalCreateGroupRequest,
@@ -159,7 +159,7 @@ async def _create_local_group(req: LocalCreateGroupRequest) -> dict:
     # 同时保留 rid 兼容本机接口调用方。
     if isinstance(result, dict) and result.get("success") and result.get("rid") is not None:
         rid = int(result["rid"])
-        result = {**result, "group_id": rid}
+        result = {**result, "group_id": group_number_text("R:", rid)}
         # /local/group/create 的 HTTP 路径会补发初始化消息,但 mars 的
         # group.create 之前漏了这一步,导致新群里没有约定的第一条 "1"。
         # 建群刚结束时会话索引可能尚未落库,沿用 HTTP 路径的短暂重试策略。

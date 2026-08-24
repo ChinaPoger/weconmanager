@@ -480,6 +480,7 @@ def test_mars_group_create_sends_initial_message(monkeypatch):
     ))
     assert calls == [{"conv_rid": 3395103030, "content": "1"}]
     assert result["message_result"]["success"] is True
+    assert result["group_id"] == "R:3395103030"
 
 
 def test_status_reports_config_without_leaking_the_token(client):
