@@ -239,6 +239,13 @@ def test_id_text_never_emits_scientific_notation():
     assert mars_sync.normalize_group_number("wework-1.0945118031183244e+16") == "wework-10945118031183244"
 
 
+def test_exact_scientific_rid_string_keeps_all_17_digits():
+    """新群 RID 从 SQLite/JSON 以科学计数法字符串来时不能再丢精度。"""
+    rid = "1.0946415406230956e+16"
+    assert mars_sync.id_text(rid) == "10946415406230956"
+    assert mars_sync.group_number_text("R:", rid) == "R:10946415406230956"
+
+
 def test_large_float_rid_is_decimal_in_group_number(settings):
     """sqlite REAL / JSON number 会把 17 位 RID 变成 float,绝不能 f-string 成 e+16。"""
     rid = 10945118031183243.0
