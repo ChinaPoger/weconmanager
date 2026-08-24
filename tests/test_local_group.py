@@ -869,6 +869,7 @@ def test_endpoint_returns_local_error_shape(api, fake, monkeypatch):
 def test_endpoint_success(api, fake, monkeypatch):
     monkeypatch.setattr(local_group, "_group_names", lambda: {})
     monkeypatch.setattr(local_send, "send_message", lambda **kwargs: {"success": True})
+    monkeypatch.setattr(local_group.time, "sleep", lambda _seconds: None)
     r = api.post("/api/v1/group/create", json={"members": ["陈涛", "陈挺"]})
     assert r.status_code == 200
     assert r.json()["member_count"] == 3
@@ -895,6 +896,28 @@ def test_endpoint_sends_initial_message_after_group_creation(api, monkeypatch):
 
     assert r.status_code == 200
     assert sent == [{"conv_rid": 3395103030, "content": "1"}]
+    assert r.json()["message_result"]["success"] is True
+
+
+def test_endpoint_retries_initial_message_until_session_is_ready(api, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        local_group,
+        "create_group",
+        lambda members, name="", nickname="", return_rid=False: {
+            "success": True, "rid": 3395103030, "member_count": 3,
+        },
+    )
+    def send(**kwargs):
+        calls.append(kwargs)
+        return {"success": len(calls) >= 3, "error": "未找到 RID=3395103030 的对话"}
+    monkeypatch.setattr(local_send, "send_message", send)
+    monkeypatch.setattr(local_group.time, "sleep", lambda _seconds: None)
+
+    r = api.post("/api/v1/group/create", json={"members": ["陈涛", "陈挺"]})
+
+    assert r.status_code == 200
+    assert len(calls) == 3
     assert r.json()["message_result"]["success"] is True
 
 
