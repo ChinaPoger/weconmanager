@@ -466,6 +466,23 @@ def client(monkeypatch, tmp_path):
         yield c
 
 
+def test_mars_group_create_sends_initial_message(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(mars_tasks.local_group, "create_group", lambda *a, **kw: {
+        "success": True, "rid": 3395103030,
+    })
+    monkeypatch.setattr(mars_tasks.local_send, "send_message", lambda **kw: calls.append(kw) or {
+        "success": True, "conv_rid": kw["conv_rid"],
+    })
+    result = asyncio.run(mars_tasks._create_local_group(
+        mars_tasks.LocalCreateGroupRequest(members=["陈涛", "陈挺"])
+    ))
+    assert calls == [{"conv_rid": 3395103030, "content": "1"}]
+    assert result["message_result"]["success"] is True
+    assert result["group_id"] == "R:3395103030"
+
+
 def test_status_reports_config_without_leaking_the_token(client):
     body = client.get("/api/v1/mars/tasks/status").json()
     assert body["configured"] is True

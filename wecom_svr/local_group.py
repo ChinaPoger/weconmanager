@@ -1784,7 +1784,7 @@ def _open_group_info_panel(*, skip_stray_close: bool = False) -> None:
         return
 
     # 即使 already_open 也要 raise。该参数只代表“不要重新打开会话”,不代表
-    # 当前已经是 front window；这是建群后昵称设置最常见的竞态。
+    # 当前已经是 front window;这是建群后昵称设置最常见的竞态。
     _activate()
     _close_stray_windows()
     if _group_info_dialog_open() or _nickname_dialog_field() is not None:
@@ -1792,7 +1792,7 @@ def _open_group_info_panel(*, skip_stray_close: bool = False) -> None:
 
     last_more: tuple[int, int] | None = None
     for attempt in range(3):
-        # 菜单/浮层可能还在，先收掉再重新把主窗口抬到最前。
+        # 菜单/浮层可能还在,先收掉再重新把主窗口抬到最前。
         if attempt:
             try:
                 _osa("  key code 53\n")
@@ -1821,8 +1821,8 @@ def _open_group_info_panel(*, skip_stray_close: bool = False) -> None:
 
     point = f"({last_more[0]},{last_more[1]})" if last_more else "未知位置"
     raise LocalGroupError(
-        f"点了标题栏「更多」{point} 后仍找不到群详情。已自动重试3次；"
-        "请确认会话已打开，且右上角没有挡住「更多」的面板。"
+        f"点了标题栏「更多」{point} 后仍找不到群详情。已自动重试3次;"
+        "请确认会话已打开,且右上角没有挡住「更多」的面板。"
     )
 
 
