@@ -62,6 +62,8 @@ PICKER_ROW_CAP = 24
 
 # 选中一个人最多试几次(回车偶尔落空),以及每次判定前等计数刷新的次数/间隔
 SELECT_ATTEMPTS = 3
+# 批量结果里的真实鼠标点击也可能被客户端偶尔漏掉,同一行重试而不是跳到下一人。
+CLICK_ATTEMPTS = 3
 COUNT_SETTLE_TRIES = 8
 COUNT_SETTLE_DELAY = 0.15
 # 企业微信建群后写入 Info.db/WAL 可能有几十秒延迟。只等 2 秒会把已经
@@ -619,30 +621,39 @@ def _english_candidate_rows(rows: list[dict], queries: list[str]) -> list[dict]:
 
 
 def _click_english_candidates(targets: list[dict], expect_total: int) -> list[dict]:
-    """点弹框里未勾上的英文/拼音联系人。每点一个人必须看到已选+1,多了就停。"""
+    """点弹框里未勾上的英文/拼音联系人,点击没生效就重试同一行。"""
     clicked: list[dict] = []
     got = _selected_count()
     for row in targets:
         if got >= expect_total:
             break
-        _click_picker_row(row)
-        now = _await_selected_count(got + 1)
         label = row.get("name") or row.get("query") or ""
-        if now > expect_total:
-            raise LocalGroupError(
-                f"点选「{label}」后已选人数是 {now},超过预期 {expect_total} —— "
-                "可能多选了人,已中止,没有建群。"
+        for attempt in range(1, CLICK_ATTEMPTS + 1):
+            _click_picker_row(row)
+            now = _await_selected_count(got + 1)
+            if now > expect_total:
+                raise LocalGroupError(
+                    f"点选「{label}」后已选人数是 {now},超过预期 {expect_total} —— "
+                    "可能多选了人,已中止,没有建群。"
+                )
+            if now < got:
+                raise LocalGroupError(
+                    f"点选「{label}」把已选人数从 {got} 降到了 {now} —— "
+                    "可能点到了已勾上的人,已中止,没有建群。"
+                )
+            if now == got + 1:
+                clicked.append(row)
+                got = now
+                break
+            log.warning(
+                "点选「%s」第 %d/%d 次没生效(已选 %d,预期 %d),重试",
+                label, attempt, CLICK_ATTEMPTS, now, got + 1,
             )
-        if now < got:
+        else:
             raise LocalGroupError(
-                f"点选「{label}」把已选人数从 {got} 降到了 {now} —— "
-                "可能点到了已勾上的人,已中止,没有建群。"
+                f"点选「{label}」试了 {CLICK_ATTEMPTS} 次,已选人数仍是 {got}"
+                f"(预期 {got + 1}) —— 已中止,没有建群。"
             )
-        if now == got + 1:
-            clicked.append(row)
-            got = now
-            continue
-        log.warning("点选「%s」后已选仍是 %d(预期 %d),跳过", label, now, got + 1)
     return clicked
 
 
