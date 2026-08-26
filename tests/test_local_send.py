@@ -50,6 +50,7 @@ def script(monkeypatch):
     monkeypatch.setattr(local_send, "_set_current_input", fake_input)
     monkeypatch.setattr(local_send, "_focus_chat_input", fake_focus)
     monkeypatch.setattr(local_send, "_focused_chat_input", lambda attempts=4, interval=0.08: (True, 1, "ok"))
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
     return seen
 
 
