@@ -36,6 +36,9 @@ _quartz_libraries = None
 _accessibility_libraries = None
 _wecom_ax_application: tuple[int, int] | None = None
 _chat_window_bounds: tuple[float, float, float, float] | None = None
+_AX_ERROR_CANNOT_COMPLETE = -25204
+_FOCUSED_INPUT_ATTEMPTS = 4
+_FOCUSED_INPUT_RETRY_DELAY = 0.08
 
 
 class _CGPoint(ctypes.Structure):
@@ -580,6 +583,20 @@ def _ax_application() -> tuple[bool, int, str]:
     return True, app, "ok"
 
 
+def _invalidate_ax_application(app: int) -> None:
+    """丢弃失效的企业微信 AX 引用,下次读取时按当前 PID 重建。"""
+    global _wecom_ax_application
+    cached = _wecom_ax_application
+    if cached is None or cached[1] != app:
+        return
+    _wecom_ax_application = None
+    try:
+        _ax, cf = _load_accessibility_libraries()
+        cf.CFRelease(cached[1])
+    except OSError:
+        pass
+
+
 def _ax_attribute(element: int, name: str) -> tuple[bool, int, str]:
     ax, cf = _load_accessibility_libraries()
     attribute = _cf_string(name)
@@ -593,25 +610,48 @@ def _ax_attribute(element: int, name: str) -> tuple[bool, int, str]:
     return True, int(value.value), "ok"
 
 
-def _focused_chat_input() -> tuple[bool, int, str]:
-    ok, app, err = _ax_application()
-    if not ok:
-        return False, 0, err
-    ok, element, err = _ax_attribute(app, "AXFocusedUIElement")
-    if not ok:
-        return False, 0, f"企业微信没有获得输入焦点: {err}"
-    ok, role_ref, err = _ax_attribute(element, "AXRole")
-    if not ok:
-        return False, 0, err
-    _ax, cf = _load_accessibility_libraries()
-    try:
-        role = _cf_string_value(role_ref)
-    finally:
-        cf.CFRelease(role_ref)
-    if role not in {"AXTextArea", "AXTextField"}:
-        cf.CFRelease(element)
-        return False, 0, f"当前焦点不是聊天输入框: {role}"
-    return True, element, "ok"
+def _focused_chat_input(
+    attempts: int = _FOCUSED_INPUT_ATTEMPTS,
+    interval: float = _FOCUSED_INPUT_RETRY_DELAY,
+) -> tuple[bool, int, str]:
+    """等待企微完成焦点切换并返回聊天输入框。
+
+    ``kAXErrorCannotComplete`` 常见于客户端切会话/重启后的短暂不可响应。此时
+    旧的 application 引用也可能已经指向退出的进程,所以先失效缓存再重连。
+    """
+    attempts = max(1, int(attempts))
+    last_error = "企业微信没有获得输入焦点"
+    for attempt in range(attempts):
+        ok, app, err = _ax_application()
+        if not ok:
+            last_error = err
+        else:
+            ok, element, err = _ax_attribute(app, "AXFocusedUIElement")
+            if not ok:
+                last_error = f"企业微信没有获得输入焦点: {err}"
+                if f"AXError={_AX_ERROR_CANNOT_COMPLETE}" in err:
+                    _invalidate_ax_application(app)
+            else:
+                ok, role_ref, err = _ax_attribute(element, "AXRole")
+                if not ok:
+                    _ax, cf = _load_accessibility_libraries()
+                    cf.CFRelease(element)
+                    last_error = err
+                    if f"AXError={_AX_ERROR_CANNOT_COMPLETE}" in err:
+                        _invalidate_ax_application(app)
+                else:
+                    _ax, cf = _load_accessibility_libraries()
+                    try:
+                        role = _cf_string_value(role_ref)
+                    finally:
+                        cf.CFRelease(role_ref)
+                    if role in {"AXTextArea", "AXTextField"}:
+                        return True, element, "ok"
+                    cf.CFRelease(element)
+                    last_error = f"当前焦点不是聊天输入框: {role}"
+        if attempt + 1 < attempts:
+            time.sleep(max(0.0, interval))
+    return False, 0, last_error
 
 
 def _current_input_value() -> tuple[bool, str, str]:

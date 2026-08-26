@@ -263,6 +263,73 @@ def test_submit_rejects_non_chat_focus_without_sending(monkeypatch):
     )
 
 
+def test_focused_chat_input_recovers_from_cannot_complete(monkeypatch):
+    applications = iter([(True, 11, "ok"), (True, 22, "ok")])
+    invalidated = []
+    sleeps = []
+    released = []
+
+    class CoreFoundation:
+        @staticmethod
+        def CFRelease(ref):
+            released.append(ref)
+
+    def attribute(element, name):
+        if (element, name) == (11, "AXFocusedUIElement"):
+            return False, 0, "读取 AXFocusedUIElement 失败(AXError=-25204)"
+        if (element, name) == (22, "AXFocusedUIElement"):
+            return True, 101, "ok"
+        if (element, name) == (101, "AXRole"):
+            return True, 201, "ok"
+        raise AssertionError((element, name))
+
+    monkeypatch.setattr(local_send, "_ax_application", lambda: next(applications))
+    monkeypatch.setattr(local_send, "_ax_attribute", attribute)
+    monkeypatch.setattr(
+        local_send, "_invalidate_ax_application", invalidated.append
+    )
+    monkeypatch.setattr(
+        local_send, "_load_accessibility_libraries", lambda: (object(), CoreFoundation())
+    )
+    monkeypatch.setattr(local_send, "_cf_string_value", lambda _ref: "AXTextArea")
+    monkeypatch.setattr(local_send.time, "sleep", sleeps.append)
+
+    assert local_send._focused_chat_input(attempts=2, interval=0.05) == (
+        True, 101, "ok",
+    )
+    assert invalidated == [11]
+    assert sleeps == [0.05]
+    assert released == [201]
+
+
+def test_focused_chat_input_keeps_non_chat_focus_failure(monkeypatch):
+    released = []
+
+    class CoreFoundation:
+        @staticmethod
+        def CFRelease(ref):
+            released.append(ref)
+
+    monkeypatch.setattr(local_send, "_ax_application", lambda: (True, 11, "ok"))
+    monkeypatch.setattr(
+        local_send,
+        "_ax_attribute",
+        lambda element, name: (
+            (True, 101, "ok") if name == "AXFocusedUIElement" else (True, 201, "ok")
+        ),
+    )
+    monkeypatch.setattr(
+        local_send, "_load_accessibility_libraries", lambda: (object(), CoreFoundation())
+    )
+    monkeypatch.setattr(local_send, "_cf_string_value", lambda _ref: "AXButton")
+    monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
+
+    assert local_send._focused_chat_input(attempts=2) == (
+        False, 0, "当前焦点不是聊天输入框: AXButton",
+    )
+    assert released == [201, 101, 201, 101]
+
+
 def test_select_current_input_uses_select_all(monkeypatch):
     calls = []
     monkeypatch.setattr(

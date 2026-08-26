@@ -286,6 +286,41 @@ def test_pinyin_names_are_clicked_after_chinese_auto_select(fake):
     assert "SMB售前bot" in clicks[0]
 
 
+class DropsPickerClick(FakeClient):
+    """指定联系人前 N 次真实点击落空,之后才正常选中。"""
+
+    def __init__(self, directory, name: str, drop: int):
+        super().__init__(directory)
+        self.drop_name = name
+        self.to_drop = drop
+        self.dropped = 0
+
+    def __call__(self, script, timeout=15):
+        if "CLICK_PICKER_ROW" in script:
+            name = script.split('set clickName to "')[1].split('"')[0]
+            if name == self.drop_name and self.dropped < self.to_drop:
+                self.dropped += 1
+                return True, ""  # 鼠标发出去了,但客户端没有收到
+        return super().__call__(script, timeout)
+
+
+def test_picker_click_is_retried_on_the_same_contact(monkeypatch):
+    client = DropsPickerClick(DIRECTORY, "SMB售前bot", drop=1)
+    client.sheet_open = True
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+    monkeypatch.setattr(local_group, "_ui_click", lambda x, y: None)
+
+    targets = [
+        {"name": "郝一君", "query": "haoyijun", "x": 70, "y": 34},
+        {"name": "SMB售前bot", "query": "SMB售前bot", "x": 70, "y": 74},
+    ]
+    clicked = local_group._click_english_candidates(targets, expect_total=2)
+
+    assert [row["name"] for row in clicked] == ["郝一君", "SMB售前bot"]
+    assert client.selected == 2
+    assert client.dropped == 1
+
+
 def test_english_candidate_rows_match_query_or_resolved_name(monkeypatch):
     monkeypatch.setattr(
         directory, "resolve_member", lambda q: {"name": "陈挺"} if q == "chenting01" else {"name": q},
