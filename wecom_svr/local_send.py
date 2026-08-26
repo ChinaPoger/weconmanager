@@ -39,6 +39,9 @@ _chat_window_bounds: tuple[float, float, float, float] | None = None
 _AX_ERROR_CANNOT_COMPLETE = -25204
 _FOCUSED_INPUT_ATTEMPTS = 4
 _FOCUSED_INPUT_RETRY_DELAY = 0.08
+_FOCUS_CHAT_INPUT_ATTEMPTS = 3
+_CHAT_INPUT_BOTTOM_OFFSETS = (45, 75, 105)
+_INPUT_ROLES = {"AXTextArea", "AXTextField"}
 
 
 class _CGPoint(ctypes.Structure):
@@ -285,12 +288,9 @@ def _paste_image_current(path: str, paste_delay: float = 0.8) -> tuple[bool, str
     except (OSError, ValueError) as e:
         return False, str(e)
 
-    ok, err = _focus_chat_input()
+    ok, err = _focus_chat_input_verified()
     if not ok:
         return False, f"聚焦聊天输入框失败: {err}"
-    ok, _element, err = _focused_chat_input()
-    if not ok:
-        return False, err
     ok, err = _write_image_clipboard(image_path)
     if not ok:
         return False, err
@@ -470,8 +470,8 @@ def _refresh_chat_window_bounds() -> tuple[bool, str]:
     return True, "ok"
 
 
-def _focus_chat_input() -> tuple[bool, str]:
-    """使用预热的窗口位置点击聊天输入区;无缓存时再读取一次。"""
+def _focus_chat_input_with_offset(bottom_offset: float) -> tuple[bool, str]:
+    """按窗口矩形点击聊天输入区的一个候选位置。"""
     if _chat_window_bounds is None:
         ok, err = _refresh_chat_window_bounds()
         if not ok:
@@ -479,12 +479,58 @@ def _focus_chat_input() -> tuple[bool, str]:
     assert _chat_window_bounds is not None
     win_x, win_y, width, height = _chat_window_bounds
 
-    # 输入区位于主窗口右下方。按窗口比例取点可适配缩放/移动后的窗口,
-    # y 距底部 45px 落在多行编辑区中部,避开发送按钮和工具栏。
-    ok, err = _post_mouse_click(win_x + width * 0.72, win_y + height - 45)
+    # 输入区位于主窗口右下方。按窗口比例取点可适配缩放/移动后的窗口。
+    ok, err = _post_mouse_click(
+        win_x + width * 0.72, win_y + height - bottom_offset,
+    )
     if ok:
         time.sleep(0.06)
     return ok, err
+
+
+def _focus_chat_input() -> tuple[bool, str]:
+    """使用预热的窗口位置点击聊天输入区;无缓存时再读取一次。"""
+    return _focus_chat_input_with_offset(_CHAT_INPUT_BOTTOM_OFFSETS[0])
+
+
+def _release_ax_element(element: int) -> None:
+    """释放一个由 Accessibility API 返回的 AX 元素引用。"""
+    if not isinstance(element, int) or not element:
+        return
+    try:
+        _ax, cf = _load_accessibility_libraries()
+    except OSError:
+        return
+    cf.CFRelease(element)
+
+
+def _focus_chat_input_verified() -> tuple[bool, str]:
+    """点击聊天输入区并确认 AX 焦点已经落到可编辑节点。"""
+    global _chat_window_bounds
+
+    last_error = "企业微信没有获得输入焦点"
+    for attempt in range(_FOCUS_CHAT_INPUT_ATTEMPTS):
+        if attempt:
+            # URL Scheme 切会话、窗口拖动或缩放后,旧矩形可能还在缓存里。
+            _chat_window_bounds = None
+        offset = _CHAT_INPUT_BOTTOM_OFFSETS[
+            min(attempt, len(_CHAT_INPUT_BOTTOM_OFFSETS) - 1)
+        ]
+        if attempt == 0:
+            ok, err = _focus_chat_input()
+        else:
+            ok, err = _focus_chat_input_with_offset(offset)
+        if not ok:
+            last_error = err
+        else:
+            ok, element, err = _focused_chat_input(attempts=1)
+            if ok:
+                _release_ax_element(element)
+                return True, "ok"
+            last_error = err
+        if attempt + 1 < _FOCUS_CHAT_INPUT_ATTEMPTS:
+            time.sleep(_FOCUSED_INPUT_RETRY_DELAY)
+    return False, last_error
 
 
 def _select_current_input() -> tuple[bool, str]:
@@ -536,6 +582,12 @@ def _load_accessibility_libraries():
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
     ]
     cf.CFStringGetCString.restype = ctypes.c_bool
+    cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+    cf.CFArrayGetCount.restype = ctypes.c_long
+    cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+    cf.CFRetain.argtypes = [ctypes.c_void_p]
+    cf.CFRetain.restype = ctypes.c_void_p
     cf.CFRelease.argtypes = [ctypes.c_void_p]
     cf.CFRelease.restype = None
     _accessibility_libraries = ax, cf
@@ -557,6 +609,64 @@ def _cf_string_value(ref: int) -> str:
             return buf.value.decode("utf-8")
         size *= 2
     raise ValueError("Accessibility 文本超过 1 MiB")
+
+
+def _ax_role(element: int) -> tuple[bool, str, str]:
+    """读取 AX 元素角色,并释放 AXRole 返回值。"""
+    ok, role_ref, err = _ax_attribute(element, "AXRole")
+    if not ok:
+        return False, "", err
+    _ax, cf = _load_accessibility_libraries()
+    try:
+        return True, _cf_string_value(role_ref), "ok"
+    finally:
+        cf.CFRelease(role_ref)
+
+
+def _ax_find_input_descendant(
+    element: int, depth: int = 0, max_depth: int = 5,
+) -> tuple[bool, int, str]:
+    """在 AX 容器下找可编辑子节点,返回一个已 Retain 的元素引用。
+
+    部分企微版本在点击聊天编辑区后把焦点报告成 ``AXTable``;真正的文本节点
+    仍挂在它的 AXChildren 下。只沿有限深度查找输入角色,不接受 AXTable 本身,
+    这样不会把聊天记录表误当成输入框。
+    """
+    if depth >= max_depth:
+        return False, 0, "未找到可编辑输入节点"
+    ok, children, err = _ax_attribute(element, "AXChildren")
+    if not ok:
+        return False, 0, err
+
+    _ax, cf = _load_accessibility_libraries()
+    last_error = err
+    try:
+        count = max(0, int(cf.CFArrayGetCount(children)))
+        for index in range(count):
+            child_ref = cf.CFArrayGetValueAtIndex(children, index)
+            child = int(child_ref) if child_ref else 0
+            if not child:
+                continue
+            # AXChildren owns the child; retain it before releasing the array.
+            cf.CFRetain(child)
+            ok, role, child_error = _ax_role(child)
+            if ok and role in _INPUT_ROLES:
+                return True, child, "ok"
+            if ok and role in {
+                "AXGroup", "AXWebArea", "AXScrollArea", "AXTable", "AXCell",
+            }:
+                found, descendant, descendant_error = _ax_find_input_descendant(
+                    child, depth=depth + 1, max_depth=max_depth,
+                )
+                if found:
+                    cf.CFRelease(child)
+                    return True, descendant, "ok"
+                child_error = descendant_error
+            last_error = child_error
+            cf.CFRelease(child)
+        return False, 0, last_error if count else "AXChildren 为空"
+    finally:
+        cf.CFRelease(children)
 
 
 def _ax_application() -> tuple[bool, int, str]:
@@ -632,7 +742,7 @@ def _focused_chat_input(
                 if f"AXError={_AX_ERROR_CANNOT_COMPLETE}" in err:
                     _invalidate_ax_application(app)
             else:
-                ok, role_ref, err = _ax_attribute(element, "AXRole")
+                ok, role, err = _ax_role(element)
                 if not ok:
                     _ax, cf = _load_accessibility_libraries()
                     cf.CFRelease(element)
@@ -640,15 +750,21 @@ def _focused_chat_input(
                     if f"AXError={_AX_ERROR_CANNOT_COMPLETE}" in err:
                         _invalidate_ax_application(app)
                 else:
-                    _ax, cf = _load_accessibility_libraries()
-                    try:
-                        role = _cf_string_value(role_ref)
-                    finally:
-                        cf.CFRelease(role_ref)
-                    if role in {"AXTextArea", "AXTextField"}:
+                    if role in _INPUT_ROLES:
                         return True, element, "ok"
-                    cf.CFRelease(element)
+                    if role in {
+                        "AXGroup", "AXWebArea", "AXScrollArea", "AXTable", "AXCell",
+                    }:
+                        found, input_element, input_error = _ax_find_input_descendant(element)
+                        if found:
+                            _ax, cf = _load_accessibility_libraries()
+                            cf.CFRelease(element)
+                            return True, input_element, "ok"
+                        err = input_error
+                    _release_ax_element(element)
                     last_error = f"当前焦点不是聊天输入框: {role}"
+                    if err and f"AXError={_AX_ERROR_CANNOT_COMPLETE}" in err:
+                        _invalidate_ax_application(app)
         if attempt + 1 < attempts:
             time.sleep(max(0.0, interval))
     return False, 0, last_error
@@ -932,7 +1048,7 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
     started = time.perf_counter()
     spans = _mention_spans(content, mentions)
     focus_started = time.perf_counter()
-    ok, err = _focus_chat_input()
+    ok, err = _focus_chat_input_verified()
     focus_elapsed = time.perf_counter() - focus_started
     if not ok:
         return False, f"聚焦聊天输入框失败: {err}"
@@ -1190,7 +1306,7 @@ def _send_image_by_scheme(conv: dict, image_path: str) -> tuple[bool, str]:
     if not ok:
         return False, msg
     # 预览生成后企微会把 AX 焦点移到附件表格;重新点回输入区再提交。
-    ok, msg = _focus_chat_input()
+    ok, msg = _focus_chat_input_verified()
     if not ok:
         return False, f"图片已粘贴但无法聚焦输入框发送: {msg}"
     return _post_return_key()

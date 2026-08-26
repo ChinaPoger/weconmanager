@@ -49,6 +49,8 @@ def script(monkeypatch):
     monkeypatch.setattr(local_send, "_post_unicode_text", fake_unicode)
     monkeypatch.setattr(local_send, "_set_current_input", fake_input)
     monkeypatch.setattr(local_send, "_focus_chat_input", fake_focus)
+    monkeypatch.setattr(local_send, "_focused_chat_input", lambda attempts=4, interval=0.08: (True, 1, "ok"))
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
     return seen
 
 
@@ -85,6 +87,7 @@ def test_paste_image_splits_clipboard_and_ui_automation(monkeypatch, tmp_path):
     image = tmp_path / "a.png"
     image.write_bytes(b"png")
     calls = []
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
     focus_results = iter([
         (True, "ok"),                         # 点击聊天输入框
         (True, 1, "ok"),                      # 粘贴前确认
@@ -92,7 +95,9 @@ def test_paste_image_splits_clipboard_and_ui_automation(monkeypatch, tmp_path):
     monkeypatch.setattr(
         local_send, "_focus_chat_input", lambda: calls.append("focus") or next(focus_results)
     )
-    monkeypatch.setattr(local_send, "_focused_chat_input", lambda: next(focus_results))
+    monkeypatch.setattr(
+        local_send, "_focused_chat_input", lambda *args, **kwargs: next(focus_results)
+    )
     monkeypatch.setattr(
         local_send,
         "_write_image_clipboard",
@@ -117,8 +122,11 @@ def test_paste_image_splits_clipboard_and_ui_automation(monkeypatch, tmp_path):
 def test_paste_image_rejects_silent_clipboard_failure(monkeypatch, tmp_path):
     image = tmp_path / "a.png"
     image.write_bytes(b"png")
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
     monkeypatch.setattr(local_send, "_focus_chat_input", lambda: (True, "ok"))
-    monkeypatch.setattr(local_send, "_focused_chat_input", lambda: (True, 1, "ok"))
+    monkeypatch.setattr(
+        local_send, "_focused_chat_input", lambda *args, **kwargs: (True, 1, "ok")
+    )
     monkeypatch.setattr(local_send, "_write_image_clipboard", lambda _path: (True, "ok"))
     monkeypatch.setattr(local_send, "_run_applescript", lambda *_a, **_kw: (True, "ok"))
     monkeypatch.setattr(local_send, "_current_input_value", lambda: (True, "", "ok"))
@@ -330,6 +338,80 @@ def test_focused_chat_input_keeps_non_chat_focus_failure(monkeypatch):
     assert released == [201, 101, 201, 101]
 
 
+def test_focused_chat_input_finds_text_area_under_ax_table(monkeypatch):
+    released = []
+    retained = []
+
+    class CoreFoundation:
+        @staticmethod
+        def CFRelease(ref):
+            released.append(ref)
+
+        @staticmethod
+        def CFArrayGetCount(_ref):
+            return 1
+
+        @staticmethod
+        def CFArrayGetValueAtIndex(_ref, _index):
+            return 102
+
+        @staticmethod
+        def CFRetain(ref):
+            retained.append(ref)
+            return ref
+
+    def attribute(element, name):
+        values = {
+            (11, "AXFocusedUIElement"): (True, 101, "ok"),
+            (101, "AXRole"): (True, 201, "ok"),
+            (101, "AXChildren"): (True, 301, "ok"),
+            (102, "AXRole"): (True, 202, "ok"),
+        }
+        return values[(element, name)]
+
+    monkeypatch.setattr(local_send, "_ax_application", lambda: (True, 11, "ok"))
+    monkeypatch.setattr(local_send, "_ax_attribute", attribute)
+    monkeypatch.setattr(
+        local_send, "_load_accessibility_libraries", lambda: (object(), CoreFoundation())
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_cf_string_value",
+        lambda ref: {201: "AXTable", 202: "AXTextArea"}[ref],
+    )
+
+    assert local_send._focused_chat_input(attempts=1) == (True, 102, "ok")
+    assert retained == [102]
+    assert released == [201, 202, 301, 101]
+
+
+def test_verified_focus_retries_after_ax_table(monkeypatch):
+    calls = []
+    focus_results = iter([
+        (False, 0, "当前焦点不是聊天输入框: AXTable"),
+        (True, 1, "ok"),
+    ])
+    monkeypatch.setattr(local_send, "_chat_window_bounds", (1.0, 2.0, 500.0, 400.0))
+    monkeypatch.setattr(
+        local_send,
+        "_focus_chat_input",
+        lambda: calls.append("default") or (True, "ok"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_focus_chat_input_with_offset",
+        lambda offset: calls.append(offset) or (True, "ok"),
+    )
+    monkeypatch.setattr(
+        local_send, "_focused_chat_input", lambda *args, **kwargs: next(focus_results)
+    )
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda element: calls.append(element))
+    monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
+
+    assert local_send._focus_chat_input_verified() == (True, "ok")
+    assert calls == ["default", 75, 1]
+
+
 def test_select_current_input_uses_select_all(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -496,7 +578,11 @@ def test_type_mention_selects_candidate_without_send_confirmation(monkeypatch):
 
 def test_rich_message_selects_mentions_before_sending(monkeypatch):
     calls = []
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
     monkeypatch.setattr(local_send, "_focus_chat_input", lambda: calls.append("focus") or (True, "ok"))
+    monkeypatch.setattr(
+        local_send, "_focused_chat_input", lambda *args, **kwargs: (True, 1, "ok")
+    )
     monkeypatch.setattr(local_send, "_clear_current_input", lambda: calls.append("clear") or (True, "ok"))
     monkeypatch.setattr(local_send, "_insert_current_input", lambda text: calls.append(text) or (True, "ok"))
     monkeypatch.setattr(local_send, "_type_mention", lambda name: calls.append(("mention", name)))
@@ -523,7 +609,11 @@ def test_rich_message_selects_mentions_before_sending(monkeypatch):
 
 def test_plain_text_uses_verified_ax_input_without_clipboard(monkeypatch):
     calls = []
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
     monkeypatch.setattr(local_send, "_focus_chat_input", lambda: calls.append("focus") or (True, "ok"))
+    monkeypatch.setattr(
+        local_send, "_focused_chat_input", lambda *args, **kwargs: (True, 1, "ok")
+    )
     monkeypatch.setattr(
         local_send,
         "_set_current_input",
