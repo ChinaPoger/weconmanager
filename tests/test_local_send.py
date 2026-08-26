@@ -86,6 +86,7 @@ def test_paste_image_splits_clipboard_and_ui_automation(monkeypatch, tmp_path):
     image = tmp_path / "a.png"
     image.write_bytes(b"png")
     calls = []
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
     focus_results = iter([
         (True, "ok"),                         # 点击聊天输入框
         (True, 1, "ok"),                      # 粘贴前确认
@@ -120,6 +121,7 @@ def test_paste_image_splits_clipboard_and_ui_automation(monkeypatch, tmp_path):
 def test_paste_image_rejects_silent_clipboard_failure(monkeypatch, tmp_path):
     image = tmp_path / "a.png"
     image.write_bytes(b"png")
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
     monkeypatch.setattr(local_send, "_focus_chat_input", lambda: (True, "ok"))
     monkeypatch.setattr(
         local_send, "_focused_chat_input", lambda *args, **kwargs: (True, 1, "ok")
@@ -575,6 +577,7 @@ def test_type_mention_selects_candidate_without_send_confirmation(monkeypatch):
 
 def test_rich_message_selects_mentions_before_sending(monkeypatch):
     calls = []
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
     monkeypatch.setattr(local_send, "_focus_chat_input", lambda: calls.append("focus") or (True, "ok"))
     monkeypatch.setattr(
         local_send, "_focused_chat_input", lambda *args, **kwargs: (True, 1, "ok")
@@ -605,6 +608,7 @@ def test_rich_message_selects_mentions_before_sending(monkeypatch):
 
 def test_plain_text_uses_verified_ax_input_without_clipboard(monkeypatch):
     calls = []
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
     monkeypatch.setattr(local_send, "_focus_chat_input", lambda: calls.append("focus") or (True, "ok"))
     monkeypatch.setattr(
         local_send, "_focused_chat_input", lambda *args, **kwargs: (True, 1, "ok")
