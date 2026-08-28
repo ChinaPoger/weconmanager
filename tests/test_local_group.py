@@ -477,6 +477,154 @@ def test_an_unfamiliar_sheet_stops_the_probing(monkeypatch):
         local_group.create_group(["陈涛", "陈挺"])
 
 
+class AXPlus(FakeClient):
+    """AX 树里读得到 "+" 的客户端(企业微信 5.0.10)。
+
+    ``menu=True`` 复刻 5.0.10 的真实行为: 点 "+" 不直接开面板,先弹一个小菜单。
+    """
+
+    PLUS_SCREEN = (500, 150)
+    PLUS_OFFSET = (300, 31)
+    MENU = (440, 168, 177, 79)      # 挂在 "+" 底下
+
+    def __init__(self, directory, *, menu: bool = False, plus_works: bool = True,
+                 stray: tuple[int, int, int, int] | None = None):
+        super().__init__(directory)
+        self.menu = menu
+        self.plus_works = plus_works
+        self.stray = stray          # 点之前就开着的小窗口(独立会话窗口那种)
+        self.menu_open = False
+        self.ui_clicks: list[tuple[int, int]] = []
+
+    def __call__(self, script, timeout=15):
+        if "PLUS_POINT" in script:
+            self.scripts.append(script)
+            return True, "{},{},{},{}".format(*self.PLUS_SCREEN, *self.PLUS_OFFSET)
+        if "UI_STATE" in script:       # _PICKER 里也有「count of sheets」,认标记别认它
+            self.scripts.append(script)
+            small = [w for w in (self.stray, self.MENU if self.menu_open else None) if w]
+            code = "1" if self.sheet_open else "0"
+            return True, ";".join([code] + [",".join(str(v) for v in w) for w in small])
+        return super().__call__(script, timeout)
+
+    def click(self, x: int, y: int) -> None:
+        """替身鼠标: 真鼠标点的是屏幕坐标,和 click at 的窗口偏移不是一回事。"""
+        self.ui_clicks.append((x, y))
+        if (x, y) == self.PLUS_SCREEN:
+            if not self.plus_works:
+                return
+            if self.menu:
+                self.menu_open = True
+            else:
+                self.sheet_open = True
+        elif self.menu_open:
+            self.menu_open = False
+            self.sheet_open = True
+
+
+def test_plus_is_located_through_the_ax_tree(monkeypatch):
+    """AX 里读得到 "+" 就直接点它 —— 一次坐标试探都不该发生。"""
+    client = AXPlus(DIRECTORY)
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+    monkeypatch.setattr(local_group, "_ui_click", client.click)
+
+    assert local_group.create_group(["陈涛", "陈挺"])["success"] is True
+    assert client.ui_clicks == [AXPlus.PLUS_SCREEN]
+    assert [s for s in client.scripts if "click at {" in s] == []
+    # 换算出来的偏移记回去,坐标兜底那条路才不会停在几个版本前的布局上
+    assert ui_offsets.primary("plus") == AXPlus.PLUS_OFFSET
+
+
+def test_plus_opens_a_menu_before_the_picker(monkeypatch):
+    """5.0.10 的 "+" 先弹「发起群聊 / 记录面聊」菜单,得再点一次第一项。"""
+    client = AXPlus(DIRECTORY, menu=True)
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+    monkeypatch.setattr(local_group, "_ui_click", client.click)
+
+    assert local_group.create_group(["陈涛", "陈挺"])["success"] is True
+    left, top, width, _h = AXPlus.MENU
+    assert client.ui_clicks == [
+        AXPlus.PLUS_SCREEN,
+        (left + width // 2, top + local_group.MENU_FIRST_ITEM_DY),
+    ]
+
+
+def test_a_menu_that_leads_nowhere_stops_instead_of_hunting(monkeypatch):
+    """菜单开了却点不出面板 = 客户端改了菜单布局。第二项是「记录面聊」,别乱点。"""
+
+    class DeadMenu(AXPlus):
+        def click(self, x, y):
+            self.ui_clicks.append((x, y))
+            if (x, y) == self.PLUS_SCREEN:
+                self.menu_open = True
+
+    client = DeadMenu(DIRECTORY, menu=True)
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+    monkeypatch.setattr(local_group, "_ui_click", client.click)
+
+    with pytest.raises(local_group.LocalGroupError, match="弹出了菜单"):
+        local_group.create_group(["陈涛", "陈挺"])
+    assert len(client.ui_clicks) == 2      # "+" 一下,第一项一下,到此为止
+
+
+class NothingWorks(AXPlus):
+    """连坐标试探也点不开面板 —— 逼着「谁是菜单」这个判定自己说话。
+
+    回报的点击位置 (0, 0) 离菜单十万八千里,顺带把兜底那条路的锚定也验了。
+    """
+
+    def __call__(self, script, timeout=15):
+        if "click at {" in script:
+            return True, "0,0"
+        return super().__call__(script, timeout)
+
+
+def test_a_window_that_was_already_open_is_never_taken_for_the_menu(monkeypatch):
+    """人家自己弹出来的小会话窗口不是菜单 —— 认错了就是在别人的窗口里盲点一下。"""
+    client = NothingWorks(DIRECTORY, plus_works=False, stray=(440, 168, 177, 79))
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+    monkeypatch.setattr(local_group, "_ui_click", client.click)
+
+    with pytest.raises(local_group.LocalGroupError, match="面板没出现"):
+        local_group.create_group(["陈涛", "陈挺"])
+    # 那个小窗口的几何和真菜单一模一样,唯一的区别就是「点之前就在」
+    assert client.ui_clicks == [AXPlus.PLUS_SCREEN]
+
+
+def test_a_menu_that_is_not_anchored_to_the_plus_is_ignored(monkeypatch):
+    """新冒出来的小窗口离 "+" 十万八千里,那就不是 "+" 弹的菜单。"""
+
+    class FarAwayPopup(NothingWorks):
+        MENU = (1400, 900, 177, 79)
+
+    client = FarAwayPopup(DIRECTORY, menu=True)
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+    monkeypatch.setattr(local_group, "_ui_click", client.click)
+
+    with pytest.raises(local_group.LocalGroupError, match="面板没出现"):
+        local_group.create_group(["陈涛", "陈挺"])
+    assert client.ui_clicks == [AXPlus.PLUS_SCREEN]
+
+
+def test_a_dead_ax_point_falls_back_to_offset_probing(monkeypatch):
+    """AX 读到的位置点下去没反应(比如窗口刚被挪走),还得能退回坐标试探。"""
+
+    class AXPlusThenOffset(AXPlus):
+        def __call__(self, script, timeout=15):
+            if "click at {" in script:
+                self.sheet_open = True
+                self.plus_clicked = True
+            return super().__call__(script, timeout)
+
+    client = AXPlusThenOffset(DIRECTORY, plus_works=False)
+    monkeypatch.setattr(local_group, "_run_applescript", client)
+    monkeypatch.setattr(local_group, "_ui_click", client.click)
+
+    assert local_group.create_group(["陈涛", "陈挺"])["success"] is True
+    assert client.ui_clicks == [AXPlus.PLUS_SCREEN]
+    assert [s for s in client.scripts if "click at {" in s]
+
+
 def test_title_offset_is_calibrated_and_remembered(rename_env, monkeypatch):
     base_x, base_y = ui_offsets.DEFAULTS["title"]
     hit_x = 100 + base_x + 40            # rename_env 里 _window_point 是 (100+dx, 200+dy)
