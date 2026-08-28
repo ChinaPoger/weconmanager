@@ -16,10 +16,12 @@ userid,外部/微信联系人塞不进去;而「创建客户群」官方压根�
     合成点击也打不进 CEF 自绘控件;批量结果里用 CoreGraphics 真点)
   - 右侧标题里的「N contact(s) selected」能读出来,每步都能回读校验
 
-坐标依赖只剩不在 AX 树里的 "+" 按钮,按主窗口原点取相对偏移。新版客户端已把
-会话标题暴露成可写的 AXTextField,直接写值并 AXConfirm;旧版找不到该控件时才
-回退到坐标点击。坐标动作都不是「点了就算」,必须看到成功信号,看不到就换候选
-偏移再试,试中了记下来 —— 见 ui_offsets.py。
+坐标依赖只剩 "+" 和它弹出的那个菜单: 5.0.10 里 "+" 是个真 AXButton(位置能读,
+但 AXPress 无效,只能拿坐标发真鼠标),它弹出的菜单则是个空壳窗口,菜单项一个都
+读不出来,只能按窗口几何算第一项在哪。新版客户端已把会话标题暴露成可写的
+AXTextField,直接写值并 AXConfirm;旧版找不到该控件时才回退到坐标点击。坐标动作
+都不是「点了就算」,必须看到成功信号,看不到就换候选偏移再试,试中了记下来 ——
+见 ui_offsets.py。
 """
 import logging
 import re
@@ -52,6 +54,10 @@ SHEET_TIMEOUT = 8.0
 # 试探性候选的等待上限。第一个候选(记住的那个)给足 SHEET_TIMEOUT,后面的只是
 # 在猜,再给 8s 会把一次「界面改版」拖成一分钟的静默等待。
 PROBE_TIMEOUT = 2.5
+# 5.0.10 起点 "+" 先弹一个小菜单。第一项「发起群聊」的中心离菜单顶边的距离(点)。
+MENU_FIRST_ITEM_DY = 27
+# 菜单必须贴着 "+":点的那一下离菜单上/下边最多这么远,再远就不认(见 _new_menu)
+MENU_ANCHOR_SLACK = 120
 # 写入搜索框后轮询结果;上限约等于旧的固定 SEARCH_SETTLE=1.6,有结果立刻停
 SEARCH_POLL = 0.12
 SEARCH_POLL_TRIES = 15
@@ -227,79 +233,299 @@ def _activate() -> None:
 
 _SHEET_NONE, _SHEET_PICKER, _SHEET_OTHER = 0, 1, 2
 
+Menu = tuple[int, int, int, int]   # 菜单窗口的 (左, 上, 宽, 高),屏幕坐标
 
-def _sheet_state() -> int:
-    """主窗口上有没有面板,以及它是不是「发起群聊」那个。
 
-    只数 sheet 不够: 校准要靠这个信号判断「刚才那一下点对了没有」,而客户端上
-    **任何**弹窗都会让计数变成 1 —— 认错了就会拿一个不相干的面板去选人。
-    所以多问一句搜索框在不在,分得清 0=没面板 / 1=选人面板 / 2=别的面板。
+def _ui_state() -> tuple[int, list[Menu]]:
+    """(主窗口上的面板类型, 进程里所有小到可能是菜单的窗口)。
+
+    只数 sheet 不够,两处都不够:
+
+      - 校准要靠这个信号判断「刚才那一下点对了没有」,而客户端上**任何**弹窗都会让
+        sheet 计数变成 1 —— 认错了就会拿一个不相干的面板去选人。所以多问一句搜索框
+        在不在,分得清 0=没面板 / 1=选人面板 / 2=别的面板。
+      - 5.0.10 的 "+" 根本不开 sheet,先弹一个小菜单窗口(见 _pick_menu_first_item)。
+        它不是主窗口的 sheet,只数 sheet 会把「点中了」看成「点了个寂寞」。
+
+    小窗口只是**列出来**,不在这里判定谁是菜单: 菜单在 AX 里没有任何标识(role
+    AXWindow、subrole AXUnknown、子元素为空),和一个被弹出来的小会话窗口长得一模
+    一样。按尺寸认就会把人家开着的会话窗口当菜单,然后在里面盲点一下 —— 认谁是菜单
+    交给 _new_menu,靠「点完才出现」和「就贴在 + 底下」两个条件。
+
+    三件事一次脚本问完:每个 AX 属性都是一次跨进程调用,而这个函数是在轮询里跑的。
     """
     out = _osa(_MAIN_WINDOW + '''
-  if (count of sheets of mainWin) is 0 then return "0"
-  set sh to sheet 1 of mainWin
-  try
-    get text field 1 of group 1 of (splitter group 1 of sh)
-    return "1"
-  on error
-    return "2"
-  end try
+  -- UI_STATE
+  set code to "0"
+  if (count of sheets of mainWin) > 0 then
+    set sh to sheet 1 of mainWin
+    try
+      get text field 1 of group 1 of (splitter group 1 of sh)
+      set code to "1"
+    on error
+      set code to "2"
+    end try
+  end if
+  set acc to code
+  repeat with w in windows
+    set sz to size of w
+    set sw to item 1 of sz
+    set shh to item 2 of sz
+    if sw < 500 and shh < 400 then
+      set wp to position of w
+      set acc to acc & ";" & ((item 1 of wp) as text) & "," & ((item 2 of wp) as text) & ¬
+        "," & (sw as text) & "," & (shh as text)
+    end if
+  end repeat
+  return acc
 ''')
-    code = out.strip().strip('"')
-    return int(code) if code.isdigit() else _SHEET_NONE
+    parts = out.strip().strip('"').split(";")
+    code = parts[0].strip()
+    windows: list[Menu] = []
+    for chunk in parts[1:]:
+        try:
+            left, top, width, height = (int(v) for v in chunk.split(","))
+        except ValueError:
+            continue
+        windows.append((left, top, width, height))
+    return (int(code) if code in ("0", "1", "2") else _SHEET_NONE), windows
 
 
 def _sheet_open() -> bool:
-    return _sheet_state() != _SHEET_NONE
+    return _ui_state()[0] != _SHEET_NONE
 
 
-def _click_window_offset(dx: int, dy: int) -> None:
-    """在「主窗口原点 + 偏移」处点一下(合成点击,原生控件收得到)。"""
-    _osa(_MAIN_WINDOW + f'''
+def _new_menu(before: list[Menu], now: list[Menu], anchor: tuple[int, int] | None) -> Menu | None:
+    """从当前的小窗口里挑出「刚被这一下点出来的那个菜单」,挑不出来返回 None。
+
+    两个条件都要过,因为误判的代价是在一个陌生窗口里盲点一下:
+
+      - **点之前没有**。人家早就开着的独立会话窗口不会因为我们点了 "+" 而出现。
+        代价是上一次异常留下的残留菜单不会被当成新菜单 —— 那种情况宁可报错。
+      - **贴着 "+"**。菜单是从按钮上挂下来(屏幕底部附近会朝上翻),所以点的那一下
+        必须落在菜单的横向范围里,菜单的上边或下边也得离它不远。
+    """
+    for menu in now:
+        if menu in before:
+            continue
+        if anchor is None:
+            return menu
+        x, y = anchor
+        left, top, width, height = menu
+        if not left <= x <= left + width:
+            continue
+        near_top = abs(top - y) <= MENU_ANCHOR_SLACK
+        near_bottom = abs(top + height - y) <= MENU_ANCHOR_SLACK
+        if near_top or near_bottom:
+            return menu
+    return None
+
+
+def _plus_point() -> tuple[int, int, int, int] | None:
+    """从 AX 树里读 "+" 的屏幕中心点,外加它相对主窗口左上角的偏移。
+
+    5.0.10 的客户端把 "+" 暴露成了真 AXButton,位置能直接读出来 —— 比按窗口偏移猜
+    结实得多:会话列表那一列的宽度可以拖,拖一下写死的偏移就跟着废(AX 树里能看到
+    那根 splitter)。实测偏移已经漂到 334,记住的还是 275,连 ±40 的试探都够不着;
+    是拖出来的还是新版本改了搜索框宽度没查,反正这个位置本来就不该靠猜。
+
+    只借它的坐标,点还是发真鼠标:AXPress 实测对它无效,CEF 自绘的控件收不到。
+
+    按几何认人而不是按标题/help,是因为客户端语言会变:搜索框是这一行最靠左的
+    text field,"+" 是它右边同一行里最靠左的那个按钮。读不到返回 None,回退到坐标试探。
+    """
+    out = _osa(_MAIN_WINDOW + '''
+  -- PLUS_POINT
+  set answer to ""
+  try
+    set bar to splitter group 1 of splitter group 1 of mainWin
+    set tf to missing value
+    set leftX to 999999
+    repeat with t in (text fields of bar)
+      -- 位置先落到变量里再比较: 直接把 `position of t` 套进表达式,System Events
+      -- 会把整条 `every text field of ...` 的引用一起拖进来,报 -1700 类型错误
+      set tp to position of t
+      set tx to item 1 of tp
+      if tx < leftX then
+        set leftX to tx
+        set tf to contents of t
+      end if
+    end repeat
+    if tf is missing value then error "找不到搜索框"
+    set tp to position of tf
+    set ts to size of tf
+    set rowY to (item 2 of tp) + ((item 2 of ts) div 2)
+    set rightX to (item 1 of tp) + (item 1 of ts)
+    set best to missing value
+    set bestX to 999999
+    repeat with b in (buttons of bar)
+      set bp to position of b
+      set bs to size of b
+      set bx to item 1 of bp
+      set d to ((item 2 of bp) + ((item 2 of bs) div 2)) - rowY
+      if d < 0 then set d to -d
+      if d <= 8 and bx >= rightX and bx < bestX then
+        set bestX to bx
+        set best to contents of b
+      end if
+    end repeat
+    if best is missing value then error "搜索框右边没有按钮"
+    set bp to position of best
+    set bs to size of best
+    set cx to (item 1 of bp) + ((item 1 of bs) div 2)
+    set cy to (item 2 of bp) + ((item 2 of bs) div 2)
+    set wp to position of mainWin
+    set answer to (cx as text) & "," & (cy as text) & "," & ¬
+      ((cx - (item 1 of wp)) as text) & "," & ((cy - (item 2 of wp)) as text)
+  on error em
+    set answer to "ERR " & em
+  end try
+  return answer
+''')
+    parts = out.strip().strip('"').split(",")
+    if len(parts) != 4:
+        # 悄悄退回坐标试探最气人 —— 报错留一行,别让「脚本写错了」和「客户端换布局了」
+        # 长得一模一样
+        log.info("AX 树里没读到 \"+\" 的位置(%s),改用坐标试探", out.strip() or "无返回")
+        return None
+    try:
+        x, y, dx, dy = (int(v) for v in parts)
+    except ValueError:
+        return None
+    return x, y, dx, dy
+
+
+def _click_window_offset(dx: int, dy: int) -> tuple[int, int] | None:
+    """在「主窗口原点 + 偏移」处点一下,并回报点到了屏幕坐标的哪儿。
+
+    合成点击,原生控件收得到。回报的坐标是给菜单锚定用的(见 _new_menu);算不出来
+    就 None,认菜单时退回只看「点完才出现」这一个条件。
+    """
+    out = _osa(_MAIN_WINDOW + f'''
   set p to position of mainWin
-  click at {{(item 1 of p) + {dx}, (item 2 of p) + {dy}}}
+  set cx to (item 1 of p) + {dx}
+  set cy to (item 2 of p) + {dy}
+  click at {{cx, cy}}
+  return (cx as text) & "," & (cy as text)
+''')
+    try:
+        x, y = (int(v) for v in out.strip().strip('"').split(","))
+    except ValueError:
+        return None
+    return x, y
+
+
+def _press_escape() -> None:
+    """给主窗口发一次 Escape —— 通用的取消动作,不会点到未知控件。"""
+    _osa(_MAIN_WINDOW + '''
+  set frontmost to true
+  key code 53
+  delay 0.5
 ''')
 
 
-def _wait_picker(timeout: float) -> int:
+def _wait_sheet(timeout: float) -> int:
+    """等主窗口上出现面板,返回它的类型(超时就是 _SHEET_NONE)。"""
     deadline = time.time() + timeout
     state = _SHEET_NONE
     while time.time() < deadline:
         time.sleep(0.4)
-        state = _sheet_state()
+        state = _ui_state()[0]
         if state != _SHEET_NONE:
             return state
     return state
 
 
+def _pick_menu_first_item(menu: Menu) -> None:
+    """点 "+" 菜单的第一项「发起群聊」,并确认面板真的开了。
+
+    菜单是 CEF 自绘的:AX 树里它只是个没有任何子元素的空窗口,菜单项读不出来,更
+    没法按名字点。但窗口自己的位置和大小是准的,所以横向取菜单中线,纵向取「离菜单
+    顶边 MENU_FIRST_ITEM_DY」。
+
+    用离顶边的**绝对**距离而不是比例:将来菜单多一项,比例会滑到两项中间,绝对距离
+    仍然落在第一项上。点不中就收手 —— 第二项是「记录面聊」,点上去是有副作用的。
+    """
+    left, top, width, _height = menu
+    _ui_click(left + width // 2, top + MENU_FIRST_ITEM_DY)
+    if _wait_sheet(SHEET_TIMEOUT) == _SHEET_PICKER:
+        return
+    _press_escape()
+    raise LocalGroupError(
+        "点 \"+\" 弹出了菜单,但点第一项没能打开「发起群聊」面板 —— "
+        f"客户端很可能改了菜单的项数或行高(菜单窗口 {menu},"
+        f"点的是离顶边 {MENU_FIRST_ITEM_DY} 点处)。"
+    )
+
+
+def _after_plus(
+    timeout: float, where: str, before: list[Menu], anchor: tuple[int, int] | None
+) -> bool:
+    """点完 "+" 等结果:面板直接开了就成了,弹的是菜单就再点一次第一项。
+
+    ``before`` 是点之前就开着的小窗口,``anchor`` 是这一下点在了屏幕的哪儿 —— 两个
+    都是给 _new_menu 认菜单用的。
+
+    返回 False 只代表「什么都没弹出来」—— 这一下多半没点在 "+" 上,调用方可以换个
+    位置再试。点出别的面板则直接抛错:继续试探只会在一个陌生面板上乱点,而且那个
+    面板还挡着 "+"。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.4)
+        state, now = _ui_state()
+        if state == _SHEET_PICKER:
+            return True
+        if state == _SHEET_OTHER:
+            raise LocalGroupError(
+                f"点 {where} 打开的不是「发起群聊」面板,已中止。"
+                "请手动关掉客户端上多出来的那个面板再试。"
+            )
+        menu = _new_menu(before, now, anchor)
+        if menu is not None:
+            _pick_menu_first_item(menu)
+            return True
+    return False
+
+
 def _open_picker() -> None:
     """点会话列表顶部的 "+" 打开「发起群聊」面板,并确认它真的开了。
 
-    点不中就按候选偏移再试(见 ui_offsets.py):"+" 不在 AX 树里,偏移是量出来的,
-    而这里的成功信号又干净又便宜 —— 面板开没开一问就知道,正适合拿来自动校准。
-    试中了记下来,下次第一发就命中。已有面板会先自动取消,避免上一次异常中断
-    把后续操作永久卡住。
+    优先从 AX 树里读 "+" 的真实坐标(见 _plus_point);读不到才按候选偏移试探
+    (见 ui_offsets.py),试中了记下来,下次第一发就命中。AX 这条路走通时也会把
+    换算出来的偏移记下来,好让坐标兜底那条路不至于停在几个版本前的布局上。
+
+    已有面板会先自动取消,避免上一次异常中断把后续操作永久卡住。
     """
-    if _sheet_open():
+    state, before = _ui_state()
+    if state != _SHEET_NONE:
         log.warning("打开「发起群聊」前发现残留面板,正在自动关闭")
         _recover_open_sheet()
+        before = _ui_state()[1]
+    if before:
+        # 不是错误: 人家自己弹出来的独立会话窗口就长这样。记一行是因为上一次异常
+        # 留下的残留菜单也长这样,而它会让这一轮怎么点都开不出面板。
+        log.info("点 \"+\" 前客户端上已经有小窗口 %s,它们不会被当成菜单", before)
+
+    if (found := _plus_point()) is not None:
+        x, y, dx, dy = found
+        _ui_click(x, y)
+        if _after_plus(SHEET_TIMEOUT, f"AX 读到的位置 {(x, y)}", before, (x, y)):
+            ui_offsets.remember("plus", (dx, dy))
+            _focus_picker()
+            return
+        log.warning("AX 里读到的 \"+\" 位置 %s 点下去没反应,回退到坐标试探", (x, y))
 
     tried: list[tuple[int, int]] = []
     for i, (dx, dy) in enumerate(ui_offsets.candidates("plus")):
         tried.append((dx, dy))
-        _click_window_offset(dx, dy)
-        state = _wait_picker(SHEET_TIMEOUT if i == 0 else PROBE_TIMEOUT)
-        if state == _SHEET_PICKER:
+        anchor = _click_window_offset(dx, dy)
+        if _after_plus(
+            SHEET_TIMEOUT if i == 0 else PROBE_TIMEOUT, f"{dx, dy}", before, anchor
+        ):
             ui_offsets.remember("plus", (dx, dy))
             _focus_picker()
             return
-        if state == _SHEET_OTHER:
-            # 点开了别的东西。继续试下一个候选只会在一个陌生面板上乱点,
-            # 而且那个面板还挡着 "+" —— 停下来让人看一眼。
-            raise LocalGroupError(
-                f"点 {dx, dy} 打开的不是「发起群聊」面板,已中止。"
-                "请手动关掉客户端上多出来的那个面板再试。"
-            )
     raise LocalGroupError(
         f"点了「+」但「发起群聊」面板没出现(试过的窗口偏移: {tried})。"
         "常见原因: 终端没拿到「辅助功能」授权;有别的企业微信窗口盖住了主窗口左上角"
@@ -357,11 +583,11 @@ def _close_picker() -> None:
 def _recover_open_sheet() -> None:
     """清理进入发起群聊流程前残留的客户端面板,并确认它真的关闭。
 
-    已知的发起群聊面板必须点「取消」,因为这个 sheet 对 Escape 不响应。其它
-    面板只发一次 Escape:它是通用的取消动作,不会点击未知控件。关不掉就失败,
-    继续校准会有把输入送进错误窗口的风险。
+    已知的发起群聊面板必须点「取消」,因为这个 sheet 对 Escape 不响应。其它面板只发
+    一次 Escape:它是通用的取消动作,不会点击未知控件。关不掉就失败,继续校准会有把
+    输入送进错误窗口的风险。
     """
-    state = _sheet_state()
+    state, _ = _ui_state()
     if state == _SHEET_NONE:
         return
 
@@ -370,13 +596,9 @@ def _recover_open_sheet() -> None:
         _close_picker()
     else:
         log.warning("发现无法识别的企业微信弹出面板,正在尝试 Escape 关闭")
-        _osa(_MAIN_WINDOW + '''
-  set frontmost to true
-  key code 53
-  delay 0.5
-''')
+        _press_escape()
 
-    if _sheet_state() != _SHEET_NONE:
+    if _sheet_open():
         raise LocalGroupError(
             "客户端上的残留弹出面板无法自动关闭,请手动关闭后再试"
         )
@@ -2117,7 +2339,18 @@ def _set_nickname_locked(
         if found["kind"] == "NONE":
             found = _probe_nickname_in_dialog()
         if found["kind"] == "NONE":
-            return {"success": False, "rid": rid, "error": "群详情中找不到「我在本群的昵称」"}
+            # 不是「没找到控件」那么简单: 实测客户端只给**外部群**(群里有外部联系人或
+            # 微信用户)这一行,全是本企业同事的内部群,群详情里压根没有这一项。
+            return {
+                "success": False,
+                "rid": rid,
+                "no_alias_row": True,
+                "error": (
+                    "群详情里没有「我在本群的昵称」这一行。实测只有含外部联系人/微信用户"
+                    "的群才有,全是本企业同事的内部群客户端不提供群昵称 —— "
+                    "如果这个群确实有外部成员,那就是客户端又改了群详情的布局。"
+                ),
+            }
         if found["kind"] == "ROW" and _nickname_dialog_field() is None:
             _ui_click(int(found["x"]), int(found["y"]))
             _await_nickname_dialog(timeout=1.2)
