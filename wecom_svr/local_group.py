@@ -213,6 +213,29 @@ def _ui_click(x: int, y: int) -> None:
     _post_click(x, y, move_delay=0.05, down_delay=0.05, settle=0.0)
 
 
+def _real_right_click(x: int, y: int) -> None:
+    """在屏幕坐标发一次真实右键点击,用于成员上下文菜单。"""
+    jxa = f'''
+ObjC.import('CoreGraphics');
+var pt = $.CGPointMake({int(x)}, {int(y)});
+var button = 1;
+function post(t) {{ $.CGEventPost(0, $.CGEventCreateMouseEvent($(), t, pt, button)); }}
+post(5); delay(0.15);
+post(3); delay(0.08);
+post(4);
+'''
+    try:
+        r = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-"],
+            input=jxa, capture_output=True, text=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        raise LocalGroupError("发送右键事件超时") from None
+    if r.returncode != 0:
+        raise LocalGroupError(f"发送右键事件失败: {(r.stderr or r.stdout).strip()}")
+    time.sleep(0.35)
+
+
 def _activate() -> None:
     """把客户端拉到前台,并把主窗口抬到它自己所有窗口的最前面。
 
@@ -223,10 +246,21 @@ def _activate() -> None:
     """
     ok, err = _run_applescript('tell application "企业微信" to activate')
     if not ok:
-        raise LocalGroupError(f"无法激活企业微信客户端: {err}")
+        # 某些 macOS/企业微信版本的应用字典无法响应 activate,但对应的
+        # System Events 进程仍可正常置前。不要因此放弃后续 UI 操作。
+        fallback_ok, fallback_err = _run_applescript(
+            'tell application "System Events" to tell process "企业微信" '
+            'to set frontmost to true'
+        )
+        if not fallback_ok:
+            raise LocalGroupError(f"无法激活企业微信客户端: {err}; 回退失败: {fallback_err}")
     time.sleep(0.6)
     _osa(_MAIN_WINDOW + '''
+  set frontmost to true
   perform action "AXRaise" of mainWin
+  try
+    set focused of mainWin to true
+  end try
 ''')
     time.sleep(0.4)
 
@@ -490,6 +524,70 @@ def _after_plus(
     return False
 
 
+def _group_menu_point() -> tuple[int, int] | None:
+    """查找新版客户端点击「+」后出现的浮动菜单里的「发起群聊」。
+
+    企业微信 5.0.10 不再直接打开 sheet,而是先打开一个独立的 120x79 菜单窗口。
+    这个窗口不是主窗口的 sheet,所以不能用 `_sheet_state()` 判断;菜单里的 CEF
+    内容也不可靠地响应 AXPress,最后一步按它的 AX 行坐标发真实鼠标事件。
+    """
+    out = _osa('''
+  repeat with w in windows
+    try
+      set menuTable to table 1 of scroll area 1 of contents of w
+      repeat with rw in rows of menuTable
+        repeat with cellRef in UI elements of rw
+          repeat with itemRef in UI elements of contents of cellRef
+            set label to ""
+            try
+              set label to value of contents of itemRef as text
+            end try
+            if label is "" then
+              try
+                set label to name of contents of itemRef as text
+              end try
+            end if
+            if label is "发起群聊" or label is "Start group chat" then
+              set p to position of rw
+              set sz to size of rw
+              return (((item 1 of p) + ((item 1 of sz) / 2)) as integer) & "," & ¬
+                (((item 2 of p) + ((item 2 of sz) / 2)) as integer)
+            end if
+          end repeat
+        end repeat
+      end repeat
+    end try
+  end repeat
+  return "NONE"
+''')
+    raw = out.strip().strip('"')
+    if raw == "NONE":
+        return None
+    coords = re.findall(r"-?\d+", raw)
+    if len(coords) < 2:
+        return None
+    try:
+        return int(coords[0]), int(coords[1])
+    except ValueError:
+        log.warning("无法解析「发起群聊」菜单坐标: %r", out)
+        return None
+
+
+def _dismiss_group_menus() -> None:
+    """关闭失败重试留下的新版浮动菜单,避免它们挡住主窗口。"""
+    for _ in range(8):
+        if _group_menu_point() is None:
+            return
+        try:
+            _osa('''
+  set frontmost to true
+  key code 53
+''')
+        except LocalGroupError:
+            return
+        time.sleep(0.15)
+
+
 def _open_picker() -> None:
     """点会话列表顶部的 "+" 打开「发起群聊」面板,并确认它真的开了。
 
@@ -503,7 +601,8 @@ def _open_picker() -> None:
     if state != _SHEET_NONE:
         log.warning("打开「发起群聊」前发现残留面板,正在自动关闭")
         _recover_open_sheet()
-        before = _ui_state()[1]
+    _dismiss_group_menus()
+    before = _ui_state()[1]
     if before:
         # 不是错误: 人家自己弹出来的独立会话窗口就长这样。记一行是因为上一次异常
         # 留下的残留菜单也长这样,而它会让这一轮怎么点都开不出面板。
@@ -2137,6 +2236,154 @@ def _group_info_labeled_row(labels: tuple[str, ...]) -> tuple[int, int, int, int
         return None
 
 
+def _group_member_self_row_point(display_name: str) -> tuple[int, int] | None:
+    """找主窗口右侧群成员列表里本人的行中心。
+
+    新版客户端把「我在本群的昵称」入口移到了成员资料上下文菜单里。
+    群成员列表是主窗口右侧的窄表格,不能和独立群详情窗口混搜。
+    """
+    wanted = _escape((display_name or "").strip())
+    if not wanted:
+        return None
+    out = _osa(f'''
+  set wanted to "{wanted}"
+  repeat with w in windows
+    set ws to size of w
+    if (item 1 of ws) ≥ 700 and (item 2 of ws) ≥ 500 then
+      repeat with sa in scroll areas of w
+        set saPos to position of sa
+        set saSize to size of sa
+        if (item 1 of saPos) ≥ 700 and (item 1 of saSize) ≤ 260 then
+          try
+            set tbl to table 1 of sa
+            repeat with rw in rows of tbl
+              repeat with cellRef in UI elements of rw
+                repeat with itemRef in UI elements of contents of cellRef
+                  set elemRole to ""
+                  try
+                    set elemRole to role of contents of itemRef as text
+                  end try
+                  if elemRole is "AXStaticText" then
+                    set label to ""
+                    try
+                      set label to value of contents of itemRef as text
+                    end try
+                    if label is wanted or label contains wanted then
+                      set p to position of rw
+                      set sz to size of rw
+                      return (((item 1 of p) + ((item 1 of sz) / 2)) as integer) & "," & ¬
+                        (((item 2 of p) + ((item 2 of sz) / 2)) as integer)
+                    end if
+                  end if
+                end repeat
+              end repeat
+            end repeat
+          end try
+        end if
+      end repeat
+    end if
+  end repeat
+  return "NONE"
+''')
+    raw = (out or "").strip().strip('"')
+    if raw == "NONE":
+        return None
+    coords = re.findall(r"-?\d+", raw)
+    if len(coords) < 2:
+        return None
+    return int(coords[0]), int(coords[1])
+
+
+def _member_menu_item_point(labels: tuple[str, ...]) -> tuple[int, int] | None:
+    """找成员右键菜单里的群昵称菜单项,返回行中心。"""
+    quoted = ", ".join(f'"{_escape(n)}"' for n in labels)
+    out = _osa(f'''
+  set wanted to {{{quoted}}}
+  repeat with w in windows
+    set ws to size of w
+    if (item 1 of ws) ≥ 120 and (item 1 of ws) ≤ 280 and ¬
+      (item 2 of ws) ≥ 80 and (item 2 of ws) ≤ 360 then
+      try
+        set tbl to table 1 of scroll area 1 of w
+        repeat with rw in rows of tbl
+          repeat with cellRef in UI elements of rw
+            repeat with itemRef in UI elements of contents of cellRef
+              set label to ""
+              try
+                set label to value of contents of itemRef as text
+              end try
+              if label is "" then
+                try
+                  set label to name of contents of itemRef as text
+                end try
+              end if
+              repeat with needle in wanted
+                if label contains (needle as text) then
+                  set p to position of rw
+                  set sz to size of rw
+                  return (((item 1 of p) + ((item 1 of sz) / 2)) as integer) & "," & ¬
+                    (((item 2 of p) + ((item 2 of sz) / 2)) as integer)
+                end if
+              end repeat
+            end repeat
+          end repeat
+        end repeat
+      end try
+    end if
+  end repeat
+  return "NONE"
+''')
+    raw = (out or "").strip().strip('"')
+    if raw == "NONE":
+        return None
+    coords = re.findall(r"-?\d+", raw)
+    if len(coords) < 2:
+        return None
+    return int(coords[0]), int(coords[1])
+
+
+def _probe_nickname_from_member_menu() -> dict:
+    """新版客户端从本人群成员的右键菜单打开群昵称编辑器。"""
+    try:
+        self_name = str(directory.get_self().get("name") or "").strip()
+    except LocalSendError:
+        return {"kind": "NONE", "value": "", "x": 0, "y": 0}
+    point = _group_member_self_row_point(self_name)
+    if point is None:
+        return {"kind": "NONE", "value": "", "x": 0, "y": 0}
+
+    _real_right_click(*point)
+    deadline = time.monotonic() + 1.2
+    menu_point = None
+    while time.monotonic() < deadline:
+        menu_point = _member_menu_item_point(
+            ("修改群昵称", "修改我在本群的昵称", "Modify Group Nickname")
+        )
+        if menu_point is not None:
+            break
+        time.sleep(0.1)
+    if menu_point is None:
+        try:
+            _osa("  key code 53\n")
+        except LocalGroupError:
+            pass
+        return {"kind": "NONE", "value": "", "x": 0, "y": 0}
+
+    _ui_click(*menu_point)
+    dialog = _await_nickname_dialog(timeout=1.2)
+    if dialog is not None:
+        return dialog
+    focused = _focused_text_field()
+    if focused is not None:
+        return {
+            "kind": "FIELD",
+            "value": focused.get("value") or "",
+            "x": focused["x"],
+            "y": focused["y"],
+        }
+    return {"kind": "NONE", "value": "", "x": 0, "y": 0}
+
+
 def _probe_nickname_in_dialog() -> dict:
     """打开群详情后点「我在本群的昵称」那一行。
 
@@ -2366,16 +2613,14 @@ def _set_nickname_locked(
         if found["kind"] == "NONE":
             found = _probe_nickname_in_dialog()
         if found["kind"] == "NONE":
-            # 不是「没找到控件」那么简单: 实测客户端只给**外部群**(群里有外部联系人或
-            # 微信用户)这一行,全是本企业同事的内部群,群详情里压根没有这一项。
+            found = _probe_nickname_from_member_menu()
+        if found["kind"] == "NONE":
             return {
                 "success": False,
                 "rid": rid,
-                "no_alias_row": True,
                 "error": (
-                    "群详情里没有「我在本群的昵称」这一行。实测只有含外部联系人/微信用户"
-                    "的群才有,全是本企业同事的内部群客户端不提供群昵称 —— "
-                    "如果这个群确实有外部成员,那就是客户端又改了群详情的布局。"
+                    "当前企业微信版本的内部群没有暴露「修改群昵称」入口"
+                    "(群详情和本人群成员菜单都未找到), 群已保留但昵称未设置"
                 ),
             }
         if found["kind"] == "ROW" and _nickname_dialog_field() is None:

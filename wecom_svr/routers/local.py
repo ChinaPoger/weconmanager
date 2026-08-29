@@ -6,7 +6,6 @@
 """
 
 import logging
-import time
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
@@ -119,23 +118,7 @@ def create_local_group(req: LocalCreateGroupRequest, _: None = Depends(require_t
             # 群已建成,但本地会话还没落库;不能猜 RID,否则可能把“1”发到别的群。
             result["message_error"] = "群已建好,但尚未定位到会话 RID,未发送初始化消息"
         else:
-            # 新群的 RID 先落库,群名/会话索引可能稍后才写完。直接只试一次会在
-            # 拉群刚结束的竞态窗口里报“未找到”,而调用方只能手动补发“1”。
-            message = {"success": False, "error": "新群会话尚未完成落库"}
-            for attempt in range(10):
-                try:
-                    message = local_send.send_message(conv_rid=rid, content="1")
-                except Exception as e:  # 本地数据库/UI 短暂未就绪,继续重试
-                    log.warning("新群 RID=%s 初始化消息第 %d 次发送异常: %s", rid, attempt + 1, e)
-                    message = {"success": False, "error": str(e) or type(e).__name__}
-                log.info(
-                    "新群 RID=%s 初始化消息第 %d 次发送结果 success=%s",
-                    rid, attempt + 1, message.get("success"),
-                )
-                if message.get("success"):
-                    break
-                if attempt < 9:
-                    time.sleep(0.5)
+            message = local_send.send_initial_message(rid, content="1")
             result["message_result"] = message
             if not message.get("success"):
                 result["message_error"] = message.get("error") or "发送初始化消息失败"
