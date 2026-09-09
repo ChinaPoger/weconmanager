@@ -419,6 +419,24 @@ def test_image_limit_and_file_names_are_rendered_deterministically(tree):
     )
 
 
+def test_file_url_is_uploaded_and_rendered_with_filename(settings, monkeypatch):
+    item = mars_sync.media.MediaItem(
+        "a" * 32, 10, "request.csv", "file", None, "https://wework/file",
+    )
+    monkeypatch.setattr(mars_sync.media, "collect", lambda raw, *_args: [item])
+    monkeypatch.setattr(
+        mars_sync.media,
+        "resolve_item",
+        lambda item, *_args: "https://cdn.x/request.csv",
+    )
+
+    msg = {**_msg(1, 1, "[文件] request.csv"), "raw": b"file"}
+
+    assert mars_sync.message_body(msg, settings.model_copy(update=KODO)) == (
+        "[文件] request.csv https://cdn.x/request.csv"
+    )
+
+
 def test_media_is_skipped_entirely_when_kodo_is_off(settings, monkeypatch):
     monkeypatch.setattr(
         mars_sync.media, "resolve", lambda raw, s, *a: pytest.fail("没配 kodo 不该去传图")

@@ -1,4 +1,4 @@
-"""图片落地 —— 从企微本地缓存取原图,传对象存储,换回一个公网 URL。
+"""图片与文件媒体落地 —— 取企微媒体,传对象存储,换回一个公网 URL。
 
 为什么要这一步:mars 的 `qq_messages.content` 是纯文本列,前端用 `{{ }}` 渲染,
 所以只推 `[图片]` 占位符的话,图永远显示不出来。要让人看见图,就得先给图一个
@@ -61,11 +61,16 @@ log = logging.getLogger(__name__)
 
 UPLOAD_HOST = "https://up.qiniup.com"
 
-# 从企微 CDN 拉原图的上限。比这大的多半不是聊天图片,不值得为它撑住内存
+# 从企微 CDN 拉媒体的上限。同步目前在内存中完成下载,需限制单个响应大小。
 MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
 
 # 正文里内嵌的原始文件名。前面常有一个 protobuf 长度字节,所以不锚定开头
-_MEDIA_NAME = re.compile(rb"([^\x00-\x1f/\\]{1,120}\.(?:png|jpe?g|heic|gif|webp|bmp))")
+_MEDIA_NAME = re.compile(
+    rb"([^\x00-\x1f/\\]{1,120}\."
+    rb"(?:png|jpe?g|heic|gif|webp|bmp|csv|xlsx?|docx?|pptx?|pdf|zip|7z|"
+    rb"txt|md|json|log|xml|rtf))",
+    re.I,
+)
 
 # RID 理论上是纯数字,但它进对象 key,不能指望这一点 —— 别的字符一律换成下划线
 _KEY_UNSAFE = re.compile(r"[^0-9A-Za-z_-]")
@@ -132,6 +137,17 @@ def image_urls(content) -> list[str]:
     if not isinstance(content, bytes):
         return []
     return [url for url, _digest, _cache_keys in _image_links(content)]
+
+
+def media_urls(content) -> list[str]:
+    """取正文里企微媒体下载地址,不判断它是图片还是附件。"""
+    if not content:
+        return []
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+    if not isinstance(content, bytes):
+        return []
+    return _scan_image_urls(content)
 
 
 def _pb_nodes(buf: bytes) -> list[tuple[int, int, bytes | int]] | None:
@@ -251,11 +267,12 @@ def _item_at(nodes: list[tuple[int, int, bytes | int]]) -> MediaItem | None:
     return None                         # 未知协议,不要武断地当附件或图片
 
 
-def collect(content) -> list[MediaItem]:
+def collect(content, media_kind: Literal["image", "file"] | None = None) -> list[MediaItem]:
     """正文 → 全部媒体,规范序(字段号、wire occurrence、深度优先),按 md5 去重。
 
     正文与引用由调用方分别调用,这里不会跨段去重。递归深度和其它边界是输出协议,
-    不能当普通性能参数随意调整。
+    不能当普通性能参数随意调整。`media_kind` 用于调用方已经知道协议类型的
+    临时 URL 载荷(例如 type102 文件),避免把它误认成图片。
     """
     if isinstance(content, str):
         content = content.encode("utf-8", "surrogateescape")
@@ -306,6 +323,21 @@ def collect(content) -> list[MediaItem]:
         ),
         0,
     )
+    filename = extract_filename(content)
+    inferred_kind: Literal["image", "file"] = (
+        "file" if filename and not filename.lower().endswith(
+            (".png", ".jpg", ".jpeg", ".gif", ".heic", ".webp", ".bmp")
+        ) else "image"
+    )
+    if media_kind == "file" or inferred_kind == "file":
+        found = [
+            MediaItem(
+                item.md5, item.size, item.filename, "file", item.ticket,
+                item.source_url, item.md5_verified, item.cache_keys,
+            )
+            if item.kind == "image" else item
+            for item in found
+        ]
     for index, (url, media_digest, cache_keys) in enumerate(_image_links(content), 1):
         # 没有协议 MD5 的简化/兼容载荷只能用 URL 摘要做本条消息内的去重键;
         # 有协议 MD5 时则保留它,这样还能命中已经落地的本地缓存。
@@ -313,8 +345,10 @@ def collect(content) -> list[MediaItem]:
         found.append(MediaItem(
             digest,
             type101_size if media_digest else 0,
-            f"image-{index}.jpg",
-            "image",
+            filename if media_kind == "file" and filename else (
+                filename if media_kind is None and inferred_kind == "file" else f"image-{index}.jpg"
+            ),
+            media_kind or inferred_kind,
             None,
             url,
             bool(media_digest),
@@ -773,6 +807,27 @@ def upload_bytes(data: bytes, ext: str, settings: Settings, rid="", send_time: i
     )
 
 
+def upload_file_bytes(
+    data: bytes, filename: str, settings: Settings, rid="", send_time: int = 0,
+) -> str:
+    """上传附件原始字节,保留文件扩展名,不追加图片转码参数。"""
+    ext = os.path.splitext(filename)[1].lower() or ".bin"
+    digest = hashlib.md5(data).hexdigest()
+
+    def open_stream() -> io.BytesIO:
+        return io.BytesIO(data)
+
+    return _put(
+        open_stream,
+        _upload_name(os.path.basename(filename) or "file", ext),
+        digest,
+        ext,
+        settings,
+        rid,
+        send_time,
+    )
+
+
 # content-type → 扩展名。不用 mimetypes.guess_extension: 它对 image/jpeg 的
 # 返回值随 Python 版本变过(.jpe/.jpg),而这个值会进对象 key,不能飘
 CONTENT_TYPE_EXT = {
@@ -782,7 +837,7 @@ CONTENT_TYPE_EXT = {
 
 
 def download(url: str, timeout: float) -> tuple[bytes, str]:
-    """从企微 CDN 取原图,返回 (内容, 扩展名)。"""
+    """从企微 CDN 取媒体,返回 (内容, 根据响应头推断的扩展名)。"""
     try:
         resp = httpx.get(url, timeout=timeout, follow_redirects=True)
     except httpx.HTTPError as e:
@@ -794,7 +849,7 @@ def download(url: str, timeout: float) -> tuple[bytes, str]:
     if not data:
         raise MediaError("下载到的是空内容")
     if len(data) > MAX_DOWNLOAD_BYTES:
-        raise MediaError(f"图片过大: {len(data)} 字节")
+        raise MediaError(f"媒体过大: {len(data)} 字节")
 
     ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
     return data, CONTENT_TYPE_EXT.get(ctype, ".jpg")
@@ -1047,16 +1102,30 @@ def resolve_item(
     item: MediaItem, settings: Settings, rid="", send_time: int = 0, lid: int = 0,
     deadline: float | None = None,
 ) -> str:
-    """单个媒体项 → mars 可识别的公网图片 URL;失败返回空串。"""
-    if not settings.kodo_enabled or item.kind != "image":
+    """单个媒体项 → 公网 URL;失败返回空串。"""
+    if not settings.kodo_enabled:
         return ""
     try:
+        if item.kind == "file":
+            if item.source_url:
+                data, _ext = download(item.source_url, settings.kodo_timeout)
+            elif item.ticket is not None:
+                data, _ext = media_tcp.download_ticket(
+                    item.ticket, settings, deadline=deadline,
+                )
+            else:
+                return ""
+            return upload_file_bytes(
+                data, item.filename or "file", settings, rid, send_time,
+            )
+        if item.kind != "image":
+            return ""
         path = ensure_item_local(item, settings, rid, lid, deadline)
         if not path:
             return ""
         digest = item.md5 if item.md5_verified else ""
         return upload(path, settings, rid, send_time, md5=digest)
-    except (MediaError, OSError) as e:
+    except (MediaError, media_tcp.MediaTCPError, OSError) as e:
         log.warning("取图/上传失败(%s),退回占位符: %s", item.filename or item.md5, e)
         return ""
 

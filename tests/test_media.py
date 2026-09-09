@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from wecom_svr import media, uilock
+from wecom_svr import media, media_tcp, uilock
 from wecom_svr.settings import Settings
 
 KODO = {
@@ -142,6 +142,26 @@ def test_type101_collects_all_embedded_wework_image_urls():
         WEWORK_IMAGE_1.decode(), WEWORK_IMAGE_2.decode(), WEWORK_IMAGE_3.decode(),
     ]
     assert all(item.kind == "image" and item.ticket is None for item in items)
+
+
+def test_type102_csv_url_is_collected_as_a_file():
+    body = _pb(1, b"type102request-logs_20260903\xe8\x87\xb320260909.csv") + _pb(
+        1, WEWORK_IMAGE_1,
+    )
+
+    items = media.collect(body, "file")
+
+    assert len(items) == 1
+    assert items[0].kind == "file"
+    assert items[0].filename == "type102request-logs_20260903至20260909.csv"
+    assert items[0].source_url == WEWORK_IMAGE_1.decode()
+
+
+def test_csv_ticket_is_collected_as_a_file_even_without_a_temp_url():
+    item = media.collect(_ticket(b"csv,data\n1,2\n", b"request.csv"))[0]
+
+    assert item.kind == "file"
+    assert item.ticket is not None
 
 
 def test_type101_dedupes_original_thumbnail_and_nested_reference():
@@ -625,6 +645,69 @@ def test_cdn_image_is_reuploaded_to_our_own_bucket(cache, settings, shanghai, cd
     assert url == f"https://cdn.example.com/{key}"
     assert cdn["downloaded"] == [CDN.decode()]
     assert cdn["uploaded"] == [(key, b"GIF89a")]
+
+
+def test_file_bytes_keep_the_original_extension_and_do_not_get_image_conversion(
+    settings, shanghai, monkeypatch,
+):
+    posted: list[tuple[str, str, bytes]] = []
+    monkeypatch.setattr(media, "_exists", lambda url, t: False)
+    monkeypatch.setattr(
+        media,
+        "_post_form",
+        lambda stream, name, key, _token, _timeout: posted.append((name, key, stream.read())),
+    )
+
+    url = media.upload_file_bytes(
+        b"csv,data\n1,2\n",
+        "type102request-logs_20260903至20260909.csv",
+        settings,
+        rid=1688,
+        send_time=TS,
+    )
+
+    assert url.endswith(".csv")
+    assert "imageView2" not in url
+    assert posted[0][0].endswith(".csv")
+    assert posted[0][1].endswith(".csv")
+    assert posted[0][2] == b"csv,data\n1,2\n"
+
+
+def test_file_item_downloads_and_uploads_to_kodo(settings, monkeypatch):
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        media, "download", lambda url, timeout: (seen.append((url, str(timeout))) or (b"a,b\n", ".csv")),
+    )
+    monkeypatch.setattr(
+        media, "upload_file_bytes", lambda data, filename, *_args: f"https://cdn/{filename}",
+    )
+    item = media.MediaItem(
+        "a" * 32, 0, "request.csv", "file", None, WEWORK_IMAGE_1.decode(),
+    )
+
+    assert media.resolve_item(item, settings) == "https://cdn/request.csv"
+    assert seen == [(WEWORK_IMAGE_1.decode(), str(settings.kodo_timeout))]
+
+
+def test_file_ticket_downloads_over_tcp_and_uploads_to_kodo(settings, monkeypatch):
+    seen: list[tuple[object, object]] = []
+    ticket = media_tcp.ImageTicket(b"file-id", b"0123456789abcdef", "a" * 32, 10)
+    monkeypatch.setattr(
+        media.media_tcp,
+        "download_ticket",
+        lambda actual, actual_settings, *, deadline=None: (
+            seen.append((actual, deadline)) or (b"a,b\n", ".csv")
+        ),
+    )
+    monkeypatch.setattr(
+        media,
+        "upload_file_bytes",
+        lambda data, filename, *_args: f"https://cdn/{filename}",
+    )
+    item = media.MediaItem("a" * 32, 10, "request.csv", "file", ticket)
+
+    assert media.resolve_item(item, settings) == "https://cdn/request.csv"
+    assert seen == [(ticket, None)]
 
 
 def test_local_hd_copy_wins_over_the_cdn_link(cache, settings, cdn, monkeypatch):
