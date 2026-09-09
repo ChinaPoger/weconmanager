@@ -412,10 +412,7 @@ def _resolved(
         lines = [line for line in lines if not line.strip().startswith(FILE_PLACEHOLDER)]
         file_lines = []
         for item in segment.files:
-            url = (
-                media.resolve_item(item, settings, rid, send_time, lid, deadline)
-                if item.source_url else ""
-            )
+            url = media.resolve_item(item, settings, rid, send_time, lid, deadline)
             line = f"{FILE_PLACEHOLDER} {item.filename}".rstrip()
             if url:
                 line = f"{line} {url}"

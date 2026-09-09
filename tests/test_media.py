@@ -710,6 +710,34 @@ def test_file_ticket_downloads_over_tcp_and_uploads_to_kodo(settings, monkeypatc
     assert seen == [(ticket, None)]
 
 
+def test_file_item_prefers_the_wework_local_file_cache(settings, tmp_path, monkeypatch):
+    data = b"a,b\n1,2\n"
+    digest = hashlib.md5(data).hexdigest()
+    root = tmp_path / "Caches" / "Files"
+    path = root / "2026-09" / digest / "request.csv"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(data)
+    monkeypatch.setattr(media, "_files_root", lambda: str(root))
+    monkeypatch.setattr(
+        media, "download", lambda *_a: pytest.fail("本地附件命中时不应下载临时 URL"),
+    )
+    monkeypatch.setattr(
+        media.media_tcp, "download_ticket",
+        lambda *_a, **_kw: pytest.fail("本地附件命中时不应走 TCP"),
+    )
+    monkeypatch.setattr(
+        media, "upload_file_bytes",
+        lambda actual, filename, *_args: (
+            f"https://cdn/{filename}" if actual == data else pytest.fail("上传内容不对")
+        ),
+    )
+    item = media.MediaItem(
+        digest, len(data), "request.csv", "file", None, WEWORK_IMAGE_1.decode(),
+    )
+
+    assert media.resolve_item(item, settings) == "https://cdn/request.csv"
+
+
 def test_local_hd_copy_wins_over_the_cdn_link(cache, settings, cdn, monkeypatch):
     """缓存里那份是 _HD 原图,比 CDN 直链清楚 —— 两条路都通时用它。"""
     d = cache / "2026-08" / "abc"

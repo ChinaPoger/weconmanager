@@ -415,13 +415,14 @@ def test_image_limit_and_file_names_are_rendered_deterministically(tree):
     s = tree([*(_image(i) for i in (1, 2, 3)), attachment], mars_image_max_per_message=2)
     msg = {**_msg(1, 1, "[图片]"), "raw": b"tree"}
     assert mars_sync.message_body(msg, s) == (
-        "https://cdn.x/1.png\nhttps://cdn.x/2.png\n[文件] notes.md\n(另有 1 张未展示)"
+        "https://cdn.x/1.png\nhttps://cdn.x/2.png\n"
+        "[文件] notes.md https://cdn.x/notes.md\n(另有 1 张未展示)"
     )
 
 
 def test_file_url_is_uploaded_and_rendered_with_filename(settings, monkeypatch):
     item = mars_sync.media.MediaItem(
-        "a" * 32, 10, "request.csv", "file", None, "https://wework/file",
+        "a" * 32, 10, "request.csv", "file", None,
     )
     monkeypatch.setattr(mars_sync.media, "collect", lambda raw, *_args: [item])
     monkeypatch.setattr(
@@ -467,7 +468,7 @@ def test_an_attachment_only_message_does_not_claim_to_carry_an_image(tree):
     # 占位符由 messages 按种类选,渲染再把它换成文件名行 —— 两半必须对上。
     assert messages._media_placeholder([attachment]) == "[文件]"
     msg = {**_msg(1, 1, messages._media_placeholder([attachment])), "raw": b"tree"}
-    assert mars_sync.message_body(msg, s) == "[文件] tstest.zip"
+    assert mars_sync.message_body(msg, s) == "[文件] tstest.zip https://cdn.x/tstest.zip"
 
 
 def test_an_absent_payload_does_not_eat_an_image_slot(tree):
