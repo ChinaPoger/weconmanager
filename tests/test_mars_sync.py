@@ -471,6 +471,23 @@ def test_an_attachment_only_message_does_not_claim_to_carry_an_image(tree):
     assert mars_sync.message_body(msg, s) == "[文件] tstest.zip https://cdn.x/tstest.zip"
 
 
+def test_type102_message_keeps_file_parsing_hint(settings, monkeypatch):
+    attachment = mars_sync.media.MediaItem("a" * 32, 20, "request.csv", "file", None)
+    kinds = []
+
+    def collect(_raw, media_kind=None):
+        kinds.append(media_kind)
+        return [attachment]
+
+    monkeypatch.setattr(mars_sync.media, "collect", collect)
+    msg = {**_msg(1, 1, "[文件]"), "type": "type102", "raw": b"file"}
+
+    body, _quote = mars_sync.media_plan(msg, settings)
+
+    assert kinds[0] == "file"
+    assert body.files == [attachment]
+
+
 def test_an_absent_payload_does_not_eat_an_image_slot(tree):
     """`_ready_count` 和 `message_body` 必须分到同一份配额。
 

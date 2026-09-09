@@ -354,7 +354,8 @@ class Segment:
 def media_plan(msg: dict, settings: Settings) -> tuple[Segment, Segment]:
     """整条消息的媒体分配。**唯一**一处决定「哪几张图属于哪一段」。"""
     remaining = max(0, int(settings.mars_image_max_per_message))
-    file_message = msg.get("type") == "文件"
+    # vendor 尚未给 102 命名,所以这类个人微信附件的类型文字仍是 "type102"。
+    file_message = msg.get("type") in {"文件", "type102"}
     plan: list[Segment] = []
     for raw in media_payloads(msg):
         items = (
