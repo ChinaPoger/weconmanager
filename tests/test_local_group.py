@@ -1084,6 +1084,7 @@ def test_endpoint_sends_initial_message_after_group_creation(api, monkeypatch):
 
 def test_endpoint_retries_initial_message_until_session_is_ready(api, monkeypatch):
     calls = []
+    cursor = local_send.messages.Cursor(100, 1)
     monkeypatch.setattr(
         local_group,
         "create_group",
@@ -1093,14 +1094,46 @@ def test_endpoint_retries_initial_message_until_session_is_ready(api, monkeypatc
     )
     def send(**kwargs):
         calls.append(kwargs)
-        return {"success": len(calls) >= 3, "error": "未找到 RID=3395103030 的对话"}
+        return {"success": len(calls) >= 2, "error": "未找到 RID=3395103030 的对话"}
     monkeypatch.setattr(local_send, "send_message", send)
-    monkeypatch.setattr(local_group.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(local_send.messages, "latest_cursor", lambda _rid: cursor)
+    monkeypatch.setattr(local_send.time, "sleep", lambda _seconds: None)
 
     r = api.post("/api/v1/group/create", json={"members": ["陈涛", "陈挺"]})
 
     assert r.status_code == 200
-    assert len(calls) == 3
+    assert len(calls) == 2
+    assert r.json()["message_result"]["success"] is True
+
+
+def test_endpoint_does_not_resend_when_failed_send_is_already_in_database(api, monkeypatch):
+    calls = []
+    cursors = iter([
+        local_send.messages.Cursor(100, 1),
+        local_send.messages.Cursor(100, 1),
+        local_send.messages.Cursor(100, 2),
+    ])
+    monkeypatch.setattr(
+        local_group,
+        "create_group",
+        lambda members, name="", nickname="", return_rid=False: {
+            "success": True, "rid": 3395103030, "member_count": 3,
+        },
+    )
+    monkeypatch.setattr(
+        local_send,
+        "send_message",
+        lambda **kwargs: calls.append(kwargs) or {
+            "success": False, "error": "Return 已投递但输入框未清空",
+        },
+    )
+    monkeypatch.setattr(local_send.messages, "latest_cursor", lambda _rid: next(cursors))
+    monkeypatch.setattr(local_send.time, "sleep", lambda _seconds: None)
+
+    r = api.post("/api/v1/group/create", json={"members": ["陈涛", "陈挺"]})
+
+    assert r.status_code == 200
+    assert len(calls) == 1
     assert r.json()["message_result"]["success"] is True
 
 
@@ -1407,6 +1440,90 @@ def test_scan_nickname_ui_uses_labeled_row_instead_of_dumping_the_tree(monkeypat
     assert found["kind"] == "ROW"
     assert found["x"] == 857 + 320 - 40
     assert found["y"] == 375 + 20
+
+
+def test_probe_nickname_from_member_menu_uses_current_users_row(monkeypatch):
+    clicks = []
+    monkeypatch.setattr(
+        local_group.directory,
+        "get_self",
+        lambda: {"name": "SMB咨询顾问"},
+    )
+    monkeypatch.setattr(
+        local_group,
+        "_group_member_self_row_point",
+        lambda name: (1000, 262) if name == "SMB咨询顾问" else None,
+    )
+    monkeypatch.setattr(
+        local_group,
+        "_real_right_click",
+        lambda x, y: clicks.append(("right", x, y)),
+    )
+    monkeypatch.setattr(
+        local_group,
+        "_member_menu_item_point",
+        lambda _labels: (1080, 300),
+    )
+    monkeypatch.setattr(
+        local_group,
+        "_ui_click",
+        lambda x, y: clicks.append(("left", x, y)),
+    )
+    monkeypatch.setattr(
+        local_group,
+        "_await_nickname_dialog",
+        lambda timeout=1.2: {
+            "kind": "FIELD", "value": "", "x": 900, "y": 300,
+        },
+    )
+
+    found = local_group._probe_nickname_from_member_menu()
+
+    assert found["kind"] == "FIELD"
+    assert clicks == [("right", 1000, 262), ("left", 1080, 300)]
+
+
+def test_probe_nickname_from_member_menu_closes_menu_when_entry_is_missing(monkeypatch):
+    monkeypatch.setattr(
+        local_group.directory,
+        "get_self",
+        lambda: {"name": "SMB咨询顾问"},
+    )
+    monkeypatch.setattr(local_group, "_group_member_self_row_point", lambda _name: (1000, 262))
+    monkeypatch.setattr(local_group, "_real_right_click", lambda _x, _y: None)
+    monkeypatch.setattr(local_group, "_member_menu_item_point", lambda _labels: None)
+    monkeypatch.setattr(local_group, "_osa", lambda _body: "closed")
+    monkeypatch.setattr(local_group.time, "sleep", lambda _seconds: None)
+
+    found = local_group._probe_nickname_from_member_menu()
+
+    assert found["kind"] == "NONE"
+
+
+def test_set_nickname_reports_unsupported_client_entry(rename_env, monkeypatch):
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: "")
+    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda **_: None)
+    monkeypatch.setattr(
+        local_group,
+        "_scan_nickname_ui",
+        lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0},
+    )
+    monkeypatch.setattr(
+        local_group,
+        "_probe_nickname_in_dialog",
+        lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0},
+    )
+    monkeypatch.setattr(
+        local_group,
+        "_probe_nickname_from_member_menu",
+        lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0},
+    )
+    monkeypatch.setattr(local_group, "_close_group_info", lambda: None)
+
+    result = local_group._set_nickname_locked(77, "小王")
+
+    assert result["success"] is False
+    assert "没有暴露" in result["error"]
 
 
 def test_header_more_uses_leftmost_of_three_buttons(monkeypatch):

@@ -472,13 +472,17 @@ def test_mars_group_create_sends_initial_message(monkeypatch):
     monkeypatch.setattr(mars_tasks.local_group, "create_group", lambda *a, **kw: {
         "success": True, "rid": 3395103030,
     })
-    monkeypatch.setattr(mars_tasks.local_send, "send_message", lambda **kw: calls.append(kw) or {
-        "success": True, "conv_rid": kw["conv_rid"],
-    })
+    monkeypatch.setattr(
+        mars_tasks.local_send,
+        "send_initial_message",
+        lambda *args: calls.append(args) or {
+            "success": True, "conv_rid": args[0],
+        },
+    )
     result = asyncio.run(mars_tasks._create_local_group(
         mars_tasks.LocalCreateGroupRequest(members=["陈涛", "陈挺"])
     ))
-    assert calls == [{"conv_rid": 3395103030, "content": "1"}]
+    assert calls == [(3395103030, "1")]
     assert result["message_result"]["success"] is True
     assert result["group_id"] == "R:3395103030"
 

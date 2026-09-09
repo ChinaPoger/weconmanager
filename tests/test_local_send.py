@@ -1,6 +1,6 @@
 import pytest
 
-from wecom_svr import local_send
+from wecom_svr import local_send, messages
 
 
 @pytest.fixture
@@ -533,6 +533,71 @@ def test_submit_current_input_has_no_default_settle_delay(monkeypatch):
     )
 
     assert local_send._submit_current_input() == (True, "ok")
+
+
+def test_initial_message_retries_only_once_when_not_in_database(monkeypatch):
+    calls = []
+    baseline = messages.Cursor(100, 1)
+    monkeypatch.setattr(
+        local_send,
+        "send_message",
+        lambda **kwargs: calls.append(kwargs) or {
+            "success": len(calls) == 2,
+            "error": "未找到",
+        },
+    )
+    monkeypatch.setattr(local_send.messages, "latest_cursor", lambda _rid: baseline)
+    monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
+
+    result = local_send.send_initial_message(77)
+
+    assert result["success"] is True
+    assert len(calls) == 2
+
+
+def test_initial_message_accepts_failed_ui_result_when_cursor_advanced(monkeypatch):
+    calls = []
+    cursors = iter([
+        messages.Cursor(100, 1),
+        messages.Cursor(100, 1),
+        messages.Cursor(100, 2),
+    ])
+    monkeypatch.setattr(
+        local_send,
+        "send_message",
+        lambda **kwargs: calls.append(kwargs) or {
+            "success": False,
+            "error": "Return 已投递但输入框未清空",
+        },
+    )
+    monkeypatch.setattr(local_send.messages, "latest_cursor", lambda _rid: next(cursors))
+    monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
+
+    result = local_send.send_initial_message(77)
+
+    assert result["success"] is True
+    assert result["conv_rid"] == 77
+    assert len(calls) == 1
+
+
+def test_initial_message_does_not_retry_when_baseline_cursor_is_unavailable(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        local_send,
+        "send_message",
+        lambda **kwargs: calls.append(kwargs) or {"success": False, "error": "发送失败"},
+    )
+    monkeypatch.setattr(
+        local_send.messages,
+        "latest_cursor",
+        lambda _rid: (_ for _ in ()).throw(local_send.LocalDataError("db unavailable")),
+    )
+
+    result = local_send.send_initial_message(77)
+
+    assert result["success"] is False
+    assert len(calls) == 1
+    assert "游标不可读" in result["error"]
 
 
 def test_missing_mentions_keeps_at_text_plain():

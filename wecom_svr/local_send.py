@@ -21,6 +21,7 @@ import time
 from itertools import pairwise
 from urllib.parse import urlencode
 
+from . import messages
 from .localdb import NOT_SYNCED as _NOT_SYNCED
 
 # 错误类型在 localdb 定义,这里转出供 main/cli/tests 沿用。
@@ -42,6 +43,9 @@ _FOCUSED_INPUT_RETRY_DELAY = 0.08
 _FOCUS_CHAT_INPUT_ATTEMPTS = 3
 _CHAT_INPUT_BOTTOM_OFFSETS = (45, 75, 105)
 _INPUT_ROLES = {"AXTextArea", "AXTextField"}
+_INITIAL_MESSAGE_ATTEMPTS = 2
+_INITIAL_MESSAGE_VERIFY_ATTEMPTS = 6
+_INITIAL_MESSAGE_VERIFY_DELAY = 0.25
 
 
 class _CGPoint(ctypes.Structure):
@@ -1452,6 +1456,70 @@ def send_message(
         "elapsed_ms": round((time.perf_counter() - started) * 1000),
         "error": msg if not ok else None,
     }
+
+
+def send_initial_message(conv_rid: int, content: str = "1") -> dict:
+    """发送建群后的初始化消息,并防止 UI 误报导致重复发送。"""
+    try:
+        baseline = messages.latest_cursor(int(conv_rid))
+    except Exception as e:
+        baseline = None
+        baseline_error = str(e) or type(e).__name__
+        log.warning(
+            "初始化消息发送前无法读取 RID=%s 的消息游标,只尝试一次: %s",
+            conv_rid, baseline_error,
+        )
+    else:
+        baseline_error = ""
+
+    last: dict = {"success": False, "error": "发送初始化消息失败"}
+    for attempt in range(_INITIAL_MESSAGE_ATTEMPTS):
+        try:
+            last = send_message(conv_rid=int(conv_rid), content=content)
+        except Exception as e:
+            last = {"success": False, "error": str(e) or type(e).__name__}
+            log.warning(
+                "初始化消息 RID=%s 第 %d 次发送异常: %s",
+                conv_rid, attempt + 1, e,
+            )
+        if last.get("success"):
+            return last
+
+        if baseline is not None:
+            for _ in range(_INITIAL_MESSAGE_VERIFY_ATTEMPTS):
+                try:
+                    current = messages.latest_cursor(int(conv_rid))
+                except Exception as e:
+                    log.warning(
+                        "初始化消息 RID=%s 失败后无法读取消息游标,停止重试: %s",
+                        conv_rid, str(e) or type(e).__name__,
+                    )
+                    baseline = None
+                    break
+                if current > baseline:
+                    log.warning(
+                        "初始化消息 RID=%s 虽返回失败但已落库,不再补发",
+                        conv_rid,
+                    )
+                    return {
+                        **last,
+                        "success": True,
+                        "error": None,
+                        "conv_rid": int(conv_rid),
+                    }
+                time.sleep(_INITIAL_MESSAGE_VERIFY_DELAY)
+
+        if attempt + 1 < _INITIAL_MESSAGE_ATTEMPTS and baseline is not None:
+            log.warning("初始化消息 RID=%s 确认未落库,允许补发一次", conv_rid)
+            continue
+        break
+
+    if baseline_error:
+        last["error"] = (
+            f"{last.get('error') or '发送初始化消息失败'}"
+            f"(消息游标不可读: {baseline_error})"
+        )
+    return last
 
 
 def send_image(image_path: str = "", conv_rid: int | None = None) -> dict:
