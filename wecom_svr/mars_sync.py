@@ -346,7 +346,7 @@ class Segment:
 
     raw: bytes | None
     images: list[media.MediaItem]  # 本段要展示的图,已经扣过整条消息的配额
-    files: list[media.MediaItem]   # 附件:没有 aeskey,下不了,只写文件名
+    files: list[media.MediaItem]   # 附件:有临时 URL 的会上传,否则只写文件名
     legacy: bool                   # 媒体树里认不出票据,退回旧的单图解析
     omitted: int                   # 超出上限、本条不展示的图片数
 
@@ -354,9 +354,12 @@ class Segment:
 def media_plan(msg: dict, settings: Settings) -> tuple[Segment, Segment]:
     """整条消息的媒体分配。**唯一**一处决定「哪几张图属于哪一段」。"""
     remaining = max(0, int(settings.mars_image_max_per_message))
+    file_message = msg.get("type") == "文件"
     plan: list[Segment] = []
     for raw in media_payloads(msg):
-        items = media.collect(raw) if raw else []
+        items = (
+            media.collect(raw, "file") if file_message else media.collect(raw)
+        ) if raw else []
         if not raw:
             plan.append(Segment(raw, [], [], False, 0))
         elif not items:                   # 兼容旧的文件名/CDN 单图载荷:至多一张
@@ -403,9 +406,22 @@ def _resolved(
     # 取到的第一张换掉正文里的占位符,剩下的各占一行;没取到的留占位符文本。
     head = _swap(part, rendered[0]) if rendered and rendered[0] else part
     lines = [head, *(url or IMAGE_PLACEHOLDER for url in rendered[1:])]
-    if segment.files and head.strip() == FILE_PLACEHOLDER:
-        lines = lines[1:]                 # 上游合成的裸「[文件]」由文件名行顶掉
-    return [*lines, *(f"{FILE_PLACEHOLDER} {item.filename}".rstrip() for item in segment.files)]
+    if segment.files:
+        # 上游通常已经给出一行 `[文件] 文件名`;把它删掉后重新生成,这样
+        # 临时地址成功上传时可以和文件名一起保留在同一行。
+        lines = [line for line in lines if not line.strip().startswith(FILE_PLACEHOLDER)]
+        file_lines = []
+        for item in segment.files:
+            url = (
+                media.resolve_item(item, settings, rid, send_time, lid, deadline)
+                if item.source_url else ""
+            )
+            line = f"{FILE_PLACEHOLDER} {item.filename}".rstrip()
+            if url:
+                line = f"{line} {url}"
+            file_lines.append(line)
+        lines.extend(file_lines)
+    return lines
 
 
 def message_body(msg: dict, settings: Settings) -> str:

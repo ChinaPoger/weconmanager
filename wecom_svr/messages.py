@@ -530,6 +530,10 @@ def _render(content_type: int, content, label: str) -> str:
     # 下载并换成 Kodo URL。
     if content_type == 101 and media.image_urls(content):
         return IMAGE_PLACEHOLDER
+    # type=102 文件同样携带企微临时地址,不能把这个短期 URL 直接推给 Mars。
+    # 同步层会按附件原始字节重新上传到 Kodo,并保留文件名。
+    if content_type == 102 and media.media_urls(content):
+        return FILE_PLACEHOLDER
     if rich := _rich_image_text(content_type, content):
         return rich
     if label == "文本" and (mentioned := _text_with_mentions(content)):
@@ -926,7 +930,9 @@ def fetch_since(
 
         # 媒体可能藏在任意嵌套层,不能再由旧类型表/扩展名摘要决定是否把载荷交给下游。
         # 两段仍保持独立,由 media.collect 各自抽取并去重。
-        raw_media = media.collect(r["content"])
+        raw_media = media.collect(
+            r["content"], "file" if ctype in {15, 102} else None,
+        )
         quote_media = media.collect(quote_payload)
         text = text or _media_placeholder(raw_media)
         quote_text = quote_text or _media_placeholder(quote_media)
