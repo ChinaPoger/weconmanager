@@ -157,6 +157,59 @@ def test_type102_csv_url_is_collected_as_a_file():
     assert items[0].source_url == WEWORK_IMAGE_1.decode()
 
 
+def test_type102_file_uses_the_local_cache_md5_from_field_10():
+    remote_md5 = b"c2650ddb4bd64cba8a1a2629368c7c25"
+    file_md5 = b"2fded3dbfe1268398e99b038d645a4cb"
+    body = b"".join([
+        _pb(2, b"request-logs_20260903\xe8\x87\xb320260909.csv"),
+        _pb(3, WEWORK_IMAGE_1),
+        _varint(4 << 3 | 0) + _varint(804566),
+        _pb(8, remote_md5),
+        _pb(10, file_md5),
+        _pb(25, b"v1_file-id"),
+    ])
+
+    items = media.collect(body, "file")
+
+    assert len(items) == 1
+    assert items[0].md5 == file_md5.decode()
+    assert items[0].filename == "request-logs_20260903至20260909.csv"
+    assert items[0].kind == "file"
+    assert items[0].md5_verified is True
+
+
+def test_type102_file_cache_hit_is_uploaded_without_downloading_url(
+    settings, tmp_path, monkeypatch,
+):
+    data = b"a,b\n1,2\n"
+    file_md5 = hashlib.md5(data).hexdigest().encode()
+    body = b"".join([
+        _pb(2, b"request.csv"),
+        _pb(3, WEWORK_IMAGE_1),
+        _varint(4 << 3 | 0) + _varint(len(data)),
+        _pb(8, b"c" * 32),
+        _pb(10, file_md5),
+    ])
+    item = media.collect(body, "file")[0]
+    root = tmp_path / "Caches" / "Files"
+    path = root / "2026-09" / file_md5.decode() / "request.csv"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(data)
+
+    monkeypatch.setattr(media, "_files_root", lambda: str(root))
+    monkeypatch.setattr(
+        media, "download", lambda *_args: pytest.fail("命中本地文件缓存时不应下载 URL"),
+    )
+    monkeypatch.setattr(
+        media, "upload_file_bytes",
+        lambda actual, filename, *_args: (
+            f"https://cdn/{filename}" if actual == data else pytest.fail("上传内容不对")
+        ),
+    )
+
+    assert media.resolve_item(item, settings) == "https://cdn/request.csv"
+
+
 def test_csv_ticket_is_collected_as_a_file_even_without_a_temp_url():
     item = media.collect(_ticket(b"csv,data\n1,2\n", b"request.csv"))[0]
 
