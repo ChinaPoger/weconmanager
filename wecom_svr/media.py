@@ -187,7 +187,9 @@ def _pb_nodes(buf: bytes) -> list[tuple[int, int, bytes | int]] | None:
     return out
 
 
-def _image_links(content: bytes) -> list[tuple[str, str, tuple[str, ...]]]:
+def _image_links(
+    content: bytes, media_kind: Literal["image", "file"] | None = None,
+) -> list[tuple[str, str, tuple[str, ...]]]:
     """返回 ``(临时地址, 图片 MD5, 客户端缓存键)``;无协议身份时按 URL 去重。
 
     实测 type=101 的结构是:
@@ -205,11 +207,16 @@ def _image_links(content: bytes) -> list[tuple[str, str, tuple[str, ...]]]:
         return []
     root = _pb_nodes(content)
     if root is not None:
+        digest_fields = (10, 8) if media_kind == "file" else (8,)
+        # type102 文件载荷同时带远端资源摘要(field 8)和本地文件摘要
+        # (field 10)。文件缓存按后者落盘;老版本载荷没有 field 10 时,
+        # 继续兼容 field 8。
         digest = next(
             (
                 value.decode("ascii").lower()
+                for digest_field in digest_fields
                 for field, wire, value in root
-                if field == 8
+                if field == digest_field
                 and wire == 2
                 and isinstance(value, bytes)
                 and _HEX32.fullmatch(value)
@@ -338,7 +345,9 @@ def collect(content, media_kind: Literal["image", "file"] | None = None) -> list
             if item.kind == "image" else item
             for item in found
         ]
-    for index, (url, media_digest, cache_keys) in enumerate(_image_links(content), 1):
+    for index, (url, media_digest, cache_keys) in enumerate(
+        _image_links(content, media_kind), 1,
+    ):
         # 没有协议 MD5 的简化/兼容载荷只能用 URL 摘要做本条消息内的去重键;
         # 有协议 MD5 时则保留它,这样还能命中已经落地的本地缓存。
         digest = media_digest or hashlib.md5(url.encode("ascii")).hexdigest()
