@@ -676,6 +676,10 @@ def test_file_bytes_keep_the_original_extension_and_do_not_get_image_conversion(
 def test_file_item_downloads_and_uploads_to_kodo(settings, monkeypatch):
     seen: list[tuple[str, str]] = []
     monkeypatch.setattr(
+        media, "_files_root",
+        lambda: (_ for _ in ()).throw(SystemExit("未找到企业微信 profile")),
+    )
+    monkeypatch.setattr(
         media, "download", lambda url, timeout: (seen.append((url, str(timeout))) or (b"a,b\n", ".csv")),
     )
     monkeypatch.setattr(

@@ -539,7 +539,12 @@ def find_local_file(filename: str, md5: str = "") -> str:
     """
     if not filename or not md5 or not _HEX32.fullmatch(md5.encode("ascii", "ignore")):
         return ""
-    root = _files_root()
+    # CI 和未安装企微的机器没有本地 profile;这只表示缓存未命中,不应阻断
+    # 后续的临时 URL 或 TCP ticket 下载路径。
+    try:
+        root = _files_root()
+    except (OSError, SystemExit):
+        return ""
     path = os.path.join(root, "*", md5.lower(), glob.escape(os.path.basename(filename)))
     hits = [p for p in glob.glob(path) if os.path.isfile(p)]
     return hits[0] if hits else ""
