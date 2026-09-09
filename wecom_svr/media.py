@@ -525,6 +525,31 @@ def _images_root() -> str:
     return os.path.join(_vendor().paths.caches(), "Images")
 
 
+@functools.lru_cache(maxsize=1)
+def _files_root() -> str:
+    from .messages import _vendor
+    return os.path.join(_vendor().paths.caches(), "Files")
+
+
+def find_local_file(filename: str, md5: str = "") -> str:
+    """在企微附件缓存里定位文件,找不到返回空串。
+
+    文件缓存按 ``Files/<年-月>/<md5>/<文件名>`` 落盘。文件消息通常没有可用
+    的临时下载 URL,但客户端已经把附件缓存下来时,直接从这里上传即可。
+    """
+    if not filename or not md5 or not _HEX32.fullmatch(md5.encode("ascii", "ignore")):
+        return ""
+    # CI 和未安装企微的机器没有本地 profile;这只表示缓存未命中,不应阻断
+    # 后续的临时 URL 或 TCP ticket 下载路径。
+    try:
+        root = _files_root()
+    except (OSError, SystemExit):
+        return ""
+    path = os.path.join(root, "*", md5.lower(), glob.escape(os.path.basename(filename)))
+    hits = [p for p in glob.glob(path) if os.path.isfile(p)]
+    return hits[0] if hits else ""
+
+
 def _variant_rank(path: str) -> int:
     """`_HD` 优先 —— 它在 3875/3876 的情况下就是原图,先试它能少读几个文件。"""
     d = os.path.basename(os.path.dirname(path))
@@ -1107,7 +1132,19 @@ def resolve_item(
         return ""
     try:
         if item.kind == "file":
-            if item.source_url:
+            local_path = find_local_file(item.filename, item.md5)
+            if local_path:
+                try:
+                    size = os.path.getsize(local_path)
+                    if size > MAX_DOWNLOAD_BYTES:
+                        raise MediaError(f"媒体过大: {size} 字节")
+                    with open(local_path, "rb") as stream:
+                        data = stream.read()
+                except OSError as e:
+                    raise MediaError(f"读取待上传文件失败: {e}") from e
+                if not data:
+                    raise MediaError("本地缓存文件为空")
+            elif item.source_url:
                 data, _ext = download(item.source_url, settings.kodo_timeout)
             elif item.ticket is not None:
                 data, _ext = media_tcp.download_ticket(
