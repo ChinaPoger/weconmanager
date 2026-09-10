@@ -148,16 +148,28 @@ async def preview(
 ) -> dict:
     settings = get_settings()
     async with mars_sync.sync_lock:
+        try:
+            before_rids, _before_names, _before_missing = await asyncio.to_thread(
+                mars_sync.target_rids, settings
+            )
+        except mars_sync.MarsNotConfigured:
+            before_rids = []
+        await asyncio.to_thread(messages.refresh)
         rids, names, missing = await asyncio.to_thread(mars_sync.target_rids, settings)
         if rid is not None:
             if rid not in rids:
                 raise mars_sync.MarsNotConfigured(f"群 {rid} 不在当前同步范围内")
             index = rids.index(rid)
             rids, names = [rid], [names[index]]
-        await asyncio.to_thread(messages.refresh)
         state = mars_sync.load_state(settings)
         state = await asyncio.to_thread(
-            lambda: mars_sync.reconcile_state(state, rids, settings, persist=False)
+            lambda: mars_sync.reconcile_state(
+                state,
+                rids,
+                settings,
+                persist=False,
+                fresh_rids=set(rids) - set(before_rids),
+            )
         )
         cursors = {group_rid: state.groups[str(group_rid)].cursor for group_rid in rids}
         batch = await asyncio.to_thread(messages.fetch_since, cursors, limit, False, state.round_robin)

@@ -169,12 +169,14 @@ docstring 里写明 `limit=None` 表示不截断(是给改名后回库核验用�
 
 ### 3.2 新群的起点
 
-**必须按 RID 查该群自己的最新水位,不能用 `messages.latest_cursor()`。**
-后者是全库 `SELECT ... FROM MESSAGE ORDER BY send_time DESC LIMIT 1`,不带 RID 条件
-(`messages.py:502-507`)。用它给新群定位,该群后续入库但 `send_time` 较早的消息会被
-永久跳过。空群应得到零水位。
+首次部署时默认不倒灌历史,按 RID 查该群自己的最新水位作为起点;显式配置
+`mars_sync_backfill` 时按时间窗口回补。`messages.latest_cursor(rid)` 必须带群过滤,
+不能使用全库最新消息。
 
-需要新增 `messages.latest_cursor(rid=None)` 的按群形态。
+同步每轮会比较刷新前后的群范围。本轮刷新中新出现的群采用不同规则:没有显式
+backfill 时从零水位开始。原因是新群可能在进入本地会话库时已经带着第一批消息,
+若此时也取 latest 作为起点,这些消息会被永久跳过。空群同样从零水位开始,后续消息
+正常进入同步。仅仅是后来加入白名单的存量群仍从 latest 开始,避免意外倒灌历史。
 
 ### 3.3 群移出白名单后又加回来 —— 与 Codex 的分歧
 

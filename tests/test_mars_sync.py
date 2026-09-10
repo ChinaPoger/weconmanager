@@ -954,6 +954,57 @@ def test_first_run_starts_at_latest_not_from_the_beginning(settings, local, push
     assert [h["message"] for h in pushed["sent"]] == ["刚刚"]
 
 
+def test_a_group_found_after_refresh_does_not_skip_its_first_messages(
+    settings, local, pushed, monkeypatch
+):
+    """运行中出现的新群不能把刷新前已落库的消息当成最新水位。"""
+    s = settings.model_copy(update={"mars_sync_groups": "客户群A,kodo-alert-p1"})
+    rid = GROUP["rid"]
+    local["messages"] = [
+        {**_msg(1, 900, "新群里的第一条"), "rid": GROUP2["rid"], "group_name": GROUP2["name"]},
+    ]
+    mars_sync.save_state(
+        State(version=3, groups={str(rid): GroupState(cursor=Cursor(800, 0))}),
+        s,
+    )
+
+    def resolve_after_refresh(_selectors):
+        if local["refreshed"] == 0:
+            return [GROUP], []
+        return [GROUP, GROUP2], []
+
+    monkeypatch.setattr(messages, "resolve_groups", resolve_after_refresh)
+
+    result = run(mars_sync.sync_once(s))
+
+    assert result.pushed == 1
+    assert [h["message"] for h in pushed["sent"]] == ["新群里的第一条"]
+    assert mars_sync.load_state(s).groups[str(GROUP2["rid"])].cursor == Cursor(900, 1)
+
+
+def test_an_existing_group_later_added_to_the_whitelist_still_starts_at_latest(
+    settings, local, pushed
+):
+    """修新群竞态不能顺手把“扩大白名单”变成全量历史倒灌。"""
+    s = settings.model_copy(update={"mars_sync_groups": "客户群A,kodo-alert-p1"})
+    local["messages"] = [
+        {**_msg(1, 900, "老群历史"), "rid": GROUP2["rid"], "group_name": GROUP2["name"]},
+    ]
+    mars_sync.save_state(
+        State(
+            version=3,
+            groups={str(GROUP["rid"]): GroupState(cursor=Cursor(800, 0))},
+        ),
+        s,
+    )
+
+    result = run(mars_sync.sync_once(s))
+
+    assert result.pushed == 0
+    assert pushed["sent"] == []
+    assert mars_sync.load_state(s).groups[str(GROUP2["rid"])].cursor == Cursor(9000, 9)
+
+
 def test_backfill_seconds_opts_into_history(settings, local, pushed, monkeypatch):
     monkeypatch.setattr(mars_sync.time, "time", lambda: 10000.0)
     s = settings.model_copy(update={"mars_sync_backfill": 2000})

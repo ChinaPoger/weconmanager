@@ -821,18 +821,34 @@ def initial_cursor(settings: Settings, rid: int | None = None) -> Cursor:
     return cursor_for_backfill(back)
 
 
+def new_group_cursor(settings: Settings) -> Cursor:
+    """运行中发现的新群的起点。
+
+    首次部署仍按 `initial_cursor` 的“不倒灌历史”语义处理,但一个已经运行中的
+    同步实例后来发现的新群不能把当前最新消息当成起点:群刚被发现前可能已经有
+    消息写入本地库,那会把第一批消息静默跳过。没有显式 backfill 时从零开始,
+    显式 backfill 则沿用配置的时间窗口。
+    """
+    back = int(settings.mars_sync_backfill or 0)
+    if back <= 0:
+        return Cursor()
+    return cursor_for_backfill(back)
+
+
 def reconcile_state(
     state: State,
     rids: list[int],
     settings: Settings,
     *,
     persist: bool,
+    fresh_rids: set[int] | None = None,
 ) -> State:
     """迁移 v1 并把 active/tombstone 与当前同步范围对齐。
 
     `persist=False` 给 preview/dry-run 使用:返回深拷贝,绝不改磁盘状态。
     """
     state = deepcopy(state)
+    fresh_rids = fresh_rids or set()
     now = time.time()
     changed = False
 
@@ -860,9 +876,16 @@ def reconcile_state(
             target_group = state.groups.get(key)
             if target_group is None:
                 # 不设 media_cutover:切换点表示「这之前推过的是旧规则的 Content」,
-                # 而全新的群一条都没推过,给它钉一个只会平白挡住正常的 backfill。
+                # 本轮刷新中新出现的群可能已经有消息写入本地库,不能用 latest
+                # 作为起点,否则会把第一批消息静默跳过。仅仅是后来加入白名单的
+                # 存量群仍按 initial_cursor 处理,避免意外倒灌全部历史。
+                cursor = (
+                    new_group_cursor(settings)
+                    if rid in fresh_rids
+                    else initial_cursor(settings, rid)
+                )
                 state.groups[key] = GroupState(
-                    cursor=initial_cursor(settings, rid), active=True, last_seen=now
+                    cursor=cursor, active=True, last_seen=now
                 )
                 changed = True
                 continue
@@ -929,7 +952,23 @@ async def _sync_once(
     settings = settings or get_settings()
     result = SyncResult(dry_run=dry_run)
 
-    # target_rids 要查 sqlite,和下面的 refresh/fetch 一样不能占着事件循环
+    # 留一份刷新前的同步范围,用来区分“本轮刚进入本地库的新群”和“后来才加进
+    # 白名单的存量群”。两者的首条水位语义不同。
+    try:
+        before_rids, _before_names, _before_missing = await asyncio.to_thread(
+            target_rids, settings
+        )
+    except MarsNotConfigured:
+        # 新群可能是当前白名单唯一的命中项,刷新前 target_rids 会暂时认为
+        # “一个群都没有”。真正的配置错误在刷新后再按正常路径报告。
+        before_rids = []
+
+    # 解密是 CPU 密集且要 ~0.8s,不能阻塞事件循环
+    result.decrypted = await asyncio.to_thread(messages.refresh)
+
+    # 必须在刷新后解析同步范围。新建群可能只在本次解密后才出现在本地会话库;
+    # 若先解析群列表,下一轮 reconcile_state 会把已写入的第一批消息误当成 latest
+    # 水位,从而永久跳过。
     rids, names, missing = await asyncio.to_thread(target_rids, settings)
     result.groups = names
     if missing:
@@ -937,12 +976,15 @@ async def _sync_once(
     if not rids:
         raise MarsNotConfigured(f"配置的群一个都没匹配上本地会话: {', '.join(missing)}")
 
-    # 解密是 CPU 密集且要 ~0.8s,不能阻塞事件循环
-    result.decrypted = await asyncio.to_thread(messages.refresh)
-
     state = load_state(settings)
     state = await asyncio.to_thread(
-        lambda: reconcile_state(state, rids, settings, persist=not dry_run)
+        lambda: reconcile_state(
+            state,
+            rids,
+            settings,
+            persist=not dry_run,
+            fresh_rids=set(rids) - set(before_rids),
+        )
     )
     before = state.to_dict()
 
