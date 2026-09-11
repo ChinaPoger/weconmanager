@@ -130,7 +130,7 @@ class LocalRecallRequest(BaseModel):
 
 
 class LocalRecallTaskRequest(LocalRecallRequest):
-    """mars 异步撤回任务的请求模型，必须显式指定目标消息。"""
+    """mars 异步撤回任务的请求模型,必须显式指定目标消息。"""
 
     lid: int = Field(..., description="消息 LID,必须显式指定")
 
