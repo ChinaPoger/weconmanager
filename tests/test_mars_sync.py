@@ -148,6 +148,7 @@ def test_hook_shape_matches_mars_message_hook(settings):
     assert hook == {
         "uid": 0,
         "groupNumber": "wework-20614687431404",
+        "localId": 1,
         "groupName": "客户群A",
         "senderNumber": "5629500548464930",
         "userid": "chenyi",

@@ -131,10 +131,20 @@ curl -X POST http://127.0.0.1:8090/api/v1/app/message/send \
   -H 'Content-Type: application/json' \
   -d '{"touser":"zhangsan","msgtype":"text","content":"你好"}'
 
+# 撤回应用身份发送的消息(msgid 来自发送接口响应)
+curl -X POST http://127.0.0.1:8090/api/v1/app/message/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"msgid":"msgid-from-send-response"}'
+
 # 以本人身份发消息(操控客户端)
 curl -X POST http://127.0.0.1:8090/api/v1/message/send \
   -H 'Content-Type: application/json' \
   -d '{"conv_rid":3395103030,"content":"你好,我是本人"}'
+
+# 撤回本人身份发送的消息；省略 lid 时撤回该群中本人最新一条可定位文本消息
+curl -X POST http://127.0.0.1:8090/api/v1/message/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"conv_rid":3395103030,"lid":123456789}'
 
 # 以本人身份发送真实 @ 提醒
 curl -X POST http://127.0.0.1:8090/api/v1/message/send \
@@ -173,7 +183,9 @@ curl ... -H 'Authorization: Bearer <token>'
 
 - `GET  /health` —— 健康检查(公开,含 agent home 解析状态)
 - `POST /api/v1/app/message/send` —— 应用身份发消息,`msgtype`: `text` / `markdown` / `news`
+- `POST /api/v1/app/message/recall` —— 按发送响应中的 `msgid` 撤回应用消息
 - `POST /api/v1/message/send` —— 本人身份发消息,`msgtype`: `text` / `image`;真实 @ 用 `mentions`
+- `POST /api/v1/message/recall` —— 本人身份按会话和消息 `lid` 撤回；省略 `lid` 时选本人最新消息
   - `text`: `to` 或 `conv_rid` + `content`
   - `image`: `conv_rid` + `image_path` / `image_url` / `image_base64` 三选一
 - `POST /api/v1/conversations` —— 查本地会话(body 可省略)
@@ -687,7 +699,7 @@ curl http://127.0.0.1:8090/api/v1/mars/tasks/status
 
 - **本人身份的 action 默认不在白名单。** `WECOM_SVR_MARS_TASKS_ACTIONS` 默认只有
   `app.message.send`(应用身份)。action 名和 HTTP 路由同构 —— 带 `app.` 前缀的是
-  应用身份,不带的(`message.send` / `group.create` / `group.rename`)
+  应用身份,不带的(`message.send` / `message.recall` / `group.create` / `group.rename`)
   是**以你本人的身份说话**,让一个远端队列能驱动它,权限边界比"应用发通知"
   大一个量级,要开必须显式写进配置。
 - **宁可漏发,不重发。** 跟群消息同步的取舍正好相反 —— 那边 mars 有 checksum

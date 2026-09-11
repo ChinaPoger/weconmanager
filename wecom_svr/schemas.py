@@ -42,6 +42,21 @@ class SendMessageRequest(BaseModel):
         return {"touser": self.touser, "content": self.content}
 
 
+class RecallMessageRequest(BaseModel):
+    """撤回自建应用发送的消息。"""
+
+    model_config = ConfigDict(json_schema_extra={"example": {"msgid": "msgid-from-send-response"}})
+
+    msgid: str = Field(..., min_length=1, description="发送接口返回的消息 ID")
+
+    @model_validator(mode="after")
+    def _check_msgid(self):
+        if not self.msgid.strip():
+            raise ValueError("msgid 不能为空")
+        self.msgid = self.msgid.strip()
+        return self
+
+
 class LocalSendRequest(BaseModel):
     """以「本人登录账号」身份发送文本或图片。"""
 
@@ -97,6 +112,27 @@ class ConversationsRequest(BaseModel):
 
 class OpenConversationRequest(BaseModel):
     conv_rid: int = Field(..., description="要打开的会话 RID")
+
+
+class LocalRecallRequest(BaseModel):
+    """撤回本人登录账号在本地客户端发出的消息。"""
+
+    conv_rid: int = Field(..., description="会话 RID")
+    lid: int | None = Field(None, description="消息 LID;省略时撤回该会话中本人最新消息")
+
+    @model_validator(mode="after")
+    def _check_ids(self):
+        if self.conv_rid <= 0:
+            raise ValueError("conv_rid 必须为正整数")
+        if self.lid is not None and self.lid <= 0:
+            raise ValueError("lid 必须为正整数")
+        return self
+
+
+class LocalRecallTaskRequest(LocalRecallRequest):
+    """mars 异步撤回任务的请求模型，必须显式指定目标消息。"""
+
+    lid: int = Field(..., description="消息 LID,必须显式指定")
 
 
 class LocalCreateGroupRequest(BaseModel):

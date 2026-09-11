@@ -43,6 +43,7 @@ from .mars_sync import MarsNotConfigured, MarsSyncError, group_number_text, mars
 from .paths import AgentHomeError
 from .schemas import (
     LocalCreateGroupRequest,
+    LocalRecallTaskRequest,
     LocalRenameGroupRequest,
     LocalSendRequest,
     SendMessageRequest,
@@ -173,6 +174,10 @@ async def _rename_local_group(req: LocalRenameGroupRequest) -> dict:
     return await asyncio.to_thread(local_group.rename_group, req.conv_rid, req.name)
 
 
+async def _recall_local_message(req: LocalRecallTaskRequest) -> dict:
+    return await asyncio.to_thread(local_send.recall_message, req.conv_rid, req.lid)
+
+
 class Action(NamedTuple):
     """一个 action 的全部三件事。schema 和 HTTP 路由用的是同一批。"""
 
@@ -190,6 +195,7 @@ class Action(NamedTuple):
 ACTIONS: dict[str, Action] = {
     "app.message.send": Action(SendMessageRequest, _send_app_message, False),  # 官方 API,不碰界面
     "message.send": Action(LocalSendRequest, _send_local_message, True),
+    "message.recall": Action(LocalRecallTaskRequest, _recall_local_message, True),
     "group.create": Action(LocalCreateGroupRequest, _create_local_group, True),
     "group.rename": Action(LocalRenameGroupRequest, _rename_local_group, True),
 }

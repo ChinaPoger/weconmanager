@@ -132,6 +132,18 @@ def local(monkeypatch):
     return calls
 
 
+@pytest.fixture
+def local_recall(monkeypatch):
+    calls = []
+
+    def fake(conv_rid, lid):
+        calls.append((conv_rid, lid))
+        return {"success": True, "conv_rid": conv_rid, "lid": lid}
+
+    monkeypatch.setattr(mars_tasks.local_send, "recall_message", fake)
+    return calls
+
+
 # ─── 配置 ───────────────────────────────────────────────────────────────
 
 def test_missing_base_url_is_a_config_error(tmp_path):
@@ -211,6 +223,29 @@ def test_whitelisted_local_send_passes_mentions(settings, mars, local):
     assert local == [{
         "to": "张三", "content": "@abz", "conv_rid": None, "mentions": ["abz"],
     }]
+
+
+def test_whitelisted_local_recall_runs_with_explicit_target(settings, mars, local_recall):
+    settings = settings.model_copy(update={"mars_tasks_actions": "message.recall"})
+    mars.give(1, "message.recall", {"conv_rid": 3395103030, "lid": 123456789})
+    result = run(mars_tasks.run_once(settings, wait=0))
+
+    assert (result.done, result.failed) == (1, 0)
+    assert local_recall == [(3395103030, 123456789)]
+    assert mars.starts == [(1, {"id": 1, "lease_token": "mac-test:tok1"})]
+    assert mars.last_ack["ok"] is True
+
+
+def test_local_recall_requires_lid_in_queue(settings, mars, local_recall):
+    settings = settings.model_copy(update={"mars_tasks_actions": "message.recall"})
+    mars.give(1, "message.recall", {"conv_rid": 3395103030})
+    result = run(mars_tasks.run_once(settings, wait=0))
+
+    assert result.failed == 1
+    assert local_recall == []
+    assert mars.starts == []
+    assert mars.last_ack["ok"] is False
+    assert "payload 校验失败" in mars.last_ack["error"]
 
 
 def test_star_allows_every_known_action(settings):

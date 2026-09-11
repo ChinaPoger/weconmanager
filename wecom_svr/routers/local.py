@@ -16,6 +16,7 @@ from ..schemas import (
     ConversationsRequest,
     ConversationsResponse,
     LocalCreateGroupRequest,
+    LocalRecallRequest,
     LocalRenameGroupRequest,
     LocalSendRequest,
     LocalSendResponse,
@@ -54,6 +55,15 @@ def send_local_message(req: LocalSendRequest, _: None = Depends(require_token)):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"success": False, "error": str(e)},
         ) from e
+    return _result_response(result)
+
+
+@router.post(
+    "/message/recall",
+    summary="撤回本人消息(操控客户端)",
+)
+def recall_local_message(req: LocalRecallRequest, _: None = Depends(require_token)):
+    result = local_send.recall_message(req.conv_rid, req.lid)
     return _result_response(result)
 
 

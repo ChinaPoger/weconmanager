@@ -318,12 +318,29 @@ action 名和 wecom-svr 的 HTTP 路由**同构**:带 `app.` 前缀的是自建�
 | --- | --- | --- |
 | `app.message.send` | `POST /api/v1/app/message/send` | 自建应用 |
 | `message.send` (`msgtype=text/image`) | `POST /api/v1/message/send` | **本人** |
+| `message.recall` | `POST /api/v1/message/recall` | **本人** |
 | `group.create` | `POST /api/v1/group/create` | **本人** |
 | `group.rename` | `POST /api/v1/group/rename` | **本人** |
 
 `payload` 就是对应接口的 body,原样透传。mars 不重新建模这些字段 —— 建了就会漂。
 
-> 不带前缀的那三条默认**不在** worker 的白名单里(§5.2)。"本人身份是默认关的"
+`message.recall` 的 payload 必须同时包含 `conv_rid` 和 `lid`:
+
+```json
+{
+  "worker": "mac-cc",
+  "action": "message.recall",
+  "payload": {"conv_rid": 247764039432344, "lid": 123456789},
+  "expire_in": 600,
+  "dedup_key": "message-recall-247764039432344-123456789",
+  "created_by": "deimos"
+}
+```
+
+队列不允许省略 `lid`。人工调用 HTTP 接口时可以省略它来选择本人最新消息,
+但异步任务可能延迟执行,此时“最新消息”可能已经变化,所以必须精确指定目标。
+
+> 不带前缀的四条默认**不在** worker 的白名单里(§5.2)。"本人身份是默认关的"
 > 靠的是白名单,不是名字长得像 —— 加新 action 时别指望前缀替你把门。
 
 ### 4.7 发到群
@@ -418,13 +435,15 @@ action 时不回答这个问题根本构造不出来。漏标的后果不对称:
 
 `WECOM_SVR_MARS_TASKS_ACTIONS` 默认 `app.message.send`。
 
-不带 `app.` 前缀的三条(`message.send` / `group.create` /
+不带 `app.` 前缀的四条(`message.send` / `message.recall` / `group.create` /
 `group.rename`)是**以你本人的身份说话**,让一个远端队列能驱动它,权限边界比
 "应用发通知"大一个量级。要开必须显式写进白名单。不在白名单里的 action 直接 ack
 失败(`retry=false`),不执行。
 
 payload 用**和 HTTP 路由同一套 pydantic schema** 校验(`SendMessageRequest`、
-`LocalSendRequest`…)。同一套校验只有一份,队列这条路不会悄悄比 HTTP 那条松。
+`LocalSendRequest`、`LocalRecallTaskRequest`…)。撤回任务在 HTTP 模型的基础上要求
+显式提供 `lid`,因为异步任务不能依赖“最新一条消息”的动态选择。同一套校验只有一份,
+队列这条路不会悄悄比 HTTP 那条松。
 
 ### 5.3 崩溃恢复:只落一次盘
 

@@ -601,6 +601,8 @@ def to_hook(msg: dict, settings: Settings) -> dict:
         # 本地消息没有客户 UID 时保持 0,与 Mars MessageHook 的默认值一致。
         "uid": int(msg.get("uid") or 0),
         "groupNumber": group_number_text(settings.mars_group_prefix, msg.get("rid")),
+        # localId 是企微本地消息表的 LID,用于 Mars 按群幂等。
+        "localId": int(msg.get("lid") or 0),
         "groupName": group_name(msg.get("group_name") or "", settings, msg.get("rid")),
         "senderNumber": sender_number,
         "userid": userid,

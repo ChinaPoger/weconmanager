@@ -68,6 +68,43 @@ def test_message_send_passes_through_agent_response(client, monkeypatch):
     }
 
 
+def test_message_recall_requires_msgid(client):
+    r = client.post("/api/v1/app/message/recall", json={})
+
+    assert r.status_code == 400
+    assert r.json()["errcode"] == -1
+    assert "msgid" in r.json()["errmsg"]
+
+
+def test_message_recall_rejects_blank_msgid(client):
+    r = client.post("/api/v1/app/message/recall", json={"msgid": "   "})
+
+    assert r.status_code == 400
+    assert r.json() == {"errcode": -1, "errmsg": "msgid 不能为空"}
+
+
+def test_message_recall_passes_through_agent_response(client, monkeypatch):
+    seen = {}
+
+    async def fake_call(category, method, args):
+        seen.update(category=category, method=method, args=args)
+        return {"errcode": 0, "errmsg": "ok"}
+
+    monkeypatch.setattr("wecom_svr.routers.message.call_wecom", fake_call)
+    r = client.post("/api/v1/app/message/recall", json={"msgid": "  abc  "})
+
+    assert r.status_code == 200
+    assert r.json() == {"errcode": 0, "errmsg": "ok"}
+    assert seen == {
+        "category": "call",
+        "method": "POST",
+        "args": {
+            "path": "/cgi-bin/message/recall",
+            "body": {"msgid": "abc"},
+        },
+    }
+
+
 def test_contact_search_requires_keyword(client):
     r = client.post("/api/v1/app/contact/search", json={})
     assert r.status_code == 400
@@ -88,6 +125,30 @@ def test_local_send_requires_content(client):
     r = client.post("/api/v1/message/send", json={"to": "群"})
     assert r.status_code == 400
     assert r.json()["success"] is False
+
+
+def test_local_recall_requires_conversation(client):
+    r = client.post("/api/v1/message/recall", json={})
+    assert r.status_code == 400
+    body = r.json()
+    assert body["success"] is False
+    assert "conv_rid" in body["error"]
+
+
+def test_local_recall_passes_target(client, monkeypatch):
+    seen = {}
+
+    def fake_recall(conv_rid, lid):
+        seen.update(conv_rid=conv_rid, lid=lid)
+        return {"success": True, "conv_rid": conv_rid, "lid": lid, "error": None}
+
+    monkeypatch.setattr(local_send, "recall_message", fake_recall)
+    r = client.post(
+        "/api/v1/message/recall",
+        json={"conv_rid": 10698325762690906, "lid": 123},
+    )
+    assert r.status_code == 200
+    assert seen == {"conv_rid": 10698325762690906, "lid": 123}
 
 
 def test_local_send_failure_is_400_with_body(client, monkeypatch):

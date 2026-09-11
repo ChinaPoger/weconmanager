@@ -42,6 +42,7 @@ DESCRIPTION = """
 企业微信消息发送 API。底层引用 [wecom-agent](https://github.com/tzwkb/wecom-agent) 作为 pkg。
 
 - **/api/v1/app/message/send** — 以「自建应用」身份发消息(官方 API)
+- **/api/v1/app/message/recall** — 按 `msgid` 撤回自建应用消息(官方 API)
 - **/api/v1/message/send** — 以「本人登录账号」身份发消息(操控 macOS 客户端)
 - **/api/v1/app/group/create** — 拉群(官方 appchat),成员可直接写中文名和「我」
 - **/api/v1/app/contact/search** — 查通讯录

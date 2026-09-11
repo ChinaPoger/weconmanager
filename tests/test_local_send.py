@@ -524,6 +524,231 @@ def test_open_conversation_uses_short_settle_delay(monkeypatch):
     assert sleeps == [0.45]
 
 
+def test_latest_own_message_filters_by_self_and_lid(monkeypatch):
+    monkeypatch.setattr(local_send.directory, "self_vid_or_none", lambda: "42")
+    seen = {}
+
+    def rows(sql, params):
+        seen.update(sql=sql, params=params)
+        return [{
+            "LID": 99,
+            "content_type": 0,
+            "send_time": 1,
+            "content": b"hello",
+        }]
+
+    monkeypatch.setattr(local_send.messages, "_rows", rows)
+    monkeypatch.setattr(local_send.messages, "_type_name", lambda _ctype: "文本")
+    monkeypatch.setattr(
+        local_send.messages,
+        "_render",
+        lambda _ctype, _content, _label: "hello",
+    )
+
+    assert local_send._latest_own_message(7, 99) == {
+        "lid": 99,
+        "text": "hello",
+        "type": "文本",
+    }
+    assert seen["params"] == (7, 42, 99)
+    assert "sender_id = ?" in seen["sql"]
+    assert "LID = ?" in seen["sql"]
+
+
+def test_latest_own_message_refuses_unknown_self(monkeypatch):
+    monkeypatch.setattr(local_send.directory, "self_vid_or_none", lambda: None)
+
+    with pytest.raises(local_send.LocalDataError, match="无法识别当前登录账号"):
+        local_send._latest_own_message(7, None)
+
+
+def test_recall_message_stops_before_click_when_text_is_not_located(monkeypatch):
+    monkeypatch.setattr(local_send, "ensure_macos", lambda: None)
+    monkeypatch.setattr(
+        local_send,
+        "get_conversation_by_rid",
+        lambda _rid: {"name": "群", "rid": 7, "type": 1, "fw_id": 0},
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_latest_own_message",
+        lambda _rid, _lid: {"lid": 99, "text": "hello", "type": "文本"},
+    )
+    monkeypatch.setattr(
+        local_send.subprocess,
+        "run",
+        lambda *_args, **_kwargs: type("Result", (), {"returncode": 0})(),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_find_message_point",
+        lambda _text: (False, 0, 0, "未找到消息气泡"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_post_mouse_right_click",
+        lambda *_args: pytest.fail("定位失败后不应点击"),
+    )
+    monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
+
+    result = local_send.recall_message(7, 99)
+
+    assert result == {"success": False, "error": "未找到消息气泡"}
+
+
+def test_recall_message_refuses_non_text_before_opening_client(monkeypatch):
+    monkeypatch.setattr(local_send, "ensure_macos", lambda: None)
+    monkeypatch.setattr(
+        local_send,
+        "get_conversation_by_rid",
+        lambda _rid: {"name": "群", "rid": 7, "type": 1, "fw_id": 0},
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_latest_own_message",
+        lambda _rid, _lid: {"lid": 99, "text": "[图片]", "type": "图片"},
+    )
+    monkeypatch.setattr(
+        local_send.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("非文本消息不应打开客户端"),
+    )
+
+    result = local_send.recall_message(7, 99)
+
+    assert result == {
+        "success": False,
+        "error": "暂不支持撤回图片消息,仅支持可精确定位的文本消息",
+    }
+
+
+def test_press_menu_item_clicks_exact_auxiliary_text_point(monkeypatch):
+    monkeypatch.setattr(
+        local_send,
+        "_ax_find_auxiliary_named_point",
+        lambda names: (True, 12.5, 34.5, f"found {names[0]}"),
+    )
+    seen = {}
+
+    def click(x, y):
+        seen.update(x=x, y=y)
+        return True, "ok"
+
+    monkeypatch.setattr(local_send, "_post_mouse_click", click)
+
+    assert local_send._press_menu_item(("撤回", "Recall")) == (True, "ok")
+    assert seen == {"x": 12.5, "y": 34.5}
+
+
+def test_recall_message_verifies_original_text_disappeared(monkeypatch):
+    monkeypatch.setattr(local_send, "ensure_macos", lambda: None)
+    monkeypatch.setattr(
+        local_send,
+        "get_conversation_by_rid",
+        lambda _rid: {"name": "群", "rid": 7, "type": 1, "fw_id": 0},
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_latest_own_message",
+        lambda _rid, _lid: {"lid": 99, "text": "hello", "type": "文本"},
+    )
+    monkeypatch.setattr(
+        local_send.subprocess,
+        "run",
+        lambda *_args, **_kwargs: type("Result", (), {"returncode": 0})(),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_find_message_point",
+        lambda _text: (True, 10, 20, "ok"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_post_mouse_right_click",
+        lambda *_args: (True, "ok"),
+    )
+    pressed = []
+
+    def press(names):
+        pressed.append(names)
+        return True, "ok"
+
+    monkeypatch.setattr(local_send, "_press_menu_item", press)
+    monkeypatch.setattr(
+        local_send,
+        "_wait_message_disappeared",
+        lambda text: (text == "hello", "ok"),
+    )
+    monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
+
+    result = local_send.recall_message(7, 99)
+
+    assert result["success"] is True
+    assert result["lid"] == 99
+    assert pressed == [("撤回", "Recall"), ("确定", "确认", "OK")]
+
+
+def test_rid_resolution_accepts_conversation_without_name(monkeypatch):
+    conv = {"name": "", "rid": 224202291574706, "lid": 1, "type": 1, "fw_id": 0}
+    monkeypatch.setattr(local_send, "get_conversation_by_rid", lambda _rid: conv.copy())
+    monkeypatch.setattr(
+        local_send,
+        "_count_name_collisions",
+        lambda _name: pytest.fail("空名称不应查询同名联系人"),
+    )
+
+    result = local_send.resolve_conversation_name("", conv["rid"])
+
+    assert result == {**conv, "skip": 0}
+
+
+def test_send_message_allows_rid_with_empty_conversation_name(monkeypatch):
+    monkeypatch.setattr(local_send, "ensure_macos", lambda: None)
+    monkeypatch.setattr(
+        local_send,
+        "resolve_conversation_name",
+        lambda _identifier, _rid: {
+            "name": "", "rid": 224202291574706, "lid": 1, "type": 1, "fw_id": 0,
+        },
+    )
+    seen = {}
+
+    def fake_send(conv, content):
+        seen.update(conv=conv, content=content)
+        return True, "ok"
+
+    monkeypatch.setattr(local_send, "_send_by_scheme", fake_send)
+
+    result = local_send.send_message(conv_rid=224202291574706, content="hello")
+
+    assert result["success"] is True
+    assert result["conv_name"] == "未命名群-224202291574706"
+    assert seen["content"] == "hello"
+
+
+def test_send_image_allows_rid_with_empty_conversation_name(monkeypatch, tmp_path):
+    image = tmp_path / "a.png"
+    image.write_bytes(b"png")
+    monkeypatch.setattr(local_send, "ensure_macos", lambda: None)
+    monkeypatch.setattr(
+        local_send,
+        "resolve_conversation_name",
+        lambda _identifier, _rid: {
+            "name": "", "rid": 224202291574706, "lid": 1, "type": 1, "fw_id": 0,
+        },
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_send_image_by_scheme",
+        lambda conv, path: (True, f"{conv['rid']}:{path}"),
+    )
+
+    result = local_send.send_image(str(image), 224202291574706)
+
+    assert result["success"] is True
+    assert result["conv_name"] == "未命名群-224202291574706"
+
+
 def test_submit_current_input_has_no_default_settle_delay(monkeypatch):
     monkeypatch.setattr(local_send, "_post_return_key", lambda: (True, "ok"))
     monkeypatch.setattr(
@@ -636,9 +861,69 @@ def test_type_mention_selects_candidate_without_send_confirmation(monkeypatch):
     )
     monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
 
-    local_send._type_mention("abz")
+    assert local_send._type_mention("abz") is True
 
     assert calls == [False]
+
+
+def test_type_mention_downgrades_non_exact_candidate_to_plain_text(monkeypatch):
+    calls = []
+    monkeypatch.setattr(local_send, "_run_applescript", lambda *_args, **_kwargs: (True, "ok"))
+    monkeypatch.setattr(local_send, "_insert_current_input", lambda text: calls.append(text) or (True, "ok"))
+    monkeypatch.setattr(local_send, "_mention_candidates", lambda: ["黄卫杰(小杰)"])
+    monkeypatch.setattr(
+        local_send,
+        "_dismiss_mention_picker",
+        lambda: calls.append("dismiss"),
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_post_return_key",
+        lambda **_kwargs: pytest.fail("候选不严格匹配时不应选择成员"),
+    )
+
+    assert local_send._type_mention("黄卫杰") is False
+    assert calls == ["黄卫杰", "dismiss"]
+
+
+def test_rich_message_sends_when_mention_candidate_is_not_exact(monkeypatch):
+    state = {"text": ""}
+    submitted = []
+    monkeypatch.setattr(local_send, "_release_ax_element", lambda _element: None)
+    monkeypatch.setattr(local_send, "_focus_chat_input", lambda: (True, "ok"))
+    monkeypatch.setattr(
+        local_send, "_focused_chat_input", lambda *args, **kwargs: (True, 1, "ok")
+    )
+    monkeypatch.setattr(
+        local_send,
+        "_clear_current_input",
+        lambda: state.update(text="") or (True, "ok"),
+    )
+
+    def insert(text):
+        state["text"] += text
+        return True, "ok"
+
+    monkeypatch.setattr(local_send, "_insert_current_input", insert)
+
+    def applescript(_script, **_kwargs):
+        state["text"] += "@"
+        return True, "ok"
+
+    monkeypatch.setattr(local_send, "_run_applescript", applescript)
+    monkeypatch.setattr(local_send, "_mention_candidates", lambda: ["黄卫杰(小杰)"])
+    monkeypatch.setattr(local_send, "_dismiss_mention_picker", lambda: None)
+    monkeypatch.setattr(local_send.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(
+        local_send,
+        "_submit_current_input",
+        lambda: submitted.append(state["text"]) or (True, "ok"),
+    )
+
+    assert local_send._type_rich_message(
+        "RPM 和 TPM 可以调整,销售同学帮忙确认下 @黄卫杰", ["黄卫杰"]
+    ) == (True, "ok")
+    assert submitted == ["RPM 和 TPM 可以调整,销售同学帮忙确认下 @黄卫杰"]
 
 
 def test_rich_message_selects_mentions_before_sending(monkeypatch):

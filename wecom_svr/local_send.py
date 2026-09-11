@@ -21,7 +21,7 @@ import time
 from itertools import pairwise
 from urllib.parse import urlencode
 
-from . import messages
+from . import directory, messages
 from .localdb import NOT_SYNCED as _NOT_SYNCED
 
 # 错误类型在 localdb 定义,这里转出供 main/cli/tests 沿用。
@@ -46,10 +46,15 @@ _INPUT_ROLES = {"AXTextArea", "AXTextField"}
 _INITIAL_MESSAGE_ATTEMPTS = 2
 _INITIAL_MESSAGE_VERIFY_ATTEMPTS = 6
 _INITIAL_MESSAGE_VERIFY_DELAY = 0.25
+_UNNAMED_CONVERSATION_PREFIX = "未命名群"
 
 
 class _CGPoint(ctypes.Structure):
     _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class _CGSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
 
 
 def ensure_macos() -> None:
@@ -155,10 +160,12 @@ def resolve_conversation_name(identifier: str, rid: int | None = None) -> dict |
 
     skip 表示搜索结果中需跳过的同名用户数(防止选到机器人)。
     """
-    if rid:
+    if rid is not None:
         conv = get_conversation_by_rid(rid)
-        if conv and conv["name"]:
-            conv["skip"] = _count_name_collisions(conv["name"])
+        if conv:
+            conv["skip"] = (
+                _count_name_collisions(conv["name"]) if conv.get("name") else 0
+            )
             return conv
 
     matches = get_conversation_by_name(identifier) if identifier else []
@@ -181,6 +188,19 @@ def resolve_conversation_name(identifier: str, rid: int | None = None) -> dict |
         c["skip"] = _count_name_collisions(c["name"])
         return c
     return None
+
+
+def _display_conversation_name(conv: dict) -> str:
+    """给没有落库名称的会话生成稳定的本地展示名。"""
+    name = str(conv.get("name") or "").strip()
+    if name:
+        return name
+    rid = conv.get("rid")
+    return (
+        f"{_UNNAMED_CONVERSATION_PREFIX}-{rid}"
+        if rid is not None
+        else _UNNAMED_CONVERSATION_PREFIX
+    )
 
 
 # ─── 剪贴板 ────────────────────────────────────────────────────────────
@@ -438,6 +458,177 @@ def _post_mouse_click(x: float, y: float) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _post_mouse_right_click(x: float, y: float) -> tuple[bool, str]:
+    """通过 Quartz 右键点击消息气泡。"""
+    try:
+        cg, cf = _load_quartz_libraries()
+        point = _CGPoint(float(x), float(y))
+        down = cg.CGEventCreateMouseEvent(None, 3, point, 1)  # right mouse down
+        up = cg.CGEventCreateMouseEvent(None, 4, point, 1)  # right mouse up
+        if not down or not up:
+            if down:
+                cf.CFRelease(down)
+            if up:
+                cf.CFRelease(up)
+            return False, "无法创建 Quartz 右键事件"
+        try:
+            cg.CGEventPost(0, down)
+            time.sleep(0.03)
+            cg.CGEventPost(0, up)
+        finally:
+            cf.CFRelease(down)
+            cf.CFRelease(up)
+    except OSError as e:
+        return False, f"加载 Quartz 失败: {e}"
+    return True, "ok"
+
+
+def _find_message_point(text: str) -> tuple[bool, float, float, str]:
+    """在当前聊天区找正文完全匹配的消息气泡中心。"""
+    ok, app, error = _ax_application()
+    if not ok:
+        return False, 0, 0, error
+    ok, windows, error = _ax_attribute(app, "AXWindows")
+    if not ok:
+        return False, 0, 0, error
+
+    _ax, cf = _load_accessibility_libraries()
+    try:
+        count = max(0, int(cf.CFArrayGetCount(windows)))
+        for index in range(count):
+            window_ref = cf.CFArrayGetValueAtIndex(windows, index)
+            window = int(window_ref) if window_ref else 0
+            if not window:
+                continue
+            cf.CFRetain(window)
+            try:
+                point = _ax_find_text_point(window, text)
+            finally:
+                cf.CFRelease(window)
+            if point is not None:
+                return True, point[0], point[1], "ok"
+    finally:
+        cf.CFRelease(windows)
+    return False, 0, 0, "未找到消息气泡(消息可能尚未加载到当前窗口)"
+
+
+def _press_menu_item(names: tuple[str, ...]) -> tuple[bool, str]:
+    """按名称点击企微 CEF 菜单项,坐标来自精确匹配的 AX 文本节点。"""
+    found, x, y, error = _ax_find_auxiliary_named_point(names)
+    if not found:
+        return False, error
+    return _post_mouse_click(x, y)
+
+
+def _latest_own_message(conv_rid: int, lid: int | None) -> dict | None:
+    self_vid = directory.self_vid_or_none()
+    if not self_vid:
+        raise LocalDataError("无法识别当前登录账号,拒绝猜测要撤回的消息")
+    sender_id = int(self_vid)
+    params: tuple = (conv_rid, sender_id)
+    sql = (
+        "SELECT LID, content_type, send_time, CAST(content AS BLOB) AS content "
+        "FROM MESSAGE WHERE conv_id = ? AND sender_id = ?"
+    )
+    if lid is not None:
+        sql += " AND LID = ?"
+        params += (lid,)
+    sql += " ORDER BY send_time DESC, LID DESC LIMIT 1"
+    rows = messages._rows(sql, params)
+    if not rows:
+        return None
+    row = rows[0]
+    label = messages._type_name(row["content_type"])
+    text = messages._render(row["content_type"], row["content"], label).strip()
+    return {"lid": int(row["LID"]), "text": text, "type": label}
+
+
+def _wait_message_disappeared(
+    text: str,
+    attempts: int = 4,
+    interval: float = 0.2,
+) -> tuple[bool, str]:
+    """撤回后确认原正文已从消息区消失。"""
+    last_error = ""
+    for attempt in range(max(1, attempts)):
+        found, _x, _y, error = _find_message_point(text)
+        if not found:
+            if error.startswith("未找到消息气泡"):
+                return True, "ok"
+            last_error = error
+        if attempt + 1 < attempts:
+            time.sleep(max(0.0, interval))
+    if last_error:
+        return False, f"撤回后无法核验消息状态: {last_error}"
+    return False, "已点击撤回,但原消息仍在当前会话中"
+
+
+def recall_message(conv_rid: int, lid: int | None = None) -> dict:
+    """撤回本人消息;默认只选择目标会话中本人最新一条。"""
+    ensure_macos()
+    try:
+        rid = int(conv_rid)
+        target_lid = int(lid) if lid is not None else None
+    except (TypeError, ValueError):
+        return {"success": False, "error": f"非法 conv_rid/lid: {conv_rid!r}/{lid!r}"}
+    conv = get_conversation_by_rid(rid)
+    if not conv:
+        return {"success": False, "error": f"未找到 RID={rid} 的对话"}
+    target = _latest_own_message(rid, target_lid)
+    if not target:
+        return {"success": False, "error": "目标会话中没有找到本人消息"}
+    if target["type"] != "文本":
+        return {
+            "success": False,
+            "error": f"暂不支持撤回{target['type']}消息,仅支持可精确定位的文本消息",
+        }
+    if not target["text"]:
+        return {"success": False, "error": "目标消息没有可定位的文本,拒绝按坐标猜测"}
+
+    with ui_session("撤回消息"):
+        try:
+            url = _conversation_jump_url(conv, msgid=target["lid"])
+            result = subprocess.run(
+                ["open", url], capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+            return {"success": False, "error": f"打开消息失败: {e}"}
+        if result.returncode != 0:
+            return {
+                "success": False,
+                "error": (result.stderr or result.stdout).strip() or "打开消息失败",
+            }
+        time.sleep(0.6)
+        found, x, y, error = _find_message_point(target["text"])
+        if not found:
+            return {"success": False, "error": error}
+        ok, error = _post_mouse_right_click(x, y)
+        if not ok:
+            return {"success": False, "error": error}
+        time.sleep(0.15)
+        ok, error = _press_menu_item(("撤回", "Recall"))
+        if not ok:
+            _run_applescript(
+                'tell application "System Events" to tell process "企业微信" to key code 53',
+                timeout=2,
+            )
+            return {"success": False, "error": error}
+        time.sleep(0.25)
+        # 某些版本会弹二次确认,能按下「确定」时完成确认;没有弹窗则保持成功。
+        _press_menu_item(("确定", "确认", "OK"))
+        ok, error = _wait_message_disappeared(target["text"])
+        if not ok:
+            return {"success": False, "error": error}
+
+    return {
+        "success": True,
+        "conv_name": conv.get("name") or _display_conversation_name(conv),
+        "conv_rid": rid,
+        "lid": target["lid"],
+        "error": None,
+    }
+
+
 def _refresh_chat_window_bounds() -> tuple[bool, str]:
     """读取并缓存企微聊天窗口位置,供后续发送直接复用。"""
     global _chat_window_bounds
@@ -578,6 +769,10 @@ def _load_accessibility_libraries():
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ]
     ax.AXUIElementSetAttributeValue.restype = ctypes.c_int32
+    ax.AXValueGetValue.argtypes = [
+        ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p,
+    ]
+    ax.AXValueGetValue.restype = ctypes.c_bool
     cf.CFStringCreateWithCString.argtypes = [
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
     ]
@@ -722,6 +917,216 @@ def _ax_attribute(element: int, name: str) -> tuple[bool, int, str]:
     if code != 0 or not value.value:
         return False, 0, f"读取 {name} 失败(AXError={code})"
     return True, int(value.value), "ok"
+
+
+def _ax_text_attribute(element: int, name: str) -> tuple[bool, str, str]:
+    """读取字符串类型 AX 属性并释放返回值。"""
+    ok, value_ref, error = _ax_attribute(element, name)
+    if not ok:
+        return False, "", error
+    _ax, cf = _load_accessibility_libraries()
+    try:
+        try:
+            return True, _cf_string_value(value_ref), "ok"
+        except ValueError as e:
+            return False, "", str(e)
+    finally:
+        cf.CFRelease(value_ref)
+
+
+def _ax_value_pair(
+    element: int,
+    attribute: str,
+    value_type: int,
+    structure_type,
+) -> tuple[bool, tuple[float, float], str]:
+    """读取 AXPosition/AXSize 这类 AXValue 二元结构。"""
+    ok, value_ref, error = _ax_attribute(element, attribute)
+    if not ok:
+        return False, (0, 0), error
+    ax, cf = _load_accessibility_libraries()
+    value = structure_type()
+    try:
+        if not ax.AXValueGetValue(value_ref, value_type, ctypes.byref(value)):
+            return False, (0, 0), f"解析 {attribute} 失败"
+    finally:
+        cf.CFRelease(value_ref)
+    fields = [float(getattr(value, field)) for field, _ctype in value._fields_]
+    return True, (fields[0], fields[1]), "ok"
+
+
+def _ax_frame(element: int) -> tuple[bool, tuple[float, float, float, float], str]:
+    ok, position, error = _ax_value_pair(element, "AXPosition", 1, _CGPoint)
+    if not ok:
+        return False, (0, 0, 0, 0), error
+    ok, size, error = _ax_value_pair(element, "AXSize", 2, _CGSize)
+    if not ok:
+        return False, (0, 0, 0, 0), error
+    return True, (*position, *size), "ok"
+
+
+def _ax_find_text_point(
+    element: int,
+    text: str,
+    *,
+    window_frame: tuple[float, float, float, float] | None = None,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> tuple[float, float] | None:
+    """在单个 AX 窗口树内精确查找文本消息,并返回气泡中心。"""
+    if budget is None:
+        budget = [5000]
+    if budget[0] <= 0 or depth > 16:
+        return None
+    budget[0] -= 1
+
+    if window_frame is None:
+        ok, frame, _error = _ax_frame(element)
+        if ok:
+            window_frame = frame
+
+    ok, role, _error = _ax_role(element)
+    if ok and role == "AXTextArea":
+        ok, value, _error = _ax_text_attribute(element, "AXValue")
+        if ok and value == text:
+            ok, frame, _error = _ax_frame(element)
+            if ok:
+                x, y, width, height = frame
+                center = x + width / 2, y + height / 2
+                if width > 0 and height > 0 and window_frame is not None:
+                    win_x, win_y, win_width, win_height = window_frame
+                    in_chat_area = (
+                        center[0] > win_x + win_width * 0.25
+                        and center[1] > win_y + 50
+                        and center[1] < win_y + win_height * 0.88
+                    )
+                    if in_chat_area:
+                        return center
+
+    ok, children, _error = _ax_attribute(element, "AXChildren")
+    if not ok:
+        return None
+    _ax, cf = _load_accessibility_libraries()
+    try:
+        count = max(0, int(cf.CFArrayGetCount(children)))
+        for index in range(count):
+            child_ref = cf.CFArrayGetValueAtIndex(children, index)
+            child = int(child_ref) if child_ref else 0
+            if not child:
+                continue
+            cf.CFRetain(child)
+            try:
+                point = _ax_find_text_point(
+                    child,
+                    text,
+                    window_frame=window_frame,
+                    depth=depth + 1,
+                    budget=budget,
+                )
+            finally:
+                cf.CFRelease(child)
+            if point is not None:
+                return point
+    finally:
+        cf.CFRelease(children)
+    return None
+
+
+def _ax_find_named_point(
+    element: int,
+    names: set[str],
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> tuple[float, float] | None:
+    """在一棵 AX 子树里按可见文字精确找控件中心。"""
+    if budget is None:
+        budget = [1000]
+    if budget[0] <= 0 or depth > 16:
+        return None
+    budget[0] -= 1
+
+    ok, role, _error = _ax_role(element)
+    if ok and role in {"AXStaticText", "AXButton", "AXMenuItem"}:
+        for attribute in ("AXValue", "AXTitle"):
+            ok, value, _error = _ax_text_attribute(element, attribute)
+            if ok and value in names:
+                ok, frame, _error = _ax_frame(element)
+                if ok:
+                    x, y, width, height = frame
+                    if width > 0 and height > 0:
+                        return x + width / 2, y + height / 2
+
+    ok, children, _error = _ax_attribute(element, "AXChildren")
+    if not ok:
+        return None
+    _ax, cf = _load_accessibility_libraries()
+    try:
+        count = max(0, int(cf.CFArrayGetCount(children)))
+        for index in range(count):
+            child_ref = cf.CFArrayGetValueAtIndex(children, index)
+            child = int(child_ref) if child_ref else 0
+            if not child:
+                continue
+            cf.CFRetain(child)
+            try:
+                point = _ax_find_named_point(
+                    child,
+                    names,
+                    depth=depth + 1,
+                    budget=budget,
+                )
+            finally:
+                cf.CFRelease(child)
+            if point is not None:
+                return point
+    finally:
+        cf.CFRelease(children)
+    return None
+
+
+def _ax_find_auxiliary_named_point(
+    names: tuple[str, ...],
+) -> tuple[bool, float, float, str]:
+    """只在非主窗口中找菜单/确认文字,避免误点聊天正文里的同名文本。"""
+    ok, app, error = _ax_application()
+    if not ok:
+        return False, 0, 0, error
+    ok, windows, error = _ax_attribute(app, "AXWindows")
+    if not ok:
+        return False, 0, 0, error
+
+    _ax, cf = _load_accessibility_libraries()
+    candidates: list[tuple[float, int]] = []
+    try:
+        count = max(0, int(cf.CFArrayGetCount(windows)))
+        for index in range(count):
+            window_ref = cf.CFArrayGetValueAtIndex(windows, index)
+            window = int(window_ref) if window_ref else 0
+            if not window:
+                continue
+            ok, frame, _error = _ax_frame(window)
+            if not ok:
+                continue
+            _x, _y, width, height = frame
+            candidates.append((width * height, window))
+        if len(candidates) < 2:
+            return False, 0, 0, f"界面中没有找到菜单项: {', '.join(names)}"
+
+        main_window = max(candidates)[1]
+        for _area, window in sorted(candidates):
+            if window == main_window:
+                continue
+            cf.CFRetain(window)
+            try:
+                point = _ax_find_named_point(window, set(names))
+            finally:
+                cf.CFRelease(window)
+            if point is not None:
+                return True, point[0], point[1], "ok"
+    finally:
+        cf.CFRelease(windows)
+    return False, 0, 0, f"界面中没有找到菜单项: {', '.join(names)}"
 
 
 def _focused_chat_input(
@@ -980,8 +1385,8 @@ def _dismiss_mention_picker() -> None:
     _run_applescript(script, timeout=10)
 
 
-def _type_mention(name: str) -> None:
-    """触发 @ 候选,确认唯一匹配后选中成员。"""
+def _type_mention(name: str) -> bool:
+    """触发 @ 候选,严格匹配时选中成员,否则降级为普通文本。"""
     # System Events 可稳定触发企微 CEF 的 @ 候选。Quartz 在服务宿主没有
     # 输入监控权限时会静默丢弃,正是普通文本此前“假成功”的同一根因。
     ok, err = _run_applescript(
@@ -1000,15 +1405,20 @@ def _type_mention(name: str) -> None:
     candidates = _mention_candidates()
     if candidates != [name]:
         shown = ", ".join(candidates[:8]) or "(无结果)"
-        raise LocalSendError(
-            f"@「{name}」匹配到 {len(candidates)} 个候选: {shown};"
-            "为避免误 @,未发送消息"
+        log.warning(
+            "@「%s」匹配到 %d 个候选: %s;降级为普通文本",
+            name,
+            len(candidates),
+            shown,
         )
+        _dismiss_mention_picker()
+        return False
 
     ok, err = _post_return_key(confirm_send=False)
     if not ok:
         raise LocalSendError(f"选择 @成员失败: {err}")
     time.sleep(0.4)
+    return True
 
 
 def _infer_mentions(content: str) -> list[str]:
@@ -1091,10 +1501,11 @@ def _type_rich_message(content: str, mentions: list[str] | None) -> tuple[bool, 
             if not ok:
                 raise LocalSendError(f"输入消息失败: {err}")
             mention_started = time.perf_counter()
-            _type_mention(name)
+            selected = _type_mention(name)
             log.info(
-                "本地消息 @ 候选并选择完成: name=%r elapsed=%.3fs",
+                "本地消息 @ 候选处理完成: name=%r selected=%s elapsed=%.3fs",
                 name,
+                selected,
                 time.perf_counter() - mention_started,
             )
             cursor = end
@@ -1418,7 +1829,7 @@ def send_message(
         return {"success": False, "error": "请指定 to 或 conv_rid"}
 
     conv = resolve_conversation_name(identifier, conv_rid)
-    if not conv or not conv.get("name"):
+    if not conv or (not conv.get("name") and conv_rid is None):
         if identifier:
             matches = list_conversations(identifier)
             return {
@@ -1427,7 +1838,7 @@ def send_message(
             }
         return {"success": False, "error": f"未找到 RID={conv_rid} 的对话"}
 
-    name = conv["name"]
+    name = _display_conversation_name(conv)
     skip = conv.get("skip", 0)
     open_method = "url_scheme" if conv_rid else "search"
     with ui_session("发消息"):
@@ -1538,7 +1949,7 @@ def send_image(image_path: str = "", conv_rid: int | None = None) -> dict:
         return {"success": False, "error": str(e)}
 
     conv = resolve_conversation_name("", conv_rid)
-    if not conv or not conv.get("name"):
+    if not conv:
         return {"success": False, "error": f"未找到 RID={conv_rid} 的对话"}
 
     with ui_session("发图片"):
@@ -1546,7 +1957,7 @@ def send_image(image_path: str = "", conv_rid: int | None = None) -> dict:
 
     return {
         "success": ok,
-        "conv_name": conv["name"],
+        "conv_name": _display_conversation_name(conv),
         "conv_rid": conv["rid"],
         "conv_lid": conv["lid"],
         "conv_type": conv["type"],
