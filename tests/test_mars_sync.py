@@ -505,12 +505,15 @@ def test_an_absent_payload_does_not_eat_an_image_slot(tree):
 def test_outbox_reuses_the_first_hook_when_media_resolution_changes(settings, monkeypatch):
     msg = {**_msg(7, 100, "[图片]"), "raw": b"tree"}
     calls = iter(["https://cdn.x/first.png", "https://cdn.x/later.png"])
-    monkeypatch.setattr(mars_sync, "to_hook", lambda _msg, _settings: {"message": next(calls)})
+    monkeypatch.setattr(
+        mars_sync, "to_hook",
+        lambda _msg, _settings: {"message": next(calls), "localId": 7},
+    )
 
     first = mars_sync.outbox_hook(msg, settings)
     second = mars_sync.outbox_hook(msg, settings)
 
-    assert first == second == {"message": "https://cdn.x/first.png"}
+    assert first == second == {"message": "https://cdn.x/first.png", "localId": 7}
     assert len(list(settings.mars_outbox_dir.rglob("*.json"))) == 1
     assert mars_sync.peek_outbox(msg, settings) == first
 
@@ -528,7 +531,18 @@ def test_old_outbox_normalizes_numeric_member_identity_fields(settings):
         "message": "frozen",
         "userid": "708781594",
         "corpid": "1970325276990586",
+        "localId": 7,
     }
+
+
+def test_old_outbox_backfills_the_local_id(settings):
+    """旧版本冻结的 hook 没有 localId;复用它会一直推 400(local_id cannot be null)。"""
+    msg = {**_msg(7, 100, "[图片]"), "raw": b"tree"}
+    path = mars_sync._outbox_path(msg, settings)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"message": "frozen"}), encoding="utf-8")
+
+    assert mars_sync.peek_outbox(msg, settings) == {"message": "frozen", "localId": 7}
 
 
 def test_old_outbox_rewrites_scientific_group_number(settings):

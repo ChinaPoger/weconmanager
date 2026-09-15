@@ -489,6 +489,11 @@ def peek_outbox(msg: dict, settings: Settings) -> dict | None:
         for field in ("userid", "corpid"):
             if field in hook:
                 hook[field] = str(hook[field] or "")
+        # localId 也是后加的身份字段:旧 outbox 冻结的那份没有它。补上不改变 mars 的
+        # checksum(群号+发送人+时间+正文),但缺了 mars 会当成 NULL 建行失败,
+        # 于是这个群永远卡在 "Column 'local_id' cannot be null"。
+        if not hook.get("localId"):
+            hook["localId"] = int(msg.get("lid") or 0)
         if "groupNumber" in hook:
             hook["groupNumber"] = normalize_group_number(hook.get("groupNumber"))
         if "senderNumber" in hook:
