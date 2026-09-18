@@ -321,6 +321,7 @@ action 名和 wecom-svr 的 HTTP 路由**同构**:带 `app.` 前缀的是自建�
 | `message.recall` | `POST /api/v1/message/recall` | **本人** |
 | `group.create` | `POST /api/v1/group/create` | **本人** |
 | `group.rename` | `POST /api/v1/group/rename` | **本人** |
+| `group.nickname` | `POST /api/v1/group/nickname` | **本人** |
 
 `payload` 就是对应接口的 body,原样透传。mars 不重新建模这些字段 —— 建了就会漂。
 

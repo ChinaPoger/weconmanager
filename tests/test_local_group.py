@@ -1574,3 +1574,140 @@ def test_nickname_endpoint_success(api, fake, monkeypatch):
     assert r.status_code == 200
     assert r.json()["nickname"] == "小王"
     assert r.json()["rid"] == 42
+
+
+# ─── 已有群改昵称 ──────────────────────────────────────────────────────
+
+@pytest.fixture
+def nickname_env(rename_env, monkeypatch):
+    """在 rename_env 上叠一层假的「群详情里改昵称」界面:点昵称行 → 写字段 → 回读核验。"""
+    state = {"wrote": None, "opened": False, "closed": False, "title": rename_env["names"][77]}
+
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: state["title"])
+    monkeypatch.setattr(local_group, "_open_group_info_panel",
+                        lambda **_: state.update(opened=True))
+    monkeypatch.setattr(local_group, "_close_group_info", lambda: state.update(closed=True))
+    # 点的必须是昵称行,不能落到会话标题上(那是改名)
+    monkeypatch.setattr(local_group, "_real_click", lambda x, y: None)
+    monkeypatch.setattr(local_group, "_ui_click", lambda x, y: None)
+    monkeypatch.setattr(local_group, "_write_focused_nickname",
+                        lambda name: state.update(wrote=name))
+    monkeypatch.setattr(local_group, "_front_window_mentions",
+                        lambda text: text == state["wrote"])
+    monkeypatch.setattr(local_group, "_focused_text_field", lambda: None)
+    monkeypatch.setattr(
+        local_group, "_probe_nickname_in_dialog",
+        lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0},
+    )
+    monkeypatch.setattr(local_group, "_nickname_dialog_field", lambda: None)
+
+    def scan():
+        if state["wrote"]:
+            return {"kind": "FIELD", "value": f"我在本群的昵称{state['wrote']}", "x": 1, "y": 1}
+        return {"kind": "ROW", "value": "我在本群的昵称", "x": 10, "y": 20}
+
+    monkeypatch.setattr(local_group, "_scan_nickname_ui", scan)
+    return state
+
+
+def test_set_nickname_opens_the_conversation_by_rid(nickname_env, monkeypatch):
+    """已有群走 RID:查本地库、打开会话,界面那一步交给 _set_nickname_locked。"""
+    captured = {}
+
+    def fake_set(rid, nickname, **kw):
+        captured.update(rid=rid, nickname=nickname, **kw)
+        return {"success": True, "rid": rid, "nickname": nickname}
+
+    monkeypatch.setattr(local_group, "_set_nickname_locked", fake_set)
+
+    r = local_group.set_nickname(77, "小王")
+
+    assert r["success"] is True
+    assert captured["rid"] == 77 and captured["nickname"] == "小王"
+    # 建群那条路是 already_open=True(窗口已经停在新群上);这条必须自己去开
+    assert captured.get("already_open", False) is False
+
+
+def test_set_nickname_refuses_when_the_open_conversation_is_not_the_target(nickname_env, monkeypatch):
+    """昵称不进本地库,写错了没有库可以核验 —— 开写之前先拿库里的群名认会话。"""
+    monkeypatch.setattr(
+        local_group.local_send,
+        "get_conversation_by_rid",
+        lambda rid: {"name": "陈挺、陈涛、任威风", "rid": rid, "lid": 1, "type": 1, "fw_id": 0},
+    )
+    nickname_env["title"] = "别人的群"
+    monkeypatch.setattr(
+        local_group, "_open_group_info_panel", lambda **_: pytest.fail("认错会话时不该打开群详情")
+    )
+
+    r = local_group.set_nickname(77, "小王")
+
+    assert r["success"] is False
+    assert r["unrelated"] is True
+    assert nickname_env["wrote"] is None
+
+
+def test_set_nickname_rejects_empty_and_overlong_nicknames(nickname_env):
+    for nickname in ("", "长" * (local_group.MAX_NAME_LEN + 1)):
+        r = local_group.set_nickname(77, nickname)
+        assert r["success"] is False, nickname
+        assert "群昵称" in r["error"]
+    assert nickname_env["wrote"] is None      # 参数不过关就别去动客户端
+
+
+def test_set_nickname_endpoint_success(api, nickname_env):
+    r = api.post("/api/v1/group/nickname", json={"conv_rid": 77, "nickname": "小王"})
+
+    assert r.status_code == 200
+    assert r.json()["success"] is True
+    assert r.json()["nickname"] == "小王"
+    assert nickname_env["wrote"] == "小王"
+    assert nickname_env["closed"] is True
+
+
+def test_set_nickname_endpoint_reports_unsupported_client_entry(api, nickname_env, monkeypatch):
+    """这个版本客户端没入口 —— 回 400 说清楚,而不是假装成功。"""
+    monkeypatch.setattr(
+        local_group, "_scan_nickname_ui", lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0}
+    )
+    monkeypatch.setattr(
+        local_group, "_probe_nickname_in_dialog", lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0}
+    )
+    monkeypatch.setattr(
+        local_group, "_probe_nickname_from_member_menu",
+        lambda: {"kind": "NONE", "value": "", "x": 0, "y": 0},
+    )
+
+    r = api.post("/api/v1/group/nickname", json={"conv_rid": 77, "nickname": "小王"})
+
+    assert r.status_code == 400
+    assert r.json()["success"] is False
+    assert "没有暴露" in r.json()["error"]
+
+
+def test_set_nickname_endpoint_rejects_blank_nickname(api, nickname_env):
+    r = api.post("/api/v1/group/nickname", json={"conv_rid": 77, "nickname": ""})
+    assert r.status_code == 400
+    assert r.json()["success"] is False
+    assert nickname_env["wrote"] is None
+
+
+def test_set_nickname_accepts_old_client_title_probe(nickname_env, monkeypatch):
+    """旧版没有可读 AX 标题 —— 认会话走「点标题读当前名字」的兼容路径,别把好群拦下。"""
+    monkeypatch.setattr(
+        local_group.local_send,
+        "get_conversation_by_rid",
+        lambda rid: {"name": "陈挺、陈涛、任威风", "rid": rid, "lid": 1, "type": 1, "fw_id": 0},
+    )
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: None)
+    monkeypatch.setattr(
+        local_group, "_open_edit_box_and_read_current", lambda: "陈挺、陈涛、任威风"
+    )
+    cancelled = []
+    monkeypatch.setattr(local_group, "_cancel_edit_box", lambda: cancelled.append(True))
+
+    r = local_group.set_nickname(77, "小王")
+
+    assert r["success"] is True
+    assert nickname_env["wrote"] == "小王"
+    assert cancelled == [True]      # 读标题留下的输入框必须退掉,否则会接管后面的输入
