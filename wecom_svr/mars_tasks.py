@@ -46,6 +46,7 @@ from .schemas import (
     LocalRecallTaskRequest,
     LocalRenameGroupRequest,
     LocalSendRequest,
+    LocalSetNicknameRequest,
     SendMessageRequest,
 )
 from .settings import Settings, get_settings
@@ -174,6 +175,10 @@ async def _rename_local_group(req: LocalRenameGroupRequest) -> dict:
     return await asyncio.to_thread(local_group.rename_group, req.conv_rid, req.name)
 
 
+async def _set_local_nickname(req: LocalSetNicknameRequest) -> dict:
+    return await asyncio.to_thread(local_group.set_nickname, req.conv_rid, req.nickname)
+
+
 async def _recall_local_message(req: LocalRecallTaskRequest) -> dict:
     return await asyncio.to_thread(local_send.recall_message, req.conv_rid, req.lid)
 
@@ -198,6 +203,7 @@ ACTIONS: dict[str, Action] = {
     "message.recall": Action(LocalRecallTaskRequest, _recall_local_message, True),
     "group.create": Action(LocalCreateGroupRequest, _create_local_group, True),
     "group.rename": Action(LocalRenameGroupRequest, _rename_local_group, True),
+    "group.nickname": Action(LocalSetNicknameRequest, _set_local_nickname, True),
 }
 
 

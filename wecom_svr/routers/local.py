@@ -20,6 +20,7 @@ from ..schemas import (
     LocalRenameGroupRequest,
     LocalSendRequest,
     LocalSendResponse,
+    LocalSetNicknameRequest,
     OpenConversationRequest,
 )
 from ..security import require_token
@@ -147,6 +148,21 @@ def rename_local_group(req: LocalRenameGroupRequest, _: None = Depends(require_t
     不会因为「脚本没报错」就当成功。
     """
     result = local_group.rename_group(req.conv_rid, req.name)
+    return _result_response(result)
+
+
+@router.post(
+    "/group/nickname",
+    summary="以本人身份改我在群里的昵称(操控客户端)",
+    response_model=LocalSendResponse,
+)
+def set_local_nickname(req: LocalSetNicknameRequest, _: None = Depends(require_token)):
+    """官方 API 没有「改群内昵称」这个能力,只能走客户端群详情。
+
+    昵称不进本地库,没法像改群名那样事后核验,所以先把当前打开的会话和 RID
+    对清楚;对不上就一个字都不改(返回 400)。
+    """
+    result = local_group.set_nickname(req.conv_rid, req.nickname)
     return _result_response(result)
 
 

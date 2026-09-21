@@ -6,15 +6,16 @@
     wecom-svr-local --rid 3395103030 --open-only
     wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组" --group-nickname "小王"
     wecom-svr-local --rid 3395103030 --rename "客户群-新名字"       # 改群名
+    wecom-svr-local --rid 3395103030 --nickname "小王"              # 改我在本群的昵称
 
-拉群/改名和 HTTP 那两个端点走的是同一个 local_group,行为完全一致(包括选人前
-逐个核对、改完回库核验)。CLI 这条路存在的意义是: 不用先起服务、也不用配 token。
+拉群/改名/改昵称和 HTTP 那几个端点走的是同一个 local_group,行为完全一致(包括
+选人前逐个核对、改完回库核验)。CLI 这条路存在的意义是: 不用先起服务、也不用配 token。
 """
 import argparse
 import json
 import sys
 
-from .local_group import create_group, rename_group
+from .local_group import create_group, rename_group, set_nickname
 from .local_send import (
     LocalSendError,
     list_conversations,
@@ -69,7 +70,7 @@ def _finish(result: dict, as_json: bool, ok_msg: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="企业微信本地操作(以本人身份):发消息 / 发图 / 查会话 / 拉群 / 改群名")
+        description="企业微信本地操作(以本人身份):发消息 / 发图 / 查会话 / 拉群 / 改群名 / 改群昵称")
     ap.add_argument("--name", "-n", help="按名称查找会话")
     ap.add_argument("--rid", "-r", type=int, help="按 RID 查找会话")
     ap.add_argument("--search", "-s", help="搜索会话列表")
@@ -82,6 +83,8 @@ def main() -> None:
     ap.add_argument("--group-nickname", help="拉群时顺便改我在本群的昵称(可选)")
     ap.add_argument("--rename", metavar="新群名",
                     help="给一个已有的群改名(必须配合 --rid)")
+    ap.add_argument("--nickname", metavar="新昵称",
+                    help="改我在一个已有群里的昵称(必须配合 --rid)")
     ap.add_argument("--json", "-j", action="store_true", help="JSON 输出")
     ap.add_argument("content", nargs="?", help="消息内容 (配合 --name 或 --rid)")
     a = ap.parse_args()
@@ -100,6 +103,13 @@ def main() -> None:
                 sys.exit("❌ --rename 需要配合 --rid 指定改哪个群")
             _finish(rename_group(a.rid, a.rename), a.json,
                     "✅ 已改名「{name}」(RID={rid},原名「{old_name}」)")
+            return
+
+        if a.nickname:
+            if not a.rid:
+                sys.exit("❌ --nickname 需要配合 --rid 指定改哪个群")
+            _finish(set_nickname(a.rid, a.nickname), a.json,
+                    "✅ 已改昵称「{nickname}」(RID={rid})")
             return
 
         if a.open_only:

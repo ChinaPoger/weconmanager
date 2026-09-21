@@ -136,3 +136,31 @@ def test_sending_a_message_still_works(run, monkeypatch):
     code, out = run("--rid", "3395103030", "测试")
     assert code == 0
     assert "测试群" in out
+
+
+def test_nickname_needs_a_rid(run, monkeypatch):
+    called = []
+    monkeypatch.setattr(cli, "set_nickname", lambda *a: called.append(a))
+    code, out = run("--nickname", "小王")
+    assert code == 1
+    assert called == []                      # 不知道改哪个群就别去动客户端
+    assert "--rid" in out
+
+
+def test_nickname_passes_rid_and_nickname(run, monkeypatch):
+    monkeypatch.setattr(cli, "set_nickname", lambda rid, nickname: {
+        "success": True, "rid": rid, "nickname": nickname,
+    })
+    code, out = run("--rid", "77", "--nickname", "小王")
+    assert code == 0
+    assert "小王" in out and "77" in out
+
+
+def test_nickname_failure_exits_nonzero(run, monkeypatch):
+    monkeypatch.setattr(cli, "set_nickname", lambda rid, nickname: {
+        "success": False,
+        "error": "当前企业微信版本的内部群没有暴露「修改群昵称」入口",
+    })
+    code, out = run("--rid", "77", "--nickname", "小王")
+    assert code == 1
+    assert "没有暴露" in out

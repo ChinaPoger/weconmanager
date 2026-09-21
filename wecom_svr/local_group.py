@@ -2680,3 +2680,24 @@ def rename_group(rid: int, name: str) -> dict:
 
     with ui_session("改群名"):
         return _rename_locked(rid, new_name)
+
+
+def set_nickname(rid: int, nickname: str) -> dict:
+    """给一个已有的群改「我在本群的昵称」—— 打开会话 → 打开群详情 → 覆写 → 回读核验。
+
+    官方 API(含 `appchat/update`)没有改群内昵称的能力,只能走客户端。昵称不进
+    本地会话库,**写错了没有库可以核验**,所以开写之前先用库里的群名认会话:
+    当前打开的那个会话标题必须就是 RID 对应的群,认不出来一个字都不改。
+    """
+    ensure_macos()
+    try:
+        new_nickname = _check_name(nickname, "群昵称")
+    except LocalGroupError as e:
+        return {"success": False, "error": str(e)}
+
+    conv = local_send.get_conversation_by_rid(int(rid)) or {}
+    # 库里还没落名字(刚建的群)时不给 expect_title:空字符串会把标题核对变成
+    # 「标题必须为空」,那是必然失败,不是保护。
+    expect_title = (conv.get("name") or "").strip() or None
+    with ui_session("改群昵称"):
+        return _set_nickname_locked(int(rid), new_nickname, expect_title=expect_title)

@@ -193,6 +193,7 @@ curl ... -H 'Authorization: Bearer <token>'
 - `GET  /api/v1/busy` —— 客户端界面正被哪个操作占着(UI 锁的状态)
 - `POST /api/v1/group/create` —— 本人身份拉群(操控客户端,能拉外部/微信)
 - `POST /api/v1/group/rename` —— 本人身份改群名(官方 API 改不了的群只能走这条)
+- `POST /api/v1/group/nickname` —— 本人身份改我在本群的昵称(官方 API 没有这个能力)
 - `POST /api/v1/app/group/create` —— 应用身份拉群(官方 appchat,**仅限本企业成员**)
 - `POST /api/v1/app/group/members/search` —— 按名字搜通讯录候选(建群前用来挑人)
 - `POST /api/v1/app/group/members/resolve` —— 干跑:只看名字解析成谁,不建群
@@ -303,6 +304,10 @@ wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组" --group-n
 不同企业微信版本、群类型暴露的入口不同;如果当前内部群没有「修改群昵称」菜单,接口会保留已建好的群,
 并在 `nickname_error` 里明确说明未设置成功,不会误改个人资料或发送聊天消息。昵称不进本地会话库,
 核验只能回读编辑窗口。
+
+同样的入口也对已有的群开放:`POST /api/v1/group/nickname`(`conv_rid` + `nickname`,CLI 是
+`--rid --nickname`)。昵称写错了没有库可以事后核验,所以它开写之前先把当前打开的会话和
+本地库里的群名对清楚,对不上一个字都不改(回 400 并标记 `unrelated`)。
 
 改名/改昵称失败都不回滚群 —— 群已经建出来了,回滚更吓人,接口会在 `name_error` /
 `nickname_error` 里说清楚让你手动改。改过群名之后再改昵称,核验用的是**现在的标题**,
@@ -644,7 +649,7 @@ pending,直到 `MARS_IMAGE_WAIT` 超时才推占位符。
 沿用原 `api_server.py` 的语义,而非 FastAPI 默认的 422:
 
 - 本人身份那几条(`message/send`、`conversations`、
-  `conversation/open`、`busy`、`group/create`、`group/rename`)
+  `conversation/open`、`busy`、`group/create`、`group/rename`、`group/nickname`)
   → `{"success": false, "error": "..."}`
 - 其它 → `{"errcode": -1, "errmsg": "..."}`
 
@@ -753,9 +758,10 @@ wecom-svr-local --rid 3395103030 "测试"
 wecom-svr-local --rid 3395103030 --image /tmp/a.png
 wecom-svr-local --rid 3395103030 --open-only
 
-# 拉群 / 改群名:和 /api/v1/group/* 是同一套代码,只是不用先起服务
+# 拉群 / 改群名 / 改群昵称:和 /api/v1/group/* 是同一套代码,只是不用先起服务
 wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组" --group-nickname "小王"
 wecom-svr-local --rid 3395103030 --rename "客户群-新名字"
+wecom-svr-local --rid 3395103030 --nickname "小王"
 ```
 
 ## 测试与覆盖率

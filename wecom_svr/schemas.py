@@ -175,6 +175,22 @@ class LocalRenameGroupRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=MAX_NAME_LEN, description="新群名")
 
 
+class LocalSetNicknameRequest(BaseModel):
+    """改我在一个已有群里的昵称(操控客户端)。
+
+    官方 API(含 `appchat/update`)没有改群内昵称的能力,只能走客户端群详情。
+    """
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {"conv_rid": 3395103030, "nickname": "小王"}
+    })
+
+    conv_rid: int = Field(..., description="群会话 RID(见 /local/conversations)")
+    nickname: str = Field(
+        ..., min_length=1, max_length=MAX_NAME_LEN, description="我在本群的新昵称"
+    )
+
+
 class ContactSearchRequest(BaseModel):
     keyword: str = Field(..., min_length=1)
     department_id: int = 1

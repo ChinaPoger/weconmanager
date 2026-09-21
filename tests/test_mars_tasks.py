@@ -568,3 +568,19 @@ def test_unconfigured_run_is_a_400(monkeypatch):
         resp = c.post("/api/v1/mars/tasks/run", json={"wait": 0})
     assert resp.status_code == 400
     assert "WECOM_SVR_MARS_TASKS_TOKEN" in resp.json()["errmsg"]
+
+
+def test_group_nickname_action_dispatches_to_local_group(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        mars_tasks.local_group,
+        "set_nickname",
+        lambda rid, nickname: calls.append((rid, nickname)) or {"success": True},
+    )
+    result = asyncio.run(mars_tasks._set_local_nickname(
+        mars_tasks.LocalSetNicknameRequest(conv_rid=3395103030, nickname="小王")
+    ))
+    assert calls == [(3395103030, "小王")]
+    assert result["success"] is True
+    # 改昵称要独占客户端界面,代价和 group.rename 一档
+    assert mars_tasks.ACTIONS["group.nickname"].needs_ui is True
