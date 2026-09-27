@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from types import ModuleType
 
 from . import media, wal
-from .localdb import NOT_SYNCED, LocalDataError, int_id
+from .localdb import NOT_SYNCED, LocalDataError, int_id, open_db
 from .settings import get_agent_home
 
 log = logging.getLogger(__name__)
@@ -286,9 +286,7 @@ def _info_db_path() -> str:
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(_info_db_path())
-    conn.row_factory = sqlite3.Row
-    return conn
+    return open_db(_info_db_path())
 
 
 def _rows(sql: str, params: tuple | list = ()) -> list[sqlite3.Row]:
@@ -333,7 +331,7 @@ def _load_senders() -> dict[int, dict]:
         return _senders_cache[1]
 
     try:
-        conn = sqlite3.connect(path)
+        conn = open_db(path)
         try:
             try:
                 rows = conn.execute(
@@ -356,7 +354,7 @@ def _load_senders() -> dict[int, dict]:
 
     senders = {}
     for r in rows:
-        senders[int_id(r[0])] = {
+        senders[r[0]] = {
             "name": r[1] or "",
             "userid": r[2] or "",
             "corpid": (r[3] if has_corpid else "") or "",
@@ -736,7 +734,7 @@ def group_profile(rid: int) -> dict:
         return {"rid": rid, "name": "", "sort_time": 0}
     r = rows[0]
     return {
-        "rid": int_id(r["RID"]),
+        "rid": r["RID"],
         "name": r["name"] or "",
         "sort_time": int(r["sort_time"] or 0),
     }
@@ -787,7 +785,7 @@ def list_groups(
         sql += " LIMIT ?"
         params += (int(limit),)
     return [
-        {"rid": int_id(r["RID"]), "name": r["name"] or "", "sort_time": r["sort_time"]}
+        {"rid": r["RID"], "name": r["name"] or "", "sort_time": r["sort_time"]}
         for r in _rows(sql, params)
     ]
 
@@ -831,7 +829,7 @@ def latest_cursor(rid: int | None = None) -> Cursor:
     rows = _rows(sql, params)
     if not rows:
         return Cursor()
-    return Cursor(int(rows[0]["send_time"] or 0), int_id(rows[0]["LID"]))
+    return Cursor(int(rows[0]["send_time"] or 0), rows[0]["LID"])
 
 
 MAX_GROUPS_PER_QUERY = 400  # sqlite 默认 compound SELECT 上限是 500
@@ -910,8 +908,8 @@ def fetch_since(
     scan_end: dict[int, Cursor] = {}
     scan_counts: dict[int, int] = {}
     for r in rows:
-        rid = int_id(r["conv_id"])
-        scan_end[rid] = Cursor(int(r["send_time"] or 0), int_id(r["LID"]))
+        rid = r["conv_id"]
+        scan_end[rid] = Cursor(int(r["send_time"] or 0), r["LID"])
         scan_counts[rid] = scan_counts.get(rid, 0) + 1
         ctype = r["content_type"]
         rich_image = _rich_image_text(ctype, r["content"])
@@ -938,14 +936,14 @@ def fetch_since(
         if skipped and not include_skipped:
             continue
 
-        sender = senders.get(int_id(r["sender_id"]), {})
+        sender = senders.get(r["sender_id"], {})
         out.append({
-            "lid": int_id(r["LID"]),
+            "lid": r["LID"],
             "rid": rid,
             "group_name": r["conv_name"] or "",
             "send_time": int(r["send_time"] or 0),
             "time": v.export.fmt_time(r["send_time"] or 0),
-            "sender_id": int_id(r["sender_id"]),
+            "sender_id": r["sender_id"],
             "sender_name": sender.get("name") or v.export.resolve_sender(r["sender_id"], names),
             "sender_userid": sender.get("userid", ""),
             "sender_corpid": sender.get("corpid", ""),
@@ -983,4 +981,4 @@ def count_since(cursors: dict[int, Cursor]) -> dict[int, int]:
         f"SELECT conv_id, COUNT(*) AS n FROM MESSAGE WHERE {' OR '.join(clauses)} GROUP BY conv_id",
         params,
     )
-    return {int_id(r["conv_id"]): int(r["n"]) for r in rows}
+    return {r["conv_id"]: int(r["n"]) for r in rows}

@@ -7,6 +7,7 @@
 错误类型定义在这里而不是 local_send,是为了让「查人」也能复用同一套
 HTTP 映射(LocalSendError→400,LocalDataError→503),又不产生循环 import。
 """
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -22,12 +23,10 @@ NOT_SYNCED = (
 
 
 def parse_id(value: object) -> int | None:
-    """sqlite / JSON 里的身份列(RID、LID、sender_id)→ int,认不出来返回 None。
+    """身份列(RID、LID、sender_id)的值 → int,认不出来返回 None。
 
-    sqlite 列一旦是 REAL,Python 拿到的就是 float;再 `f"{rid}"` 就会变成
-    `1.09e+16` 这种科学计数法,推给 mars 的群号跟着脏掉。凡是从库里取身份
-    列的地方都该过这一道,所以放在连接层 —— directory 和 messages 都能用,
-    不产生循环 import。
+    从库里读出来的行已经由 id_row 收敛过;这个函数留给库外来的值 —— 调用方
+    传进来的参数、JSON 状态文件、请求体。
     """
     if value is None:
         return None
@@ -56,6 +55,32 @@ def int_id(value: object, default: int = 0) -> int:
     return default if n is None else n
 
 
+# 企微库里的身份列。列的声明类型不可靠,17 位的值有时落成 REAL
+_ID_COLUMNS = frozenset({"rid", "lid", "conv_id", "sender_id", "creater_id"})
+
+
+def id_row(cursor: sqlite3.Cursor, row: tuple) -> sqlite3.Row:
+    """row_factory:身份列读出来是 float 就收成 int,其余原样,返回 sqlite3.Row。
+
+    sqlite 列一旦是 REAL,Python 拿到的就是 float;再 `f"{rid}"` 就会变成
+    `1.09e+16` 这种科学计数法,推给 mars 的群号跟着脏掉。在连接上统一收敛,
+    新写的查询就不用记着逐个调用 parse_id。
+    """
+    if any(isinstance(v, float) for v in row):
+        row = tuple(
+            int(v) if isinstance(v, float) and d[0].lower() in _ID_COLUMNS else v
+            for d, v in zip(cursor.description, row, strict=True)
+        )
+    return sqlite3.Row(cursor, row)
+
+
+def open_db(path: str | os.PathLike) -> sqlite3.Connection:
+    """打开一个企微库,身份列统一收成 int(见 id_row)。"""
+    conn = sqlite3.connect(path)
+    conn.row_factory = id_row
+    return conn
+
+
 class LocalSendError(RuntimeError):
     """本地数据/客户端操作的可预期错误(向客户端回报文案,不是 500)。"""
 
@@ -73,7 +98,7 @@ def connect(name: str) -> sqlite3.Connection:
             f"未找到解密后的 {name}(查找目录 {decrypt_dir})。"
             "请先运行 wecom-agent 的 decrypt/macos/read_wecom.py"
         )
-    return sqlite3.connect(db)
+    return open_db(db)
 
 
 _batch = threading.local()

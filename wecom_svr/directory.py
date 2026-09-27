@@ -168,7 +168,6 @@ def self_vid_or_none() -> str | None:
         vid = get_self().get("vid")
     except LocalSendError:
         return None
-    # USER.RID 可能是 REAL:直接 str() 会写出 `1.09e+16`,而这个值会变成每条
-    # hook 的 robot 和每份群信息的 source。必须过 parse_id。
+    # 库里读出来的已经是 int(见 localdb.id_row);parse_id 兜的是空串 / None
     n = parse_id(vid)
     return None if n is None else format(n, "d")

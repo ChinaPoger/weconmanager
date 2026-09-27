@@ -25,6 +25,7 @@ AXTextField,直接写值并 AXConfirm;旧版找不到该控件时才回退到坐
 """
 import logging
 import re
+import sqlite3
 import subprocess
 import time
 from typing import NoReturn
@@ -135,10 +136,15 @@ def _without_self(members: list[str]) -> list[str]:
 
 # ─── AppleScript ───────────────────────────────────────────────────────
 
-# 主窗口按「面积最大」挑,不按名字 —— 客户端语言会变(实测英文版叫 "WeCom")
-_MAIN_WINDOW = '''
+def _main_window(each_window: str = "") -> str:
+    """挑主窗口的 AppleScript 前缀;``each_window`` 插进同一圈遍历里,复用读到的 sz。
+
+    主窗口按「面积最大」挑,不按名字 —— 客户端语言会变(实测英文版叫 "WeCom")。
+    """
+    return '''
   set mainWin to missing value
   set bestArea to -1
+  set small to ""
   repeat with w in windows
     set sz to size of w
     set a to (item 1 of sz) * (item 2 of sz)
@@ -146,9 +152,24 @@ _MAIN_WINDOW = '''
       set bestArea to a
       set mainWin to contents of w
     end if
+''' + each_window + '''
   end repeat
   if mainWin is missing value then error "找不到企业微信主窗口"
 '''
+
+
+_MAIN_WINDOW = _main_window()
+
+# 同一圈里顺手把小到可能是菜单的窗口记进 small(";左,上,宽,高" 逐个拼接)
+_MAIN_WINDOW_AND_SMALL = _main_window('''
+    set sw to item 1 of sz
+    set shh to item 2 of sz
+    if sw < 500 and shh < 400 then
+      set wp to position of w
+      set small to small & ";" & ((item 1 of wp) as text) & "," & ((item 2 of wp) as text) & ¬
+        "," & (sw as text) & "," & (shh as text)
+    end if
+''')
 
 # 选人面板定位。frontmost 只在打开面板时做一次:每次搜人/读计数都 delay 0.3
 # 的话,3 个人就要白付一两秒,而且 keystroke 仍然可能落到别的应用上。
@@ -289,21 +310,10 @@ def _ui_state(with_windows: bool = True) -> tuple[int, list[Menu]]:
     交给 _new_menu,靠「点完才出现」和「就贴在 + 底下」两个条件。
 
     三件事一次脚本问完:每个 AX 属性都是一次跨进程调用,而这个函数是在轮询里跑的。
-    只关心面板的调用方传 ``with_windows=False``,省掉逐个窗口读尺寸那一圈。
+    小窗口在挑主窗口那一圈里顺手记下;只关心面板的调用方传 ``with_windows=False``,
+    连每个小窗口的 position 也省了。
     """
-    window_scan = '''
-  repeat with w in windows
-    set sz to size of w
-    set sw to item 1 of sz
-    set shh to item 2 of sz
-    if sw < 500 and shh < 400 then
-      set wp to position of w
-      set acc to acc & ";" & ((item 1 of wp) as text) & "," & ((item 2 of wp) as text) & ¬
-        "," & (sw as text) & "," & (shh as text)
-    end if
-  end repeat
-''' if with_windows else ""
-    out = _osa(_MAIN_WINDOW + '''
+    out = _osa((_MAIN_WINDOW_AND_SMALL if with_windows else _MAIN_WINDOW) + '''
   -- UI_STATE
   set code to "0"
   if (count of sheets of mainWin) > 0 then
@@ -315,20 +325,22 @@ def _ui_state(with_windows: bool = True) -> tuple[int, list[Menu]]:
       set code to "2"
     end try
   end if
-  set acc to code
-''' + window_scan + '''
-  return acc
+  return code & small
 ''')
-    parts = out.strip().strip('"').split(";")
-    code = parts[0].strip()
+    code, *chunks = out.strip().strip('"').split(";")
+    code = code.strip()
+    return (int(code) if code in ("0", "1", "2") else _SHEET_NONE), _parse_windows(chunks)
+
+
+def _parse_windows(chunks: list[str]) -> list[Menu]:
     windows: list[Menu] = []
-    for chunk in parts[1:]:
+    for chunk in chunks:
         try:
             left, top, width, height = (int(v) for v in chunk.split(","))
         except ValueError:
             continue
         windows.append((left, top, width, height))
-    return (int(code) if code in ("0", "1", "2") else _SHEET_NONE), windows
+    return windows
 
 
 def _sheet_state() -> int:
@@ -365,20 +377,8 @@ def _new_menu(before: list[Menu], now: list[Menu], anchor: tuple[int, int] | Non
     return None
 
 
-def _plus_point() -> tuple[int, int, int, int] | None:
-    """从 AX 树里读 "+" 的屏幕中心点,外加它相对主窗口左上角的偏移。
-
-    5.0.10 的客户端把 "+" 暴露成了真 AXButton,位置能直接读出来 —— 比按窗口偏移猜
-    结实得多:会话列表那一列的宽度可以拖,拖一下写死的偏移就跟着废(AX 树里能看到
-    那根 splitter)。实测偏移已经漂到 334,记住的还是 275,连 ±40 的试探都够不着;
-    是拖出来的还是新版本改了搜索框宽度没查,反正这个位置本来就不该靠猜。
-
-    只借它的坐标,点还是发真鼠标:AXPress 实测对它无效,CEF 自绘的控件收不到。
-
-    按几何认人而不是按标题/help,是因为客户端语言会变:搜索框是这一行最靠左的
-    text field,"+" 是它右边同一行里最靠左的那个按钮。读不到返回 None,回退到坐标试探。
-    """
-    out = _osa(_MAIN_WINDOW + '''
+# 读 "+" 位置的脚本片段(接在 _MAIN_WINDOW 后面),结果留在 answer 里,见 _plus_point
+_PLUS_POINT = '''
   -- PLUS_POINT
   set answer to ""
   try
@@ -428,8 +428,33 @@ def _plus_point() -> tuple[int, int, int, int] | None:
   on error em
     set answer to "ERR " & em
   end try
-  return answer
-''')
+'''
+
+
+def _plus_point() -> tuple[int, int, int, int] | None:
+    """从 AX 树里读 "+" 的屏幕中心点,外加它相对主窗口左上角的偏移。
+
+    5.0.10 的客户端把 "+" 暴露成了真 AXButton,位置能直接读出来 —— 比按窗口偏移猜
+    结实得多:会话列表那一列的宽度可以拖,拖一下写死的偏移就跟着废(AX 树里能看到
+    那根 splitter)。实测偏移已经漂到 334,记住的还是 275,连 ±40 的试探都够不着;
+    是拖出来的还是新版本改了搜索框宽度没查,反正这个位置本来就不该靠猜。
+
+    只借它的坐标,点还是发真鼠标:AXPress 实测对它无效,CEF 自绘的控件收不到。
+
+    按几何认人而不是按标题/help,是因为客户端语言会变:搜索框是这一行最靠左的
+    text field,"+" 是它右边同一行里最靠左的那个按钮。读不到返回 None,回退到坐标试探。
+    """
+    return _parse_plus(_osa(_MAIN_WINDOW + _PLUS_POINT + "  return answer\n"))
+
+
+def _plus_point_and_windows() -> tuple[tuple[int, int, int, int] | None, list[Menu]]:
+    """(_plus_point, 当前的小窗口) 一次脚本问完 —— 点 "+" 之前两样都要。"""
+    out = _osa(_MAIN_WINDOW_AND_SMALL + _PLUS_POINT + "  return answer & small\n")
+    plus, *chunks = out.strip().strip('"').split(";")
+    return _parse_plus(plus), _parse_windows(chunks)
+
+
+def _parse_plus(out: str) -> tuple[int, int, int, int] | None:
     try:
         x, y, dx, dy = (int(v) for v in out.strip().strip('"').split(","))
     except ValueError:
@@ -600,31 +625,40 @@ def _dismiss_group_menus() -> None:
 def _open_picker() -> None:
     """点会话列表顶部的 "+" 打开「发起群聊」面板,并确认它真的开了。
 
-    优先从 AX 树里读 "+" 的真实坐标(见 _plus_point);读不到才按候选偏移试探
-    (见 ui_offsets.py),试中了记下来,下次第一发就命中。AX 这条路走通时也会把
-    换算出来的偏移记下来,好让坐标兜底那条路不至于停在几个版本前的布局上。
+    AX 树里读得到 "+"(见 _plus_point)就只信它:点了没反应先重读一次(窗口可能
+    刚被挪过),还不行直接报错 —— AX 说 "+" 在这儿,再拿猜出来的偏移去会话列表里
+    点就是盲点。读不到 AX(老版本客户端)才按候选偏移试探(见 ui_offsets.py)。
+
+    两条路走通都会把偏移记下来:坐标兜底要用,启动预检也拿「记过偏移」当
+    「这台机器校准过」,免得每次启动都弹一次面板。
 
     已有面板会先自动取消,避免上一次异常中断把后续操作永久卡住。
     """
-    state, before = _ui_state()
-    if state != _SHEET_NONE:
+    if _sheet_state() != _SHEET_NONE:
         log.warning("打开「发起群聊」前发现残留面板,正在自动关闭")
         _recover_open_sheet()
     _dismiss_group_menus()
-    before = _ui_state()[1]
+    found, before = _plus_point_and_windows()
     if before:
         # 不是错误: 人家自己弹出来的独立会话窗口就长这样。记一行是因为上一次异常
         # 留下的残留菜单也长这样,而它会让这一轮怎么点都开不出面板。
         log.info("点 \"+\" 前客户端上已经有小窗口 %s,它们不会被当成菜单", before)
 
-    if (found := _plus_point()) is not None:
-        x, y, dx, dy = found
-        _ui_click(x, y)
-        if _after_plus(SHEET_TIMEOUT, f"AX 读到的位置 {(x, y)}", before, (x, y)):
-            ui_offsets.remember("plus", (dx, dy))
-            _focus_picker()
-            return
-        log.warning("AX 里读到的 \"+\" 位置 %s 点下去没反应,回退到坐标试探", (x, y))
+    if found is not None:
+        clicked: list[tuple[int, int]] = []
+        while found is not None and len(clicked) < 2:
+            x, y, dx, dy = found
+            clicked.append((x, y))
+            _ui_click(x, y)
+            if _after_plus(SHEET_TIMEOUT, f"AX 读到的位置 {(x, y)}", before, (x, y)):
+                ui_offsets.remember("plus", (dx, dy))
+                _focus_picker()
+                return
+            found = _plus_point()
+        raise LocalGroupError(
+            f"AX 里读到了 \"+\",但点下去「发起群聊」面板没出现(点过的屏幕坐标: {clicked})。"
+            "常见原因: 终端没拿到「辅助功能」授权,或者有别的窗口盖住了 \"+\"。"
+        )
 
     tried: list[tuple[int, int]] = []
     for i, (dx, dy) in enumerate(ui_offsets.candidates("plus")):
@@ -2565,6 +2599,24 @@ def _title_matches_expectation(
     return True
 
 
+def _has_outside_members(rid: int | None) -> bool:
+    """本地库看得出群里有和我不同企业的人(外部联系人 / 微信用户)就 True。
+
+    只用来给「没找到昵称入口」挑报错: 内部群在有些版本上本来就没有这个入口,
+    含外部成员的群还找不到,才说明客户端界面变了。库里读不出来按内部群报。
+    """
+    if rid is None:
+        return False
+    try:
+        members = messages.group_members(int(rid))
+        me = directory.self_vid_or_none()
+    except (LocalSendError, sqlite3.Error) as e:
+        log.info("读不到 RID=%s 的成员,昵称入口报错按内部群给: %s", rid, e)
+        return False
+    my_corp = next((m["corpid"] for m in members if m["member_id"] == me), "")
+    return bool(my_corp) and any(m["corpid"] != my_corp for m in members)
+
+
 def _set_nickname_locked(
     rid: int | None,
     nickname: str,
@@ -2622,14 +2674,17 @@ def _set_nickname_locked(
         if found["kind"] == "NONE":
             found = _probe_nickname_from_member_menu()
         if found["kind"] == "NONE":
-            return {
-                "success": False,
-                "rid": rid,
-                "error": (
+            if _has_outside_members(rid):
+                error = (
+                    "群里有外部成员,但群详情和本人群成员菜单都没找到「修改群昵称」入口"
+                    " —— 客户端界面很可能改了, 群已保留但昵称未设置"
+                )
+            else:
+                error = (
                     "当前企业微信版本的内部群没有暴露「修改群昵称」入口"
                     "(群详情和本人群成员菜单都未找到), 群已保留但昵称未设置"
-                ),
-            }
+                )
+            return {"success": False, "rid": rid, "error": error}
         if found["kind"] == "ROW" and _nickname_dialog_field() is None:
             _ui_click(int(found["x"]), int(found["y"]))
             _await_nickname_dialog(timeout=1.2)

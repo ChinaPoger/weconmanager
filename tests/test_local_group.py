@@ -497,14 +497,18 @@ class AXPlus(FakeClient):
         self.ui_clicks: list[tuple[int, int]] = []
 
     def __call__(self, script, timeout=15):
+        # 前缀里带了小窗口扫描(_MAIN_WINDOW_AND_SMALL)才在头一段后面拼窗口列表
+        small = [w for w in (self.stray, self.MENU if self.menu_open else None) if w]
+        scans = "set small to small &" in script
+        windows = [",".join(str(v) for v in w) for w in small] if scans else []
         if "PLUS_POINT" in script:
             self.scripts.append(script)
-            return True, "{},{},{},{}".format(*self.PLUS_SCREEN, *self.PLUS_OFFSET)
+            plus = "{},{},{},{}".format(*self.PLUS_SCREEN, *self.PLUS_OFFSET)
+            return True, ";".join([plus, *windows])
         if "UI_STATE" in script:       # _PICKER 里也有「count of sheets」,认标记别认它
             self.scripts.append(script)
-            small = [w for w in (self.stray, self.MENU if self.menu_open else None) if w]
             code = "1" if self.sheet_open else "0"
-            return True, ";".join([code] + [",".join(str(v) for v in w) for w in small])
+            return True, ";".join([code, *windows])
         return super().__call__(script, timeout)
 
     def click(self, x: int, y: int) -> None:
@@ -567,34 +571,23 @@ def test_a_menu_that_leads_nowhere_stops_instead_of_hunting(monkeypatch):
     assert len(client.ui_clicks) == 2      # "+" 一下,第一项一下,到此为止
 
 
-class NothingWorks(AXPlus):
-    """连坐标试探也点不开面板 —— 逼着「谁是菜单」这个判定自己说话。
-
-    回报的点击位置 (0, 0) 离菜单十万八千里,顺带把兜底那条路的锚定也验了。
-    """
-
-    def __call__(self, script, timeout=15):
-        if "click at {" in script:
-            return True, "0,0"
-        return super().__call__(script, timeout)
-
-
 def test_a_window_that_was_already_open_is_never_taken_for_the_menu(monkeypatch):
     """人家自己弹出来的小会话窗口不是菜单 —— 认错了就是在别人的窗口里盲点一下。"""
-    client = NothingWorks(DIRECTORY, plus_works=False, stray=(440, 168, 177, 79))
+    client = AXPlus(DIRECTORY, plus_works=False, stray=(440, 168, 177, 79))
     monkeypatch.setattr(local_group, "_run_applescript", client)
     monkeypatch.setattr(local_group, "_ui_click", client.click)
 
     with pytest.raises(local_group.LocalGroupError, match="面板没出现"):
         local_group.create_group(["陈涛", "陈挺"])
-    # 那个小窗口的几何和真菜单一模一样,唯一的区别就是「点之前就在」
-    assert client.ui_clicks == [AXPlus.PLUS_SCREEN]
+    # 那个小窗口的几何和真菜单一模一样,唯一的区别就是「点之前就在」。
+    # 两下都点在 "+" 上(第二下是重读 AX 之后),一下都没落进那个窗口
+    assert client.ui_clicks == [AXPlus.PLUS_SCREEN] * 2
 
 
 def test_a_menu_that_is_not_anchored_to_the_plus_is_ignored(monkeypatch):
     """新冒出来的小窗口离 "+" 十万八千里,那就不是 "+" 弹的菜单。"""
 
-    class FarAwayPopup(NothingWorks):
+    class FarAwayPopup(AXPlus):
         MENU = (1400, 900, 177, 79)
 
     client = FarAwayPopup(DIRECTORY, menu=True)
@@ -603,26 +596,19 @@ def test_a_menu_that_is_not_anchored_to_the_plus_is_ignored(monkeypatch):
 
     with pytest.raises(local_group.LocalGroupError, match="面板没出现"):
         local_group.create_group(["陈涛", "陈挺"])
-    assert client.ui_clicks == [AXPlus.PLUS_SCREEN]
+    assert client.ui_clicks == [AXPlus.PLUS_SCREEN] * 2
 
 
-def test_a_dead_ax_point_falls_back_to_offset_probing(monkeypatch):
-    """AX 读到的位置点下去没反应(比如窗口刚被挪走),还得能退回坐标试探。"""
-
-    class AXPlusThenOffset(AXPlus):
-        def __call__(self, script, timeout=15):
-            if "click at {" in script:
-                self.sheet_open = True
-                self.plus_clicked = True
-            return super().__call__(script, timeout)
-
-    client = AXPlusThenOffset(DIRECTORY, plus_works=False)
+def test_a_dead_ax_point_rereads_once_then_stops(monkeypatch):
+    """AX 读到的 "+" 点下去没反应: 重读一次再点,还不行就报错 —— 不去会话列表里盲点偏移。"""
+    client = AXPlus(DIRECTORY, plus_works=False)
     monkeypatch.setattr(local_group, "_run_applescript", client)
     monkeypatch.setattr(local_group, "_ui_click", client.click)
 
-    assert local_group.create_group(["陈涛", "陈挺"])["success"] is True
-    assert client.ui_clicks == [AXPlus.PLUS_SCREEN]
-    assert [s for s in client.scripts if "click at {" in s]
+    with pytest.raises(local_group.LocalGroupError, match="AX 里读到了"):
+        local_group.create_group(["陈涛", "陈挺"])
+    assert client.ui_clicks == [AXPlus.PLUS_SCREEN, AXPlus.PLUS_SCREEN]
+    assert [s for s in client.scripts if "click at {" in s] == []
 
 
 def test_title_offset_is_calibrated_and_remembered(rename_env, monkeypatch):
@@ -1524,6 +1510,35 @@ def test_set_nickname_reports_unsupported_client_entry(rename_env, monkeypatch):
 
     assert result["success"] is False
     assert "没有暴露" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("corpids", "expected"),
+    [
+        (["corpA", "corpA"], "内部群没有暴露"),
+        (["corpA", "corpB"], "客户端界面很可能改了"),
+        (["corpA", ""], "客户端界面很可能改了"),      # USER 表里没有的外部联系人
+    ],
+)
+def test_missing_nickname_entry_error_depends_on_outside_members(
+    rename_env, monkeypatch, corpids, expected
+):
+    """没找到昵称入口: 内部群是版本本来就不给,含外部成员的群找不到才是界面变了。"""
+    none = {"kind": "NONE", "value": "", "x": 0, "y": 0}
+    monkeypatch.setattr(local_group, "_read_ax_title", lambda: "")
+    monkeypatch.setattr(local_group, "_open_group_info_panel", lambda **_: None)
+    monkeypatch.setattr(local_group, "_scan_nickname_ui", lambda: none)
+    monkeypatch.setattr(local_group, "_probe_nickname_in_dialog", lambda: none)
+    monkeypatch.setattr(local_group, "_probe_nickname_from_member_menu", lambda: none)
+    monkeypatch.setattr(local_group, "_close_group_info", lambda: None)
+    members = [{"member_id": str(i + 1), "corpid": c} for i, c in enumerate(corpids)]
+    monkeypatch.setattr(local_group.messages, "group_members", lambda _rid: members)
+    monkeypatch.setattr(local_group.directory, "self_vid_or_none", lambda: "1")
+
+    result = local_group._set_nickname_locked(77, "小王")
+
+    assert result["success"] is False
+    assert expected in result["error"]
 
 
 def test_header_more_uses_leftmost_of_three_buttons(monkeypatch):
