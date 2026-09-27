@@ -35,9 +35,6 @@ from .settings import get_agent_home
 log = logging.getLogger(__name__)
 
 
-# 身份列的收敛规则在 localdb —— directory 也要用同一份(见 self_vid_or_none)。
-_int_id = int_id
-
 
 # CONVERSATION.conversationtype —— 1 是群聊(0 单聊,3/6/7/10x 是各类应用会话)
 GROUP_CONV_TYPE = 1
@@ -359,7 +356,7 @@ def _load_senders() -> dict[int, dict]:
 
     senders = {}
     for r in rows:
-        senders[_int_id(r[0])] = {
+        senders[int_id(r[0])] = {
             "name": r[1] or "",
             "userid": r[2] or "",
             "corpid": (r[3] if has_corpid else "") or "",
@@ -692,7 +689,7 @@ def parse_member_bin(blob: bytes | None) -> list[int]:
         i = end
         if not vids:
             continue
-        vid = _int_id(vids[0])
+        vid = int_id(vids[0])
         if vid and vid not in seen:
             seen.add(vid)
             out.append(vid)
@@ -701,7 +698,7 @@ def parse_member_bin(blob: bytes | None) -> list[int]:
 
 def _member_bin_for(rid: int) -> bytes:
     """取一个群的成员二进制。优先 CONV_MEMBER_DATA,没有再退回会话行。"""
-    rid = _int_id(rid)
+    rid = int_id(rid)
     try:
         rows = _rows(
             "SELECT CAST(member_bin AS BLOB) AS member_bin "
@@ -725,7 +722,7 @@ def _member_bin_for(rid: int) -> bytes:
 
 def group_profile(rid: int) -> dict:
     """一个群的档案(名 / 活跃时间)。会话不存在时仍返回 rid,调用方好拼占位名。"""
-    rid = _int_id(rid)
+    rid = int_id(rid)
     rows = _rows(
         "SELECT RID, name, sort_time FROM CONVERSATION "
         "WHERE conversationtype = ? AND RID = ? ORDER BY sort_time DESC LIMIT 1",
@@ -735,7 +732,7 @@ def group_profile(rid: int) -> dict:
         return {"rid": rid, "name": "", "sort_time": 0}
     r = rows[0]
     return {
-        "rid": _int_id(r["RID"]),
+        "rid": int_id(r["RID"]),
         "name": r["name"] or "",
         "sort_time": int(r["sort_time"] or 0),
     }
@@ -786,7 +783,7 @@ def list_groups(
         sql += " LIMIT ?"
         params += (int(limit),)
     return [
-        {"rid": _int_id(r["RID"]), "name": r["name"] or "", "sort_time": r["sort_time"]}
+        {"rid": int_id(r["RID"]), "name": r["name"] or "", "sort_time": r["sort_time"]}
         for r in _rows(sql, params)
     ]
 
@@ -825,12 +822,12 @@ def latest_cursor(rid: int | None = None) -> Cursor:
     params: tuple = ()
     if rid is not None:
         sql += " WHERE conv_id = ?"
-        params = (_int_id(rid),)
+        params = (int_id(rid),)
     sql += " ORDER BY send_time DESC, LID DESC LIMIT 1"
     rows = _rows(sql, params)
     if not rows:
         return Cursor()
-    return Cursor(int(rows[0]["send_time"] or 0), _int_id(rows[0]["LID"]))
+    return Cursor(int(rows[0]["send_time"] or 0), int_id(rows[0]["LID"]))
 
 
 MAX_GROUPS_PER_QUERY = 400  # sqlite 默认 compound SELECT 上限是 500
@@ -909,8 +906,8 @@ def fetch_since(
     scan_end: dict[int, Cursor] = {}
     scan_counts: dict[int, int] = {}
     for r in rows:
-        rid = _int_id(r["conv_id"])
-        scan_end[rid] = Cursor(int(r["send_time"] or 0), _int_id(r["LID"]))
+        rid = int_id(r["conv_id"])
+        scan_end[rid] = Cursor(int(r["send_time"] or 0), int_id(r["LID"]))
         scan_counts[rid] = scan_counts.get(rid, 0) + 1
         ctype = r["content_type"]
         rich_image = _rich_image_text(ctype, r["content"])
@@ -935,14 +932,14 @@ def fetch_since(
         if skipped and not include_skipped:
             continue
 
-        sender = senders.get(_int_id(r["sender_id"]), {})
+        sender = senders.get(int_id(r["sender_id"]), {})
         out.append({
-            "lid": _int_id(r["LID"]),
+            "lid": int_id(r["LID"]),
             "rid": rid,
             "group_name": r["conv_name"] or "",
             "send_time": int(r["send_time"] or 0),
             "time": v.export.fmt_time(r["send_time"] or 0),
-            "sender_id": _int_id(r["sender_id"]),
+            "sender_id": int_id(r["sender_id"]),
             "sender_name": sender.get("name") or v.export.resolve_sender(r["sender_id"], names),
             "sender_userid": sender.get("userid", ""),
             "sender_corpid": sender.get("corpid", ""),
@@ -975,9 +972,9 @@ def count_since(cursors: dict[int, Cursor]) -> dict[int, int]:
     params: list = []
     for rid, cursor in cursors.items():
         clauses.append("(conv_id = ? AND (send_time > ? OR (send_time = ? AND LID > ?)))")
-        params.extend((_int_id(rid), cursor.send_time, cursor.send_time, cursor.lid))
+        params.extend((int_id(rid), cursor.send_time, cursor.send_time, cursor.lid))
     rows = _rows(
         f"SELECT conv_id, COUNT(*) AS n FROM MESSAGE WHERE {' OR '.join(clauses)} GROUP BY conv_id",
         params,
     )
-    return {_int_id(r["conv_id"]): int(r["n"]) for r in rows}
+    return {int_id(r["conv_id"]): int(r["n"]) for r in rows}

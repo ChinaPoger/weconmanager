@@ -236,7 +236,7 @@ _SHEET_NONE, _SHEET_PICKER, _SHEET_OTHER = 0, 1, 2
 Menu = tuple[int, int, int, int]   # 菜单窗口的 (左, 上, 宽, 高),屏幕坐标
 
 
-def _ui_state() -> tuple[int, list[Menu]]:
+def _ui_state(with_windows: bool = True) -> tuple[int, list[Menu]]:
     """(主窗口上的面板类型, 进程里所有小到可能是菜单的窗口)。
 
     只数 sheet 不够,两处都不够:
@@ -253,7 +253,20 @@ def _ui_state() -> tuple[int, list[Menu]]:
     交给 _new_menu,靠「点完才出现」和「就贴在 + 底下」两个条件。
 
     三件事一次脚本问完:每个 AX 属性都是一次跨进程调用,而这个函数是在轮询里跑的。
+    只关心面板的调用方传 ``with_windows=False``,省掉逐个窗口读尺寸那一圈。
     """
+    window_scan = '''
+  repeat with w in windows
+    set sz to size of w
+    set sw to item 1 of sz
+    set shh to item 2 of sz
+    if sw < 500 and shh < 400 then
+      set wp to position of w
+      set acc to acc & ";" & ((item 1 of wp) as text) & "," & ((item 2 of wp) as text) & ¬
+        "," & (sw as text) & "," & (shh as text)
+    end if
+  end repeat
+''' if with_windows else ""
     out = _osa(_MAIN_WINDOW + '''
   -- UI_STATE
   set code to "0"
@@ -267,16 +280,7 @@ def _ui_state() -> tuple[int, list[Menu]]:
     end try
   end if
   set acc to code
-  repeat with w in windows
-    set sz to size of w
-    set sw to item 1 of sz
-    set shh to item 2 of sz
-    if sw < 500 and shh < 400 then
-      set wp to position of w
-      set acc to acc & ";" & ((item 1 of wp) as text) & "," & ((item 2 of wp) as text) & ¬
-        "," & (sw as text) & "," & (shh as text)
-    end if
-  end repeat
+''' + window_scan + '''
   return acc
 ''')
     parts = out.strip().strip('"').split(";")
@@ -291,8 +295,12 @@ def _ui_state() -> tuple[int, list[Menu]]:
     return (int(code) if code in ("0", "1", "2") else _SHEET_NONE), windows
 
 
+def _sheet_state() -> int:
+    return _ui_state(with_windows=False)[0]
+
+
 def _sheet_open() -> bool:
-    return _ui_state()[0] != _SHEET_NONE
+    return _sheet_state() != _SHEET_NONE
 
 
 def _new_menu(before: list[Menu], now: list[Menu], anchor: tuple[int, int] | None) -> Menu | None:
@@ -341,6 +349,7 @@ def _plus_point() -> tuple[int, int, int, int] | None:
     set bar to splitter group 1 of splitter group 1 of mainWin
     set tf to missing value
     set leftX to 999999
+    set tfPos to missing value
     repeat with t in (text fields of bar)
       -- 位置先落到变量里再比较: 直接把 `position of t` 套进表达式,System Events
       -- 会把整条 `every text field of ...` 的引用一起拖进来,报 -1700 类型错误
@@ -349,10 +358,11 @@ def _plus_point() -> tuple[int, int, int, int] | None:
       if tx < leftX then
         set leftX to tx
         set tf to contents of t
+        set tfPos to tp
       end if
     end repeat
     if tf is missing value then error "找不到搜索框"
-    set tp to position of tf
+    set tp to tfPos
     set ts to size of tf
     set rowY to (item 2 of tp) + ((item 2 of ts) div 2)
     set rightX to (item 1 of tp) + (item 1 of ts)
@@ -367,11 +377,13 @@ def _plus_point() -> tuple[int, int, int, int] | None:
       if d <= 8 and bx >= rightX and bx < bestX then
         set bestX to bx
         set best to contents of b
+        set bestPos to bp
+        set bestSize to bs
       end if
     end repeat
     if best is missing value then error "搜索框右边没有按钮"
-    set bp to position of best
-    set bs to size of best
+    set bp to bestPos
+    set bs to bestSize
     set cx to (item 1 of bp) + ((item 1 of bs) div 2)
     set cy to (item 2 of bp) + ((item 2 of bs) div 2)
     set wp to position of mainWin
@@ -382,15 +394,12 @@ def _plus_point() -> tuple[int, int, int, int] | None:
   end try
   return answer
 ''')
-    parts = out.strip().strip('"').split(",")
-    if len(parts) != 4:
+    try:
+        x, y, dx, dy = (int(v) for v in out.strip().strip('"').split(","))
+    except ValueError:
         # 悄悄退回坐标试探最气人 —— 报错留一行,别让「脚本写错了」和「客户端换布局了」
         # 长得一模一样
         log.info("AX 树里没读到 \"+\" 的位置(%s),改用坐标试探", out.strip() or "无返回")
-        return None
-    try:
-        x, y, dx, dy = (int(v) for v in parts)
-    except ValueError:
         return None
     return x, y, dx, dy
 
@@ -430,7 +439,7 @@ def _wait_sheet(timeout: float) -> int:
     state = _SHEET_NONE
     while time.time() < deadline:
         time.sleep(0.4)
-        state = _ui_state()[0]
+        state = _sheet_state()
         if state != _SHEET_NONE:
             return state
     return state
@@ -587,7 +596,7 @@ def _recover_open_sheet() -> None:
     一次 Escape:它是通用的取消动作,不会点击未知控件。关不掉就失败,继续校准会有把
     输入送进错误窗口的风险。
     """
-    state, _ = _ui_state()
+    state = _sheet_state()
     if state == _SHEET_NONE:
         return
 
@@ -825,7 +834,7 @@ def _english_candidate_rows(rows: list[dict], queries: list[str]) -> list[dict]:
     for query in queries:
         matched = [
             (i, row) for i, row in enumerate(rows)
-            if i not in used and _row_matches_query(row, query, resolved.get(query, ""))
+            if i not in used and _row_matches_query(row, query, resolved[query])
         ]
         if len(matched) > 1:
             shown = ", ".join(f"{r['name']}({r['dept']})" for _i, r in matched)
@@ -1617,8 +1626,6 @@ def _rename_locked(
             f"改名后核验失败: {_rid_label(rid)} 的群名仍是 {seen!r},不是 {new_name!r}"
         ),
     }
-
-
 
 
 def _dump_ui_hints() -> str:
