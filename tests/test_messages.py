@@ -7,7 +7,7 @@ from typing import ClassVar
 
 import pytest
 
-from wecom_svr import messages
+from wecom_svr import localdb, messages
 
 
 class _FakeExport:
@@ -218,11 +218,11 @@ def test_empty_or_broken_extracontent_is_not_fatal(monkeypatch):
 
 def test_int_id_coerces_sqlite_real_and_scientific_strings():
     rid = 10945118031183243
-    assert messages._int_id(rid) == rid
-    assert messages._int_id(float(rid)) == 10945118031183244
-    assert messages._int_id("1.0945118031183244e+16") == 10945118031183244
-    assert messages._int_id(None) == 0
-    assert messages._int_id("") == 0
+    assert localdb.int_id(rid) == rid
+    assert localdb.int_id(float(rid)) == 10945118031183244
+    assert localdb.int_id("1.0945118031183244e+16") == 10945118031183244
+    assert localdb.int_id(None) == 0
+    assert localdb.int_id("") == 0
 
 
 def _varint(v: int) -> bytes:
