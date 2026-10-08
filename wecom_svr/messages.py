@@ -385,7 +385,14 @@ def _rich_image_text(content_type: int, content) -> str:
     rendered: list[str] = []
     has_image = False
     for part in parts:
-        text = (_vendor().export.render(0, part) or "").strip()
+        # 图文的文本子消息在 field 101 中沿用普通文本的有序片段结构。
+        # 先还原提及,否则上游会把 @名字 渲染成没有 @ 的普通名字。
+        mentioned = ""
+        for caption in _pb_fields(part).get(101, []):
+            mentioned = _text_with_mentions(caption)
+            if mentioned:
+                break
+        text = (mentioned or _vendor().export.render(0, part) or "").strip()
         if _IMAGE_EXT.search(text):
             has_image = True
         elif text and text not in rendered:
