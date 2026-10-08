@@ -162,6 +162,18 @@ def test_type_123_image_with_caption_keeps_both_parts():
     assert messages._render(123, content, "卡片") == "[图片]\naaaa"
 
 
+@pytest.mark.parametrize("name", ["SMB咨询顾问", "牛小七"])
+def test_type_123_image_caption_preserves_mentions(name):
+    # 真实图文结构:顶层 field 1 子消息的 field 101 装文本片段。
+    caption = _mention(name) + _text_part(" 图中两个模型的使用区别")
+    content = _pb(1, b"WeChatWorkScreenshot_deadbeef.png") + _pb(
+        1, b"\x08\x00\x28\x02" + _pb(101, caption)
+    )
+    assert messages._render(123, content, "卡片") == (
+        f"[图片]\n@{name} 图中两个模型的使用区别"
+    )
+
+
 def test_regular_type_123_card_is_not_mistaken_for_an_image():
     content = _pb(1, "普通应用卡片".encode())
     assert messages._rich_image_text(123, content) == ""
