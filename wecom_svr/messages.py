@@ -59,14 +59,22 @@ IMAGE_PLACEHOLDER = "[图片]"
 FILE_PLACEHOLDER = "[文件]"
 MEDIA_PLACEHOLDER = {"图片": IMAGE_PLACEHOLDER, "语音": "[语音]", "文件": FILE_PLACEHOLDER}
 
-# 哪些 content_type 要去缓存里找原图。和 TYPE_OVERRIDES 放一起不是随意:
-# 14 之所以算图片,正是因为上面那张表把它从「语音」改回了「图片」——
-# 这两处必须一起改,分家到 media.py 就等着漏改。
-IMAGE_TYPES = frozenset({4, 14, 29})
+# raw(留给下游抽媒体的原始正文)是否保留,由下面几处共同决定的**最终 label**
+# 判断:只有最终仍是图片的消息才无条件带上 raw,其余类型要 raw_media 真抽到东西
+# 才带。所以改类型表、图文识别或转发识别时,都要回头看 `fetch_since` 的保留条件。
 
 # type=123 通常是卡片,但企微把「图片 + 随图文字」也装在这个类型里。它的 content
 # 顶层 field 1 有多个消息段:一段是图片元数据/文件名,另一段是用户输入的文字。
 RICH_IMAGE_TYPES = frozenset({123})
+
+# 合并转发的聊天记录。上游类型表把 type=4 标成「图片」,但这个企微版本把它用作
+# **转发记录**:顶层 field 1 是重复的子消息,field 2 是记录标题,子消息的
+# field 6/11 是发言人、field 101 才是正文。上游 render 从 field 1 里只捞到一张
+# 发言人头像,整条记录于是渲染成 `[图片] <头像>`,子消息正文全丢;messageType
+# 还被报成「图片」,前端会把记录里的普通链接也拿去当图渲染(见
+# docs/multi-media-messages.md §3)。
+FORWARD_RECORD_TYPES = frozenset({4})
+FORWARD_RECORD_LABEL = "聊天记录"
 
 # 图片文件名的扩展名,用来判断被引用或图文消息里的载荷是不是图片
 _IMAGE_EXT = re.compile(r"\.(png|jpe?g|gif|heic|webp|bmp)\b", re.I)
@@ -400,6 +408,75 @@ def _rich_image_text(content_type: int, content) -> str:
     if not has_image:
         return ""
     return "\n".join([IMAGE_PLACEHOLDER, *rendered])
+
+
+def _forward_record_text(content_type: int, content) -> str:
+    """type=4 的「合并转发的聊天记录」→ 标题 + 各子消息;不是则返回空串。
+
+    判别靠结构而不是靠码:转发信封的每条子消息都带发言人(field 6/11),真图片
+    没有。只要有一条子消息缺发言人就返回空串,交回既有类型表 —— 不给「type=4
+    也可能是图片」的旧假设留一个会被无声吞掉的例外。
+
+    正文子消息的 field 101 和普通文本消息同一套结构,所以直接复用 `_render`,
+    连 `@提及`、单字符正文这些修正一起继承过来。
+    """
+    if content_type not in FORWARD_RECORD_TYPES or not content:
+        return ""
+    if isinstance(content, str):
+        content = content.encode("utf-8", "surrogateescape")
+    if not isinstance(content, bytes):
+        return ""
+
+    root = _pb_fields(content)
+    parts = root.get(1, [])
+    if not parts:
+        return ""
+
+    lines: list[str] = []
+    for part in parts:
+        fields = _pb_fields(part)
+        if not (sender := _forward_sender(fields)):
+            return ""
+        for payload in fields.get(101, []):
+            if text := _render(2, payload, "文本").strip():
+                lines.append(f"{sender}: {text}")
+    # 标题放最前:纯图片转发一条文本都没有,标题是唯一能说明「这是转发记录」的东西。
+    if title := _field_text(root, 2):
+        lines.insert(0, title)
+    return "\n".join(lines)
+
+
+def _forward_sender(fields: dict[int, list[bytes]]) -> str:
+    """转发信封里的发言人显示名 —— field 6 是主名,较老的载荷只有 field 11。"""
+    for number in (6, 11):
+        if name := _field_text(fields, number):
+            return name
+    return ""
+
+
+def _field_text(fields: dict[int, list[bytes]], number: int) -> str:
+    """取某个顶层字段里第一段能按 UTF-8 解出的文本,取不到返回空串。"""
+    for raw in fields.get(number, []):
+        try:
+            return raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            continue
+    return ""
+
+
+def _render_message(content_type: int, content) -> tuple[str, str]:
+    """正文 → ``(messageType, 正文)``。**唯一**一处决定类型名和正文的地方。
+
+    合并转发(type=4)上游当图片、图文(type=123)上游当卡片,都得先认出结构再改写
+    类型;不算在这里认,正文就会丢成上游给的那一个占位符(转发还会多挂一张
+    发言人头像)。
+    """
+    if forward := _forward_record_text(content_type, content):
+        return FORWARD_RECORD_LABEL, forward
+    if rich_image := _rich_image_text(content_type, content):
+        return "图片", rich_image
+    label = _type_name(content_type)
+    return label, (_render(content_type, content, label) or "").strip()
 
 
 def _short_text(content) -> str:
@@ -919,11 +996,9 @@ def fetch_since(
         scan_end[rid] = Cursor(int(r["send_time"] or 0), r["LID"])
         scan_counts[rid] = scan_counts.get(rid, 0) + 1
         ctype = r["content_type"]
-        rich_image = _rich_image_text(ctype, r["content"])
-        label = "图片" if rich_image else _type_name(ctype)
+        label, text = _render_message(ctype, r["content"])
         if label in SKIP_TYPE_LABELS and not include_skipped:
             continue                       # 系统消息占比不小,别为它走一遍媒体树
-        text = (rich_image or _render(ctype, r["content"], label)).strip()
 
         # 引用回复:被引内容不在 content 列里,得单独解出来 —— 不带上的话
         # 「103会议室」这种回复到了下游没头没尾,看不出在回谁
@@ -963,7 +1038,10 @@ def fetch_since(
             "quote_text": quote_text,
             "skipped": skipped,
             # 类型表不是媒体存在性的可靠判据:合并转发/引用里的票据会藏在任意深度。
-            "raw": r["content"] if ctype in IMAGE_TYPES or rich_image or raw_media else None,
+            # 最终仍是图片的(含被改写的图文)无条件带上 raw,供旧式单图回退;其余
+            # 类型只有 raw_media 真抽到东西才带 —— 否则合并转发会被旧的「全文找
+            # md5/文件名」当成一张还没到的图,白白压住本群一个等待窗口。
+            "raw": r["content"] if label == "图片" or raw_media else None,
             "quote_raw": quote_payload if quote_media else None,
         })
     return Batch(

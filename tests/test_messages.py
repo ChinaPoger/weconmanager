@@ -11,10 +11,10 @@ from wecom_svr import localdb, messages
 
 
 class _FakeExport:
-    """模拟上游:14 标成语音、16 标成文件(即上游那套错的映射)。"""
+    """模拟上游:4/14 标成图片、16 标成文件(即上游那套错的映射)。"""
 
-    TYPE: ClassVar[dict] = {0: "文本", 14: "语音", 15: "文件", 16: "文件", 29: "图片"}
-    MEDIA: ClassVar[dict] = {14: "[语音]", 15: "[文件]", 16: "[文件]", 29: "[图片]"}
+    TYPE: ClassVar[dict] = {0: "文本", 4: "图片", 14: "语音", 15: "文件", 16: "文件", 29: "图片"}
+    MEDIA: ClassVar[dict] = {4: "[图片]", 14: "[语音]", 15: "[文件]", 16: "[文件]", 29: "[图片]"}
 
     def type_name(self, ct):
         return self.TYPE.get(ct, f"type{ct}")
@@ -23,7 +23,7 @@ class _FakeExport:
         if ct in self.MEDIA:
             return self.MEDIA[ct]
         if isinstance(content, bytes):
-            return content.decode("utf-8", "replace")
+            return _unwrap_text(content) or content.decode("utf-8", "replace")
         return content or ""
 
 
@@ -87,6 +87,18 @@ def _pb(field: int, payload: bytes) -> bytes:
 def _text_message(payload: bytes) -> bytes:
     """企微普通文本的实测 protobuf 外壳: field 1 -> field 2 -> field 1。"""
     return _pb(1, b"\x08\x00" + _pb(2, _pb(1, payload)))
+
+
+def _unwrap_text(content: bytes) -> str:
+    """上游文本渲染的最小替身: ``1 -> 2 -> 1`` 的叶子就是正文。"""
+    for envelope in messages._pb_fields(content).get(1, []):
+        for body in messages._pb_fields(envelope).get(2, []):
+            for payload in messages._pb_fields(body).get(1, []):
+                try:
+                    return payload.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+    return ""
 
 
 LINK_PREVIEW = _pb(3045, b"meta") + _pb(1042, b"GitHub Issue #147")
@@ -177,6 +189,56 @@ def test_type_123_image_caption_preserves_mentions(name):
 def test_regular_type_123_card_is_not_mistaken_for_an_image():
     content = _pb(1, "普通应用卡片".encode())
     assert messages._rich_image_text(123, content) == ""
+
+
+# ─── 合并转发的聊天记录 ──────────────────────────────────────────────
+
+def _forward_record(title: str, messages_: list) -> bytes:
+    """实测骨架:顶层 field 1 是重复子消息,field 2 是记录标题。"""
+    parts = b""
+    for sender, text in messages_:
+        part = _pb(6, sender.encode()) + _pb(11, sender.encode())
+        if text is not None:
+            part += _pb(101, _text_message(text.encode()))
+        parts += _pb(1, part)
+    return parts + _pb(2, title.encode())
+
+
+def test_type_4_forward_record_is_not_collected_as_an_image():
+    """实测 type=4 是「群聊的聊天记录」,上游却按图片渲染成 `[图片] <头像>`。"""
+    content = _forward_record("群聊的聊天记录", [
+        ("wenzi", "请求地点: 广东深圳"),
+        ("wenzi", "大概是10:52分左右"),
+    ])
+
+    assert messages._render_message(4, content) == (
+        "聊天记录",
+        "群聊的聊天记录\n"
+        "wenzi: 请求地点: 广东深圳\n"
+        "wenzi: 大概是10:52分左右",
+    )
+
+
+def test_forward_record_without_text_keeps_title():
+    """纯图片转发也要留下标题,否则整条记录又变成一张占位图。"""
+    content = _forward_record("赵剑峰和君Joanna的聊天记录", [("赵剑峰", None)])
+
+    assert messages._forward_record_text(4, content) == "赵剑峰和君Joanna的聊天记录"
+
+
+def test_forward_record_without_sender_falls_back_to_upstream():
+    """真图片不是转发信封 —— 子消息没有发言人时不能硬解成记录。"""
+    content = _pb(1, b"\x08\x01" + _pb(2, b"306902010204")) + _pb(2, b"pic.jpg")
+
+    assert messages._forward_record_text(4, content) == ""
+    assert messages._render_message(4, content)[0] == "图片"
+
+
+def test_forward_record_does_not_hijack_other_types():
+    content = _forward_record("群聊的聊天记录", [("wenzi", "hi")])
+
+    assert messages._forward_record_text(14, content) == ""
+    assert messages._render_message(14, content)[0] == "图片"
 
 
 def _summary(extracontent) -> str:
