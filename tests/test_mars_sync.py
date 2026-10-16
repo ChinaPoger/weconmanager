@@ -6,8 +6,10 @@
 import asyncio
 import json
 import sqlite3
+import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -909,19 +911,162 @@ def test_only_whitelisted_groups_are_synced(settings, local, pushed):
 
 
 def test_resumes_from_last_success_after_failure(settings, local, pushed):
+    # 退避另测;这里只看断点续传本身
+    s = settings.model_copy(update={"mars_sync_backoff_base": 0})
     local["messages"] = [_msg(1, 900, "a"), _msg(2, 1000, "b"), _msg(3, 1100, "c")]
-    mars_sync.save_state(State(cursor=Cursor(800, 0)), settings)
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), s)
 
     pushed["fail_at"] = 1                      # 第一条成功,第二条炸
-    result = run(mars_sync.sync_once(settings))
+    result = run(mars_sync.sync_once(s))
     assert result.pushed == 1
     assert "boom" in result.error
-    assert mars_sync.load_state(settings).cursor == Cursor(900, 1)
+    assert mars_sync.load_state(s).cursor == Cursor(900, 1)
 
     pushed["fail_at"] = None                   # 下一轮从断点接上,不重推 a
-    result = run(mars_sync.sync_once(settings))
+    result = run(mars_sync.sync_once(s))
     assert [h["message"] for h in pushed["sent"]] == ["a", "b", "c"]
     assert result.error == ""
+
+
+# ─── 「mars 已有同 checksum」与退避 ────────────────────────────────────
+
+CHECKSUM_1062 = {
+    "Number": 1062,
+    "Message": "Duplicate entry '7c17ad9f' for key 'uix_checksum'",
+}
+
+
+def test_a_checksum_conflict_is_recognized_as_already_delivered():
+    assert mars_sync.is_checksum_conflict(httpx.Response(400, json=CHECKSUM_1062)) is True
+
+
+def test_a_non_json_1062_body_is_still_recognized():
+    resp = httpx.Response(400, text="Error 1062: Duplicate entry 'x' for key 'uix_checksum'")
+    assert mars_sync.is_checksum_conflict(resp) is True
+
+
+def test_a_local_id_conflict_is_not_treated_as_already_delivered():
+    """同 LID 的正文变了(媒体 URL 漂移)是 mars 有意拒绝的真冲突,不能静默跳过。"""
+    payload = {
+        **CHECKSUM_1062,
+        "Message": "Duplicate entry 'x' for key 'uix_qq_messages_group_local_id'",
+    }
+    assert mars_sync.is_checksum_conflict(httpx.Response(400, json=payload)) is False
+
+
+def test_only_the_checksum_duplicate_is_a_skip():
+    checksum_body = "Duplicate entry 'x' for key 'uix_checksum'"
+    assert mars_sync.is_checksum_conflict(httpx.Response(500, json=CHECKSUM_1062)) is False
+    assert mars_sync.is_checksum_conflict(httpx.Response(200, text="ok")) is False
+    assert mars_sync.is_checksum_conflict(
+        httpx.Response(400, json={"Number": 1064, "Message": checksum_body})
+    ) is False
+    assert mars_sync.is_checksum_conflict(
+        httpx.Response(400, json={"Number": 1062, "Message": "something else"})
+    ) is False
+
+
+def test_put_json_marks_a_checksum_conflict_as_already_stored(settings):
+    class FakeClient:
+        async def put(self, url, json=None):
+            return httpx.Response(400, json=CHECKSUM_1062)
+
+    with pytest.raises(mars_sync.MarsAlreadyStored) as e:
+        run(mars_sync.put_json(FakeClient(), "http://x", {"groupNumber": "g"}, "mars"))
+
+    assert e.value.status_code == 400
+    assert "uix_checksum" in e.value.body
+
+
+def test_put_json_reports_other_failures_as_plain_errors(settings):
+    class FakeClient:
+        async def put(self, url, json=None):
+            return httpx.Response(502, text="bad gateway")
+
+    with pytest.raises(mars_sync.MarsSyncError) as e:
+        run(mars_sync.put_json(FakeClient(), "http://x", {"groupNumber": "g"}, "mars"))
+
+    assert not isinstance(e.value, mars_sync.MarsAlreadyStored)
+    assert e.value.status_code == 502
+
+
+def test_a_checksum_conflict_advances_the_watermark_instead_of_retrying(
+    settings, local, monkeypatch
+):
+    """mars 说「同 checksum 已有」= 已经投递过;越过它,不能每 3 秒撞同一堵墙。"""
+    local["messages"] = [_msg(1, 900, "a"), _msg(2, 1000, "b")]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), settings)
+    sent = []
+
+    async def push(_client, hook, _settings):
+        if hook["localId"] == 2:
+            raise mars_sync.MarsAlreadyStored(
+                "mars 已有同 checksum 记录,按已投递跳过",
+                status_code=400,
+                body='{"Number":1062,"Message":"Duplicate entry ... uix_checksum"}',
+            )
+        sent.append(hook)
+
+    monkeypatch.setattr(mars_sync, "push_one", push)
+    result = run(mars_sync.sync_once(settings))
+
+    assert (result.pushed, result.skipped) == (1, 1)
+    assert [h["localId"] for h in sent] == [1]
+    state = mars_sync.load_state(settings)
+    group = state.groups[str(GROUP["rid"])]
+    assert group.cursor == Cursor(1000, 2)          # 越过冲突的那条
+    assert (group.skip_total, state.skipped) == (1, 1)
+    assert "checksum" in group.last_skip
+    assert state.groups[str(GROUP["rid"])].fail_streak == 0
+
+    again = run(mars_sync.sync_once(settings))      # 第二轮不再重推(原来的死循环)
+    assert (again.pushed, again.skipped) == (0, 0)
+    assert [h["localId"] for h in sent] == [1]
+
+
+def test_a_transient_failure_backs_off_instead_of_retrying_every_round(settings, local, pushed):
+    local["messages"] = [_msg(1, 900, "a")]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), settings)
+
+    pushed["fail_at"] = 0
+    first = run(mars_sync.sync_once(settings))
+    assert first.pushed == 0 and "boom" in first.error
+    group = mars_sync.load_state(settings).groups[str(GROUP["rid"])]
+    assert group.cursor == Cursor(800, 0)           # 水位不动
+    assert group.fail_streak == 1
+    assert group.next_attempt > time.time()         # 退避排到未来
+
+    pushed["fail_at"] = None
+    second = run(mars_sync.sync_once(settings))     # 还在退避窗口内,一条都不发
+    assert pushed["sent"] == []
+    assert second.group_results[str(GROUP["rid"])]["deferred"] is True
+    assert mars_sync.load_state(settings).groups[str(GROUP["rid"])].cursor == Cursor(800, 0)
+
+
+def test_the_group_retries_once_the_backoff_window_passes(settings, local, pushed):
+    local["messages"] = [_msg(1, 900, "a")]
+    mars_sync.save_state(State(cursor=Cursor(800, 0)), settings)
+
+    pushed["fail_at"] = 0
+    run(mars_sync.sync_once(settings))
+    pushed["fail_at"] = None
+
+    state = mars_sync.load_state(settings)
+    state.groups[str(GROUP["rid"])].next_attempt = 0.0   # 等价于「时间到了」
+    mars_sync.save_state(state, settings)
+
+    result = run(mars_sync.sync_once(settings))
+    assert [h["message"] for h in pushed["sent"]] == ["a"]
+    assert result.pushed == 1
+    assert mars_sync.load_state(settings).groups[str(GROUP["rid"])].fail_streak == 0
+
+
+def test_backoff_delay_is_exponential_and_capped(settings):
+    assert mars_sync.backoff_delay(1, settings) == 3.0
+    assert mars_sync.backoff_delay(2, settings) == 6.0
+    assert mars_sync.backoff_delay(99, settings) == settings.mars_sync_backoff_max
+    off = settings.model_copy(update={"mars_sync_backoff_base": 0})
+    assert mars_sync.backoff_delay(5, off) == 0.0
 
 
 def test_watermark_passes_over_a_batch_that_is_all_system_messages(settings, local, pushed):

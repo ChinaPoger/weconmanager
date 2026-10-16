@@ -1,6 +1,7 @@
 """启动服务: `python -m wecom_svr` 或 `wecom-svr`。"""
 import argparse
 import logging
+import logging.handlers
 import sys
 
 import uvicorn
@@ -20,7 +21,7 @@ def main() -> None:
     ap.add_argument("--log-level", default="info")
     a = ap.parse_args()
 
-    logging.basicConfig(level=a.log_level.upper())
+    logging.basicConfig(level=a.log_level.upper(), handlers=_log_handlers(settings))
 
     if not (settings.corpid and settings.secret):
         print("⚠️  缺少 corpid/secret,官方 API(/api/v1/app/message/send)会失败")
@@ -57,6 +58,27 @@ def main() -> None:
         Server(config).run(sockets=[claimed.sock])
     finally:
         claimed.close()
+
+
+def _log_handlers(settings) -> list[logging.Handler]:
+    """配了轮转文件就只用它;否则用 stderr。
+
+    launchd 的 StandardErrorPath 没有轮转,实测单文件能长到几百 MB。配了
+    `WECOM_SVR_LOG_FILE` 就必须**只用**轮转文件 —— 再挂一个 StreamHandler
+    就等于把同样的日志继续往那个没人管的 stderr 文件里写,配了也白配。
+    stderr 仍会收到启动期 print 和未捕获回溯。
+    """
+    if not settings.log_file:
+        return [logging.StreamHandler()]
+    settings.log_file.parent.mkdir(parents=True, exist_ok=True)
+    return [
+        logging.handlers.RotatingFileHandler(
+            settings.log_file,
+            maxBytes=max(1, int(settings.log_max_bytes)),
+            backupCount=max(0, int(settings.log_backups)),
+            encoding="utf-8",
+        )
+    ]
 
 
 def _claim_lock_or_exit(data_dir) -> None:

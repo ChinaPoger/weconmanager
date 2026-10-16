@@ -473,8 +473,19 @@ curl http://127.0.0.1:8090/api/v1/mars/sync/status
   没变化的群。本地库目前还没定位到可靠的群公告字段,`note` 先留空。
 - **默认不倒灌历史。** 首次同步的水位贴着当前最新一条。要回补用
   `MARS_SYNC_BACKFILL` 或 `/watermark`。
-- **重推是安全的。** mars 落库前算 `md5(群号+发送人+发送时间+正文)` 作唯一索引
-  并 `FirstOrCreate`,所以水位丢了、多推一段都不会产生重复行。
+- **重推不会多出行,但整个 hook 并不幂等。** mars 落库前算
+  `md5(群号+发送人+发送时间+正文)` 作唯一索引并 upsert,所以水位丢了、多推一段
+  不会产生重复行;但告警 / Slack / 销售工单等副作用会重放一遍(见
+  [docs/per-group-watermark.md §1.3](docs/per-group-watermark.md))。
+- **mars 说「已有同 checksum」= 已投递过,越过而不是重试。** 旧版 mars 带
+  `localId` 时只按 `(群号, local_id)` 查,历史行 `local_id` 是 NULL 就探不到,
+  INSERT 撞唯一键后回 400。客户端把这种 400 认成 `MarsAlreadyStored`,推进水位
+  并计入 `skipped`(`/status` 的 `state.skipped`、群级 `last_skip` / `skip_total`),
+  不会每 3 秒撞同一堵墙。撞 `uix_qq_messages_group_local_id` **不算** —— 那是同一个
+  LID 的正文变了(媒体 URL 漂移),必须暴露出来。
+- **瞬时失败按群指数退避。** 连续第 `N` 次失败的间隔 `= BACKOFF_BASE * 2^(N-1)`,
+  封顶 `BACKOFF_MAX`;退避期间水位不动、该群本轮不发,其它群照常。确定性冲突
+  (上面那条)不进退避,直接越过。`BACKOFF_BASE=0` 关掉退避。
 - **顺序被严格保持。** mars 的 `SetTimeline` 按入库顺序切问题分组,所以推送
   串行、按 `(send_time, LID)` 升序;中途失败就停在断点,下轮接上。
 - **群号带 `wework-` 前缀。** mars 的 `qq_groups.qq` 是全局唯一键,和真实 QQ

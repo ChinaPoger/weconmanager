@@ -1,5 +1,6 @@
 """单实例保护:端口占用时必须立刻退出,不能先去弹企业微信。"""
 import json
+import logging.handlers
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -126,6 +127,7 @@ def _settings(tmp_path, **updates):
         "secret": "s",
         "auth_enabled": True,
         "data_dir": tmp_path,
+        "log_file": None,
         **updates,
     }
     return type("S", (), values)()
@@ -167,3 +169,26 @@ def test_main_hands_the_claimed_socket_to_uvicorn(tmp_path, monkeypatch):
     entry.main()
 
     assert seen["port"] == port
+
+
+def test_log_handlers_rotate_to_a_file_when_configured(tmp_path):
+    """launchd 重定向的 stderr 没人轮转;配了 log_file 就不能再往 stderr 写一份。"""
+    from wecom_svr import __main__ as entry
+
+    plain = entry._log_handlers(_settings(tmp_path))
+    assert len(plain) == 1 and not isinstance(plain[0], logging.handlers.RotatingFileHandler)
+
+    rotated = entry._log_handlers(
+        _settings(tmp_path, log_file=tmp_path / "svc.log", log_max_bytes=128, log_backups=2)
+    )
+    assert len(rotated) == 1
+    assert isinstance(rotated[0], logging.handlers.RotatingFileHandler)
+    assert (rotated[0].maxBytes, rotated[0].backupCount) == (128, 2)
+
+
+def test_a_blank_log_file_env_var_is_treated_as_unset(monkeypatch, tmp_path):
+    """`.env` 里的 `WECOM_SVR_LOG_FILE=` 会被解析成 Path('.'),不能让启动期拿目录当文件。"""
+    from wecom_svr.settings import Settings
+
+    monkeypatch.setenv("WECOM_SVR_LOG_FILE", "")
+    assert Settings(data_dir=tmp_path).log_file is None
