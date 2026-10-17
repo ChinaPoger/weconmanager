@@ -8,6 +8,9 @@ hook,models.MessageHook 的字段名带着 QQ 时代的痕迹(groupnumber/sender
 
   - **只有行级去重,不是幂等**: mars 落库前算 checksum = md5(群号+发送人+发送时间+
     正文),表上是唯一索引 + FirstOrCreate,所以重推同一条不会多出一行。
+    ⚠️ 旧版 mars 的 upsert 带 localId 时只探 `(群号, local_id)`,探不到就 INSERT,
+    撞上 checksum 唯一键会回 400 —— 那是**已经投递过**,不是失败。这种 400 由
+    `is_checksum_conflict` 认出来并当成「越过这条」(见 `MarsAlreadyStored`)。
     ⚠️ 但**整个 hook 不幂等**,别据此认为「多推一点没关系」:
       · `Assign(*msg)` 命中也写,而 timeline 是以「该群当前最新消息」为参照重算的 ——
         重推一条老消息会覆盖掉它原来的 timeline(models/qq.go:273、415-417)
@@ -51,7 +54,17 @@ HOOK_PATH = "/api/qq/hook/v2/message"
 
 
 class MarsSyncError(RuntimeError):
-    """同步配置或调用失败(可预期,回 400/502)。"""
+    """同步配置或调用失败(可预期,回 400/502)。
+
+    `status_code` / `body` 保留 HTTP 层的原始信息:mars 的 400 正文里带着 MySQL
+    错误码(`{"Number":1062,...}`),「这个 400 是不是「已经有了」」必须能结构化
+    判断,不能靠翻拼进 message 的字符串。
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None, body: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
 
 
 class MarsNotConfigured(MarsSyncError):
@@ -60,6 +73,20 @@ class MarsNotConfigured(MarsSyncError):
 
 class MarsStateError(MarsSyncError):
     """水位文件不可读/不可写;继续同步会漏消息或重放副作用。"""
+
+
+class MarsAlreadyStored(MarsSyncError):
+    """mars 说这条 checksum 已经在库里了 —— 等价于「已投递」,不是失败。
+
+    checksum = md5(群号+发送人+秒级时间+正文),撞上就说明库里已经有一行内容
+    完全相同的记录。再推一万次还是撞同一行,所以调用方必须**越过**这条、把水位
+    推过去,而不是停在原地重试。
+
+    为什么客户端要认这个:旧版 mars 的 `Upsert` 带 localId 时只按
+    `(group_number, local_id)` 查,而 9/11 之前落下的行 local_id 是 NULL,查不到
+    就 INSERT,撞上 `uix_checksum` 后回 400。正确行为是 upsert 命中(新 mars 已经
+    如此),但只要线上还有旧实例,这个群就会每 3 秒撞一次同一堵墙,水位永不前进。
+    """
 
 
 # ─── 水位 ───────────────────────────────────────────────────────────────
@@ -123,6 +150,13 @@ class GroupState:
     active: bool = True
     last_error: str = ""
     fail_streak: int = 0
+    # 连续失败后的下次尝试时间(epoch 秒)。瞬时错误(网络/5xx)退避,
+    # 确定性冲突(checksum 已在 mars)直接越过,不进 fail_streak。
+    next_attempt: float = 0.0
+    # 最近一次「mars 已有同 checksum」的说明。同一句只记一次,不再每轮刷屏;
+    # 持久化是为了让 /status 在重启后仍说得清这个群为什么越过了一条。
+    last_skip: str = ""
+    skip_total: int = 0
     last_success: float = 0.0
     last_seen: float = 0.0
     scanned: int = 0
@@ -177,6 +211,9 @@ class GroupState:
             active=bool(d.get("active", True)),
             last_error=error_text(d.get("last_error")),
             fail_streak=int(d.get("fail_streak") or 0),
+            next_attempt=float(d.get("next_attempt") or 0),
+            last_skip=error_text(d.get("last_skip")),
+            skip_total=int(d.get("skip_total") or 0),
             last_success=float(d.get("last_success") or 0),
             last_seen=float(d.get("last_seen") or 0),
             scanned=int(d.get("scanned") or 0),
@@ -193,6 +230,7 @@ class State:
     groups: dict[str, GroupState] = field(default_factory=dict)
     cursor: Cursor = field(default_factory=Cursor)
     pushed: int = 0            # 累计推送条数
+    skipped: int = 0           # 累计「mars 已有同 checksum」而越过的条数(= 已投递)
     last_run: float = 0.0      # 上次跑完的时间戳
     last_push: float = 0.0     # 上次真的推出去东西的时间戳
     last_error: str = ""
@@ -217,6 +255,7 @@ class State:
             groups={str(rid): GroupState.from_dict(group) for rid, group in raw_groups.items()},
             cursor=Cursor.from_dict(d.get("cursor")),
             pushed=int(d.get("pushed") or 0),
+            skipped=int(d.get("skipped") or 0),
             last_run=float(d.get("last_run") or 0),
             last_push=float(d.get("last_push") or 0),
             last_error=error_text(d.get("last_error")),
@@ -664,6 +703,49 @@ def canonicalize_mars_payload(payload: dict, group_prefix: str = "") -> dict:
     return body
 
 
+#: mars 侧 `qq_messages.checksum` 的唯一索引名。撞车只认这一个键。
+CHECKSUM_UNIQUE_INDEX = "uix_checksum"
+#: MySQL 1062 = Duplicate entry。mars 把驱动错误原样塞进 400 的正文。
+MYSQL_DUPLICATE_ENTRY = 1062
+
+
+def _error_number(payload: object) -> int | None:
+    """mars 400 正文里的 MySQL 错误码。解析不出来返回 None。"""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("Number", "number", "errno"):
+        if key in payload:
+            try:
+                return int(payload[key])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def is_checksum_conflict(resp: httpx.Response) -> bool:
+    """这次 400 是不是「mars 里已经有同 checksum 的记录」。
+
+    必须同时满足 400 + 1062 + `uix_checksum`。**不能只看 1062**:撞
+    `uix_qq_messages_group_local_id` 是另一回事 —— 同一个 LID 的正文变了(典型
+    来源是媒体 URL 漂移,见 docs/multi-media-messages.md §2),mars 是有意拒绝的,
+    静默跳过等于把正文漂移藏起来。
+    """
+    if resp.status_code != 400:
+        return False
+    body = resp.text or ""
+    if CHECKSUM_UNIQUE_INDEX not in body:
+        return False
+    try:
+        payload: object = resp.json()
+    except ValueError:
+        payload = None
+    if payload is None:
+        return "Duplicate entry" in body
+    if _error_number(payload) not in (None, MYSQL_DUPLICATE_ENTRY):
+        return False
+    return "Duplicate entry" in str(payload)
+
+
 async def put_json(
     client: httpx.AsyncClient,
     url: str,
@@ -674,6 +756,8 @@ async def put_json(
     """PUT 一份 JSON 给 mars。非 200 或传输失败一律抛 MarsSyncError。
 
     「只认 200、报错正文截 200 字」是 mars 这几个接口共用的约定,写一份。
+    `MarsAlreadyStored` 是 MarsSyncError 的子类:群信息等其它调用方照旧把它当成
+    错误,只有消息推送会把它解释成「已投递」。
     """
     payload = canonicalize_mars_payload(payload, group_prefix)
     try:
@@ -681,14 +765,41 @@ async def put_json(
     except httpx.HTTPError as e:
         detail = str(e).strip() or type(e).__name__
         raise MarsSyncError(f"调用 {what} 失败: {detail}") from e
-    if resp.status_code != 200:
-        body = resp.text.strip()[:200]
-        raise MarsSyncError(f"{what} 返回 {resp.status_code}: {body}")
+    if resp.status_code == 200:
+        return
+    body = resp.text.strip()[:200]
+    if is_checksum_conflict(resp):
+        raise MarsAlreadyStored(
+            f"{what} 已有同 checksum 记录,按已投递跳过: 返回 400: {body}",
+            status_code=400,
+            body=body,
+        )
+    raise MarsSyncError(
+        f"{what} 返回 {resp.status_code}: {body}", status_code=resp.status_code, body=body
+    )
 
 
 async def push_one(client: httpx.AsyncClient, hook: dict, settings: Settings) -> None:
-    """推一条。失败抛 MarsSyncError —— 调用方据此停在当前水位,下轮重来。"""
+    """推一条。失败抛 MarsSyncError —— 调用方据此停在当前水位,下轮重来。
+
+    唯一的例外是 `MarsAlreadyStored`:mars 已经有同一 checksum 的行 = 已经投递过,
+    调用方必须**越过**这条而不是重试(见 `is_checksum_conflict`)。
+    """
     await put_json(client, hook_url(settings), hook, "mars", settings.mars_group_prefix)
+
+
+def backoff_delay(fail_streak: int, settings: Settings) -> float:
+    """连续第 `fail_streak` 次失败后歇多久再试。指数退避,封顶配置值。
+
+    只对**瞬时**失败(网络/超时/5xx)生效。确定性的 4xx —— 比如 checksum 撞车
+    —— 走 `MarsAlreadyStored` 直接越过,不进 fail_streak;拿退避去掩盖
+    「永远不可能成功」只会把死循环变成慢死循环。
+    """
+    base = float(settings.mars_sync_backoff_base)
+    if base <= 0:
+        return 0.0                   # 关掉退避 = 回到「每轮都重试」
+    peak = max(base, float(settings.mars_sync_backoff_max))
+    return min(peak, base * (2 ** min(max(fail_streak, 1) - 1, 16)))
 
 
 # ─── 一轮同步 ───────────────────────────────────────────────────────────
@@ -774,6 +885,7 @@ class SyncResult:
     decrypted: bool = False        # 本轮是否真的重解密了(源库有变化)
     scanned: int = 0               # 水位后读到多少条
     pushed: int = 0                # 实际推出去多少条
+    skipped: int = 0               # mars 说「已有同 checksum」而越过的条数(已投递)
     held: int = 0                  # 因为在等图而推迟到下一轮的条数
     groups: list[str] = field(default_factory=list)
     cursor: Cursor = field(default_factory=Cursor)
@@ -1004,6 +1116,7 @@ async def _sync_once(
         result.group_results[str(rid)] = {
             "scanned": batch.scan_counts.get(rid, 0),
             "pushed": 0,
+            "skipped": 0,
             "held": 0,
             "error": "",
             "cursor": state.groups[str(rid)].cursor.to_dict(),
@@ -1013,10 +1126,18 @@ async def _sync_once(
         result.cursor = state.cursor
         return result
 
+    now = time.time()
     due, held_by_group = await asyncio.to_thread(plan_round, batch, rids, settings)
     for rid, held in held_by_group.items():
         result.held += held
         result.group_results[str(rid)]["held"] = held
+
+    # 退避中的群这轮一条都不发:瞬时错误连着撞只是白烧 CPU 和日志。水位不动,
+    # 到期再来。必须在**推送前**就把它们从 due 里剔掉,而不能在循环里
+    # continue —— 尾巴上「本轮无 error 就推进到 scan_end」会把没投递的消息
+    # 当成推过。
+    backing_off = {rid for rid in rids if state.groups[str(rid)].next_attempt > now}
+    due = [m for m in due if int(m["rid"]) not in backing_off]
 
     # 先落 outbox 再发 HTTP:即使响应丢失或进程在更新水位前崩溃,下轮 Content 也不漂移。
     hooks = await asyncio.to_thread(lambda: [outbox_hook(m, settings) for m in due])
@@ -1029,18 +1150,34 @@ async def _sync_once(
                 rid = int(msg["rid"])
                 if rid in errors:
                     continue
+                sent = True
                 try:
                     await push_one(client, hook, settings)
+                except MarsAlreadyStored as e:
+                    # mars 里已经有同一 checksum 的行 = 这条已经投递过。越过它。
+                    # 这是确定性冲突,停在原地重试一万次也还是同一堵墙。
+                    sent = False
+                    reason = error_text(e)
+                    group = state.groups[str(rid)]
+                    group.next_attempt = 0.0
+                    group.skip_total += 1
+                    result.skipped += 1
+                    result.group_results[str(rid)]["skipped"] += 1
+                    if group.last_skip != reason:
+                        # 同一句只记一次,否则每轮都刷屏(实测的 613MB stderr
+                        # 有一半是这么来的)。
+                        log.warning("群 %s LID=%s 跳过: %s", rid, msg["lid"], e)
+                        group.last_skip = reason
                 except MarsSyncError as e:
                     errors[rid] = error_text(e)
                     log.warning("群 %s 推送中断于 LID=%s: %s", rid, msg["lid"], e)
                     continue
                 state.groups[str(rid)].cursor = Cursor(msg["send_time"], msg["lid"])
                 advanced.add(str(rid))
-                result.pushed += 1
-                result.group_results[str(rid)]["pushed"] += 1
+                if sent:
+                    result.pushed += 1
+                    result.group_results[str(rid)]["pushed"] += 1
 
-    now = time.time()
     for rid in rids:
         group = state.groups[str(rid)]
         if rid not in batch.selected_rids:
@@ -1049,13 +1186,22 @@ async def _sync_once(
         group.scanned = batch.scan_counts.get(rid, 0)
         group.pushed = result.group_results[str(rid)]["pushed"]
         group.held = held_by_group.get(rid, 0)
+        if rid in backing_off:
+            # 退避中的群本轮没发,水位绝不能动(它还有没投递的消息)。保留上轮的
+            # last_error,把退避原因一并带给 /status。
+            result.group_results[str(rid)]["deferred"] = True
+            result.group_results[str(rid)]["retry_after"] = group.next_attempt
+            result.group_results[str(rid)]["cursor"] = group.cursor.to_dict()
+            continue
         error = errors.get(rid, "")
         group.last_error = error
         if error:
             group.fail_streak += 1
+            group.next_attempt = now + backoff_delay(group.fail_streak, settings)
             result.group_results[str(rid)]["error"] = error
         else:
             group.fail_streak = 0
+            group.next_attempt = 0.0
             # 只有本群没有 held/failed,才能安全越过过滤掉的批尾行。
             if rid not in held_by_group:
                 end = batch.scan_end.get(rid)
@@ -1067,6 +1213,7 @@ async def _sync_once(
         result.group_results[str(rid)]["cursor"] = group.cursor.to_dict()
 
     state.pushed += result.pushed
+    state.skipped += result.skipped
     state.round_robin = batch.next_offset
     if result.pushed:
         state.last_push = now

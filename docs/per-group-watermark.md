@@ -410,3 +410,26 @@ limit 时本轮选 limit 个群各取一条,下轮轮转起点,保证所有群�
 ### 10.4 是否还有别的入口在写同一个 `wework-<rid>`
 
 如果有,企微单侧的群内保序不足以保证 mars 侧的群内保序。**待确认。**
+
+### 10.5 mars 回 400 / 1062 被误当成失败(2026-10 已修)
+
+mars 的 `Upsert` 在带 `localId` 时只按 `(group_number, local_id)` 查(`models/qq.go`)。
+9/11 之前落下的行 `local_id` 是 `NULL`,于是探不到 → INSERT → 撞 `uix_checksum` →
+回 400。同步器原来把它当普通失败,**停在当前水位每 3 秒重来** —— 实测一个群这样卡了
+59 小时(`fail_streak` 70943),`stderr` 涨到 613MB,进程吃掉半个核的 13%。
+
+关键是这个错误的语义:`checksum = md5(群号+发送人+秒级时间+正文)`,撞上就说明 mars
+里已经有一行**内容完全相同**的记录。这是**已投递**,不是失败;而且 mars 的 handler 在
+`msg.Upsert` 失败时立刻 `AbortWithStatusJSON(400)`(`qq/qq.go:295`),后面的告警 / Slack
+等副作用一条都没跑,所以「越过」不会丢任何东西。
+
+现在的处理:
+
+- 客户端把 `400 + 1062 + uix_checksum` 认成 `MarsAlreadyStored`(见
+  `mars_sync.is_checksum_conflict`),推进水位并计入 `skipped`,不再重试。
+  **必须带 `uix_checksum`**:撞 `uix_qq_messages_group_local_id` 是同一个 LID 的正文
+  变了(媒体 URL 漂移),mars 是有意拒绝的,静默跳过会把漂移藏起来。
+- mars 侧的正确行为是 upsert 命中后返回 200(分支 `fix/wecom-replay-checksum`),
+  但客户端不能依赖它 —— 对确定性错误永远重试是客户端自己的 bug。
+- 瞬时失败改走**每群**指数退避(`mars_sync_backoff_base` / `mars_sync_backoff_max`),
+  退避期间水位不动。确定性冲突不进退避。

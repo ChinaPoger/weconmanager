@@ -8,7 +8,7 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .paths import REPO_ROOT, AgentHome, AgentHomeError, resolve_agent_home
@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # 轮询间隔。源库 mtime 没变就只是一次 stat,压到秒级也不费什么
     mars_sync_interval: float = 3.0
     mars_sync_batch: int = 200
+    # 瞬时失败后的指数退避:第 N 次连续失败的间隔 = base * 2^(N-1),封顶 max。
+    # 确定性冲突(checksum 已在 mars)不走这里,直接越过 —— 见 MarsAlreadyStored。
+    mars_sync_backoff_base: float = 3.0
+    mars_sync_backoff_max: float = 300.0
     # 图片消息最多等多少秒再推。企微收到图只写消息行,图片文件要等你点开会话
     # 才下载 —— 3 秒的轮询几乎总是跑在下载前面,于是推出去的永远是 `[图片]`
     # 占位符,而下游按 md5(群号+发送人+时间+正文) 去重,事后补推只会多出一条。
@@ -105,6 +109,25 @@ class Settings(BaseSettings):
     mars_group_info_enabled: bool = True
     # 群信息 HTTP 超时。500 人快照实测约 23s,不能复用消息 hook 的 10s。
     mars_group_info_timeout: float = 30.0
+
+    # ── 日志 ───────────────────────────────────────────────────────────
+    # launchd 把 stderr 直接重定向到文件时没人轮转,实测能长到几百 MB。
+    # 配了 log_file 就由进程自己写 RotatingFileHandler(此时不再挂 stderr handler,
+    # 否则等于把同样的日志继续写进那个没人管的文件;启动期 print 和未捕获回溯
+    # 仍会落到 stderr)。
+    log_file: Path | None = None
+    log_max_bytes: int = 10 * 1024 * 1024
+    log_backups: int = 5
+
+    @field_validator("log_file", mode="before")
+    @classmethod
+    def _blank_path_is_unset(cls, value):
+        """`.env` 里写空的 Path 字段会被解析成 `Path('.')`(真值),必须收成 None。
+
+        路径字段的空串和二值开关不一样:空串不是「关」,而是当前目录,
+        RotatingFileHandler 会直接 IsADirectoryError 把服务挡在启动期。
+        """
+        return None if value is None or (isinstance(value, str) and not value.strip()) else value
 
     # ── 从 mars 拉任务(mars → 本机的反向通道)────────────────────────
     # 设计见 docs/mars-task-queue.md。token 留空 = 整个功能关闭。

@@ -52,6 +52,9 @@ async def status(
         summary["blocked"] = sum(1 for group in state.groups.values() if group.active and group.held)
         summary["failed"] = sum(1 for group in state.groups.values() if group.active and group.last_error)
         now = mars_sync.time.time()
+        summary["backing_off"] = sum(
+            1 for group in state.groups.values() if group.active and group.next_attempt > now
+        )
         lags = [
             max(0.0, now - group.cursor.send_time)
             for group in state.groups.values()
