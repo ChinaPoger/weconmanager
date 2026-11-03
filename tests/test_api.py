@@ -180,6 +180,49 @@ def test_local_send_success(client, monkeypatch):
     assert seen["mentions"] == ["abz"]
 
 
+def test_local_send_accepts_username(client, monkeypatch):
+    seen = {}
+
+    def fake_send(**kw):
+        seen.update(kw)
+        return {"success": True, "conv_name": kw["to"], "conv_rid": 697,
+                "open_method": "search", "error": None}
+
+    monkeypatch.setattr(local_send, "send_message", fake_send)
+    r = client.post("/api/v1/message/send", json={
+        "username": "葛波", "content": "你好",
+    })
+    assert r.status_code == 200
+    assert seen["to"] == "葛波"
+    assert seen["target_type"] == "user"
+    assert seen["conv_rid"] is None
+
+
+def test_local_send_accepts_group_name(client, monkeypatch):
+    seen = {}
+
+    def fake_send(**kw):
+        seen.update(kw)
+        return {"success": True, "conv_name": kw["to"], "conv_rid": 1,
+                "open_method": "search", "error": None}
+
+    monkeypatch.setattr(local_send, "send_message", fake_send)
+    r = client.post("/api/v1/message/send", json={
+        "group_name": "项目讨论群", "content": "大家好",
+    })
+    assert r.status_code == 200
+    assert seen["to"] == "项目讨论群"
+    assert seen["target_type"] == "group"
+
+
+def test_local_send_rejects_multiple_named_targets(client):
+    r = client.post("/api/v1/message/send", json={
+        "username": "葛波", "group_name": "项目讨论群", "content": "hi",
+    })
+    assert r.status_code == 400
+    assert "只能提供一个" in r.json()["error"]
+
+
 def test_local_data_error_maps_to_503(client, monkeypatch):
     def boom(_keyword=""):
         raise local_send.LocalDataError("数据未同步")

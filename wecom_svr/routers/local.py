@@ -43,8 +43,14 @@ def _result_response(result: dict) -> JSONResponse:
 )
 def send_local_message(req: LocalSendRequest, _: None = Depends(require_token)):
     if req.msgtype == "text":
+        target = req.username.strip() or req.group_name.strip() or req.to.strip()
+        target_type = "user" if req.username.strip() else "group" if req.group_name.strip() else None
         result = local_send.send_message(
-            to=req.to, content=req.content, conv_rid=req.conv_rid, mentions=req.mentions
+            to=target,
+            content=req.content,
+            conv_rid=req.conv_rid,
+            mentions=req.mentions,
+            target_type=target_type,
         )
         return _result_response(result)
 

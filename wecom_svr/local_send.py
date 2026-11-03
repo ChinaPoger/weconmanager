@@ -74,6 +74,10 @@ def _get_session_conn() -> sqlite3.Connection:
 
 def list_conversations(search: str = "") -> list[dict]:
     """列出会话,支持模糊搜索名称。"""
+    if sys.platform == "win32":
+        from . import windows_local
+
+        return windows_local.list_conversations(search)
     conn = _get_info_conn()
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(CONVERSATION)")]
@@ -105,6 +109,10 @@ def list_conversations(search: str = "") -> list[dict]:
 
 def get_conversation_by_rid(rid: int) -> dict | None:
     """按 RID 精确查找对话。"""
+    if sys.platform == "win32":
+        from . import windows_local
+
+        return windows_local.get_conversation_by_rid(rid)
     conn = _get_info_conn()
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(CONVERSATION)")]
@@ -128,6 +136,11 @@ def get_conversation_by_rid(rid: int) -> dict | None:
 
 def get_conversation_by_name(name: str) -> list[dict]:
     """按名称精确查找对话。"""
+    if sys.platform == "win32":
+        from . import windows_local
+
+        result = windows_local.resolve_conversation(name)
+        return [result] if result else []
     conn = _get_info_conn()
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(CONVERSATION)")]
@@ -155,11 +168,20 @@ def _count_name_collisions(name: str) -> int:
         return 0
 
 
-def resolve_conversation_name(identifier: str, rid: int | None = None) -> dict | None:
+def resolve_conversation_name(
+    identifier: str,
+    rid: int | None = None,
+    target_type: str | None = None,
+) -> dict | None:
     """解析对话 → {"name", "rid", "lid", "type", "fw_id", "skip"}。
 
     skip 表示搜索结果中需跳过的同名用户数(防止选到机器人)。
     """
+    if sys.platform == "win32":
+        from . import windows_local
+
+        return windows_local.resolve_conversation(identifier, rid, target_type)
+
     if rid is not None:
         conv = get_conversation_by_rid(rid)
         if conv:
@@ -169,6 +191,9 @@ def resolve_conversation_name(identifier: str, rid: int | None = None) -> dict |
             return conv
 
     matches = get_conversation_by_name(identifier) if identifier else []
+    if target_type in {"user", "group"}:
+        expected_type = 0 if target_type == "user" else 1
+        matches = [m for m in matches if m.get("conversationtype") == expected_type]
     if matches:
         if len(matches) > 1:
             groups = [m for m in matches if m.get("conversationtype") == 1]
@@ -565,6 +590,10 @@ def _wait_message_disappeared(
 
 def recall_message(conv_rid: int, lid: int | None = None) -> dict:
     """撤回本人消息;默认只选择目标会话中本人最新一条。"""
+    if sys.platform == "win32":
+        from . import windows_local
+
+        return windows_local.recall_message(conv_rid, lid)
     ensure_macos()
     try:
         rid = int(conv_rid)
@@ -1671,6 +1700,10 @@ def trigger_conversation_load(rid: int, msgid: int = 0) -> tuple[bool, str]:
 
 def open_conversation_by_rid(rid: int) -> dict:
     """按 RID 打开企业微信会话,不发送消息。"""
+    if sys.platform == "win32":
+        from . import windows_local
+
+        return windows_local.open_conversation_by_rid(rid)
     ensure_macos()
     try:
         rid = int(rid)
@@ -1801,6 +1834,7 @@ def send_message(
     content: str = "",
     conv_rid: int | None = None,
     mentions: list[str] | None = None,
+    target_type: str | None = None,
 ) -> dict:
     """以登录用户身份发送消息。
 
@@ -1813,6 +1847,11 @@ def send_message(
     Returns:
         {"success": bool, "conv_name": str, "conv_rid": int, "error": ...}
     """
+    if sys.platform == "win32":
+        from . import windows_local
+
+        return windows_local.send_message(to, content, conv_rid, mentions, target_type)
+
     started = time.perf_counter()
     ensure_macos()
     if not content.strip():
@@ -1828,7 +1867,7 @@ def send_message(
     if not identifier and not conv_rid:
         return {"success": False, "error": "请指定 to 或 conv_rid"}
 
-    conv = resolve_conversation_name(identifier, conv_rid)
+    conv = resolve_conversation_name(identifier, conv_rid, target_type)
     if not conv or (not conv.get("name") and conv_rid is None):
         if identifier:
             matches = list_conversations(identifier)
@@ -1935,6 +1974,10 @@ def send_initial_message(conv_rid: int, content: str = "1") -> dict:
 
 def send_image(image_path: str = "", conv_rid: int | None = None) -> dict:
     """以登录用户身份按 RID 发送本地图片。"""
+    if sys.platform == "win32":
+        from . import windows_local
+
+        return windows_local.send_image(image_path, conv_rid)
     ensure_macos()
     if conv_rid is None:
         return {"success": False, "error": "发送图片必须指定 conv_rid"}

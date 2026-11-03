@@ -62,12 +62,16 @@ class LocalSendRequest(BaseModel):
 
     model_config = ConfigDict(json_schema_extra={
         "examples": [
+            {"username": "葛波", "msgtype": "text", "content": "你好"},
+            {"group_name": "项目讨论群", "msgtype": "text", "content": "大家好"},
             {"conv_rid": 3395103030, "msgtype": "text", "content": "你好,我是本人"},
             {"conv_rid": 3395103030, "msgtype": "image", "image_url": "https://example.com/a.png"},
         ]
     })
 
-    to: str = Field("", description="会话/群名称(模糊搜索),与 conv_rid 二选一")
+    username: str = Field("", description="同事在企业微信客户端中的显示名")
+    group_name: str = Field("", description="企业微信群的显示名")
+    to: str = Field("", description="兼容字段:会话/群名称(模糊搜索)")
     conv_rid: int | None = Field(None, description="会话 RID(数据库 ID),精准定位")
     msgtype: Literal["text", "image"] = Field("text", description="消息类型,与官方 API 命名一致")
     content: str = Field("", description="text 消息正文")
@@ -85,8 +89,17 @@ class LocalSendRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_payload(self):
-        if not self.to.strip() and self.conv_rid is None:
-            raise ValueError("缺少 to 或 conv_rid(会话名称 或 数据库 RID)")
+        named_targets = [
+            bool(self.username.strip()),
+            bool(self.group_name.strip()),
+            bool(self.to.strip()),
+        ]
+        if not any(named_targets) and self.conv_rid is None:
+            raise ValueError("缺少 username、group_name、to 或 conv_rid")
+        if sum(named_targets) > 1:
+            raise ValueError("username、group_name、to 只能提供一个")
+        if (self.username.strip() or self.group_name.strip()) and self.conv_rid is not None:
+            raise ValueError("username/group_name 与 conv_rid 只能提供一种定位方式")
 
         sources = [
             bool(self.image_path.strip()), bool(self.image_url.strip()), bool(self.image_base64.strip()),
@@ -98,7 +111,7 @@ class LocalSendRequest(BaseModel):
                 raise ValueError("text 类型不能传 image_path、image_url 或 image_base64")
         else:
             if self.conv_rid is None:
-                raise ValueError("image 类型必须指定 conv_rid")
+                raise ValueError("image 类型暂时必须指定 conv_rid")
             if sum(sources) != 1:
                 raise ValueError("image_path、image_url、image_base64 必须且只能提供一个")
             if self.content or self.mentions is not None:

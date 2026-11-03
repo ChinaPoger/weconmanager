@@ -23,6 +23,7 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 
@@ -133,10 +134,11 @@ def _clone(base: str, dst: str) -> None:
     的增量。`cp -c` 走 clonefile,同样的库实测 0.054s、零写入。
     非 APFS(或跨卷)时 `cp -c` 会失败,退回真复制。
     """
-    r = subprocess.run(["cp", "-c", base, dst], capture_output=True, text=True)
-    if r.returncode == 0:
-        return
-    log.debug("clonefile 不可用(%s),退回字节复制", (r.stderr or "").strip())
+    if sys.platform == "darwin":
+        r = subprocess.run(["cp", "-c", base, dst], capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        log.debug("clonefile 不可用(%s),退回字节复制", (r.stderr or "").strip())
     shutil.copyfile(base, dst)
 
 

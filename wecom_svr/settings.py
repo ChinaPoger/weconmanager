@@ -44,6 +44,7 @@ class Settings(BaseSettings):
 
     data_dir: Path = REPO_ROOT / ".data"
     wecom_timeout: int = 30
+    windows_send_confirm_timeout: float = 30.0
 
     # ── 新机器启动门禁 ─────────────────────────────────────────────────
     # 默认在已经占住监听端口后验证/初始化本地数据库和客户端 UI。

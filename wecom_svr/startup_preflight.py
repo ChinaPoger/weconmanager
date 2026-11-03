@@ -124,6 +124,24 @@ def run(settings: Settings) -> PreflightResult:
             database_ready=False, key_discovered=False, contacts_ready=False, ui_ready=False
         )
 
+    if sys.platform == "win32":
+        # Windows uses the WXWork database and UIA backend; skip macOS-only checks.
+        try:
+            from . import windows_local
+
+            store = windows_local.store()
+            store.key()
+            store.db("session.db").close()
+            store.db("user.db").close()
+        except Exception as e:
+            raise StartupPreflightError(f"Windows 企业微信数据库初始化失败: {e}") from e
+        return PreflightResult(
+            database_ready=True,
+            key_discovered=False,
+            contacts_ready=True,
+            ui_ready=False,
+        )
+
     try:
         discovered = _prepare_database(settings)
     except StartupPreflightError:
