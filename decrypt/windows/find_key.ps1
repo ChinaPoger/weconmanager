@@ -115,12 +115,19 @@ Add-Type -TypeDefinition $cs -Language CSharp
 
 # 动态读当前 message.db 页1 算校验靶(FRAG/CIPHER), 避免硬编码过期
 $mdb = $null
-foreach ($ud in (Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue)) {
-    $wx = Join-Path $ud.FullName "Documents\WXWork"
-    if (-not (Test-Path $wx)) { continue }
-    foreach ($f in (Get-ChildItem $wx -Filter message.db -Recurse -Depth 3 -ErrorAction SilentlyContinue)) {
-        if ($f.FullName -match "\\Backup\\") { continue }
-        if (-not $mdb -or $f.Length -gt (Get-Item $mdb).Length) { $mdb = $f.FullName }
+$configuredProfile = $env:WECOM_WINDOWS_PROFILE
+if ($configuredProfile -and (Test-Path (Join-Path $configuredProfile "Data\message.db"))) {
+    $mdb = Get-Item (Join-Path $configuredProfile "Data\message.db")
+} else {
+    foreach ($ud in (Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue)) {
+        $wx = Join-Path $ud.FullName "Documents\WXWork"
+        if (-not (Test-Path $wx)) { continue }
+        foreach ($f in (Get-ChildItem $wx -Filter message.db -Recurse -Depth 3 -ErrorAction SilentlyContinue)) {
+            if ($f.FullName -match "\\Backup\\") { continue }
+            # 同一台机器可能保留多个历史账号。当前正在使用的账号通常是最近
+            # 写入的库，不能按文件体积选旧账号，否则扫到的 key 无法解当前进程。
+            if (-not $mdb -or $f.LastWriteTime -gt (Get-Item $mdb).LastWriteTime) { $mdb = $f }
+        }
     }
 }
 if (-not $mdb) { "NO_MESSAGE_DB"; exit }
