@@ -231,9 +231,33 @@ curl -X POST http://127.0.0.1:8090/api/v1/group/create \
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `members` | 是 | 除自己外至少 2 人。按客户端通讯录搜索,同事 / 外部联系人 / 微信用户都行 |
+| `members` | 是 | 人员名称字符串数组。Windows 第一个人必须是外部联系人,从他的单聊发起群聊,再选其余人员。除自己外至少 2 个不同成员;自己只能放在后面,也可省略。同名人员用 `姓名@部门` 或 `userid:ID` |
 | `name` | 否 | 群名。面板里没有命名框,所以是先建群再改名;留空则用客户端按成员拼的名字 |
 | `nickname` | 否 | 我在本群的昵称。建群(以及改名)成功后再打开群详情设置;留空则不改 |
+| `prepare_only` | 否 | 默认 `false`。Windows 传 `true` 时只预演选人后取消,不建群、不改名;其他平台拒绝此选项 |
+
+Windows HTTP 调用示例(如配置了鉴权,另带 `Authorization: Bearer <token>`):
+
+```http
+POST /api/v1/group/create HTTP/1.1
+Host: 127.0.0.1:8090
+Content-Type: application/json
+
+{
+  "members": ["伴风望海", "陈涛@技术支持部", "葛波"],
+  "name": "三人组"
+}
+```
+
+`members` 不接受逗号拼接字符串或空名称。Windows 先核对原始数组的第一个人确为外部联系人,
+首位是自己或本企业同事会在操作客户端前返回 HTTP 400;不会自动重排数组或改用后面的人。
+随后按原顺序合并重复成员、去掉当前登录人,再核对至少还有两位不同成员。
+先搜索并打开首位外部联系人的精确单聊,点击该窗口的“发起群聊”图标,再按顺序选择其他人员;
+即使后面也有外部联系人,发起人始终是数组第一个人。找不到首位单聊、同名未消歧或选人失败
+返回 HTTP 400 和 `success: false`;
+客户端正忙返回 409。已有同名且 userid 集合完全相同的唯一群时返回 `reused: true`,不重复邀请。
+Windows 响应中的 `verified` 是成员回库确认,`name_verified` 是群名回库确认;
+传 `prepare_only: true` 时返回 `prepared: true, submitted: false`。
 
 **响应**(群一旦建出来就是 HTTP 200 / `success: true`。改名或改昵称失败不回滚,错误写在下面两个字段里)
 
@@ -269,6 +293,39 @@ CLI 与 HTTP 走同一套代码:
 ```bash
 wecom-svr-local --group "陈涛,陈挺" --group-name "临时讨论组" --group-nickname "小王"
 ```
+
+### Windows 图像识别建群
+
+Windows 的上述建群、改名接口及 CLI 自动使用 PyAutoGUI 后端。安装依赖:
+
+```powershell
+uv sync --extra windows --extra dev
+```
+
+后端结合截图、RapidOCR 和图标模板匹配定位控件,逐个核对姓名、部门和已选人数,
+并检查焦点、窗口位置、遮挡和目标图像是否变化。提交后必须从本地库核对完整 userid 集合;
+改名另行核对同一会话的群名。同名人员需写 `姓名@部门` 或 `userid:ID`,自己自动计入人数。
+
+```powershell
+# 只预演选人后取消,不会提交建群
+wecom-svr-local --group "伴风望海,陈涛@技术支持部" --group-name "三人组" --prepare-only --json
+# 正式执行:若已有同名且成员完全相同的唯一群,直接返回 reused=true
+wecom-svr-local --group "伴风望海,陈涛@技术支持部" --group-name "三人组" --json
+wecom-svr-local --rid 3423 --rename "三人组" --json
+```
+
+Windows 建群固定采用“首位外部联系人单聊 → 发起群聊 → 选择其余人员”的流程,不走 Ctrl+N。
+首位联系人使用 `姓名@微信` 或本地库记录的 `姓名@公司` 精确匹配搜索结果并复核单聊标题,
+图片匹配“发起群聊”图标后选择其余成员。企业名称与客户端显示不一致时会停止。
+当前实测覆盖中文界面的内部选人、从微信联系人单聊发起混合群、群改名;其余人员仍需能在
+选人面板中唯一定位,无法搜索到的外部人员会导致取消。Windows 暂不支持 `nickname`,传入非空值会在操作前拒绝。
+
+操作时保持客户端完整显示在主屏幕内;当前图标模板来自浅色界面、100% 缩放,
+其他主题或缩放可能匹配失败。鼠标移到屏幕角落会触发 PyAutoGUI 急停。
+提交结果未知时会保留 `cache_dir/group-requests` 记录并拒绝自动重提;
+先人工核对客户端和记录,不要靠反复调用凑结果。`verified` 表示成员回库确认,
+`name_verified` 单独表示群名确认;`name_error` 不会被建群成功掩盖。
+本路径不自动发送初始化聊天消息。
 
 ### 为什么外部成员只能走 UI(实测记录)
 

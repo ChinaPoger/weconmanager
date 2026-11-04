@@ -6,11 +6,12 @@
 """
 
 import logging
+import sys
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 
-from .. import local_group, local_send
+from .. import local_group, local_send, windows_group
 from ..images import materialized_image
 from ..schemas import (
     ConversationsRequest,
@@ -116,7 +117,7 @@ def local_busy(_: None = Depends(require_token)) -> dict:
 
 @router.post(
     "/group/create",
-    summary="以本人身份拉群(操控客户端)",
+    summary="按人员名称数组建群(本人身份)",
     response_model=LocalSendResponse,
 )
 def create_local_group(req: LocalCreateGroupRequest, _: None = Depends(require_token)):
@@ -125,10 +126,19 @@ def create_local_group(req: LocalCreateGroupRequest, _: None = Depends(require_t
     传了 `name` 就「先建群、再改名」两步走(面板里没有命名输入框);传了 `nickname`
     再打开群详情改「我在本群的昵称」。自己自动是群主。
     每个成员在选中前都会核对客户端搜出来的姓名与部门,搜出多条会 400 并列出候选。
+    Windows 可传 `prepare_only: true` 预演选人后取消;同名人员用 `姓名@部门` 消歧。
+    Windows `members[0]` 必须是外部联系人:先搜索并打开其单聊,从该窗口发起群聊,再选择其余人员。
+    不自动排序或改用后面的外部联系人;首位是自己或本企业同事会在操作客户端前返回 400。
+    Windows 已有同名且成员完全一致的唯一群时复用,返回 `reused: true`。
     """
-    result = local_group.create_group(
-        req.members, name=req.name, nickname=req.nickname, return_rid=True
-    )
+    if sys.platform == "win32":
+        result = windows_group.create_group(
+            req.members, name=req.name, nickname=req.nickname, prepare_only=req.prepare_only,
+        )
+        return _result_response(result)
+    if req.prepare_only:
+        return _result_response({"success": False, "error": "prepare_only 仅支持 Windows,未操作客户端"})
+    result = local_group.create_group(req.members, name=req.name, nickname=req.nickname, return_rid=True)
     if result.get("success"):
         rid = result.get("rid")
         if rid is None:
@@ -153,7 +163,8 @@ def rename_local_group(req: LocalRenameGroupRequest, _: None = Depends(require_t
     改完会回库核验:名字没落到目标群上就报错(并指出落到了哪个 RID),
     不会因为「脚本没报错」就当成功。
     """
-    result = local_group.rename_group(req.conv_rid, req.name)
+    rename = windows_group.rename_group if sys.platform == "win32" else local_group.rename_group
+    result = rename(req.conv_rid, req.name)
     return _result_response(result)
 
 

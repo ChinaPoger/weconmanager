@@ -8,13 +8,14 @@
     wecom-svr-local --rid 3395103030 --rename "客户群-新名字"       # 改群名
     wecom-svr-local --rid 3395103030 --nickname "小王"              # 改我在本群的昵称
 
-拉群/改名/改昵称和 HTTP 那几个端点走的是同一个 local_group,行为完全一致(包括
+拉群/改名/改昵称和 HTTP 那几个端点走的是同一套平台后端(包括
 选人前逐个核对、改完回库核验)。CLI 这条路存在的意义是: 不用先起服务、也不用配 token。
 """
 import argparse
 import json
 import sys
 
+from . import windows_group
 from .local_group import create_group, rename_group, set_nickname
 from .local_send import (
     LocalSendError,
@@ -23,6 +24,9 @@ from .local_send import (
     send_image,
     send_message,
 )
+
+_DEFAULT_CREATE_GROUP = create_group
+_DEFAULT_RENAME_GROUP = rename_group
 
 
 def _print_convs(convs: list[dict], as_json: bool) -> None:
@@ -40,13 +44,19 @@ def _create_group(a: argparse.Namespace) -> None:
     信息不够: 得让人看见到底拉进来的是哪个部门的哪个人。
     """
     members = [m.strip() for m in a.group.split(",") if m.strip()]
-    result = create_group(
-        members, name=a.group_name or "", nickname=a.group_nickname or ""
-    )
+    # Keep the injectable legacy function for callers/tests that explicitly
+    # replace it; normal Windows runs use the Windows UI implementation.
+    if sys.platform == "win32" and create_group is _DEFAULT_CREATE_GROUP:
+        result = windows_group.create_group(
+            members, name=a.group_name or "", nickname=a.group_nickname or "",
+            prepare_only=a.prepare_only,
+        )
+    else:
+        result = create_group(members, name=a.group_name or "", nickname=a.group_nickname or "")
 
     if result.get("success") and not a.json:
         for m in result.get("members", []):
-            dept = f"({m['dept']})" if m.get("dept") else ""
+            dept = f"({m.get('dept')})" if m.get("dept") else ""
             print(f"  ✓ {m['name']}{dept}  ← 搜的是「{m['query']}」")
         # 群建出来了但名字没改上 —— 不能被一句「已建群」盖过去,那是要人手工补的
         if result.get("name_error"):
@@ -54,7 +64,13 @@ def _create_group(a: argparse.Namespace) -> None:
         if result.get("nickname_error"):
             print(f"⚠️  {result['nickname_error']}")
 
-    _finish(result, a.json, "✅ 已建群(含自己共 {member_count} 人)")
+    if result.get("prepared"):
+        message = "✅ 选人预演完成,已取消,未提交建群"
+    elif result.get("reused"):
+        message = "✅ 已核验并复用已有群(含自己共 {member_count} 人,RID={rid})"
+    else:
+        message = "✅ 已建群(含自己共 {member_count} 人)"
+    _finish(result, a.json, message)
 
 
 def _finish(result: dict, as_json: bool, ok_msg: str) -> None:
@@ -78,8 +94,9 @@ def main() -> None:
     ap.add_argument("--open-only", action="store_true", help="只按 RID 打开会话,不发送")
     ap.add_argument("--image", help="发送本地图片文件路径(必须配合 --rid)")
     ap.add_argument("--group", "-g", metavar="成员1,成员2",
-                    help="以本人身份拉群:成员逗号分隔,除自己外至少 2 个")
+                    help="以本人身份拉群:成员逗号分隔,除自己外至少 2 个;Windows 首位必须是外部联系人")
     ap.add_argument("--group-name", help="拉群时顺便把群名改掉(可选)")
+    ap.add_argument("--prepare-only", action="store_true", help="Windows:只预演选人并取消,不提交建群")
     ap.add_argument("--group-nickname", help="拉群时顺便改我在本群的昵称(可选)")
     ap.add_argument("--rename", metavar="新群名",
                     help="给一个已有的群改名(必须配合 --rid)")
@@ -88,6 +105,8 @@ def main() -> None:
     ap.add_argument("--json", "-j", action="store_true", help="JSON 输出")
     ap.add_argument("content", nargs="?", help="消息内容 (配合 --name 或 --rid)")
     a = ap.parse_args()
+    if a.prepare_only and (not a.group or sys.platform != "win32"):
+        ap.error("--prepare-only 仅支持 Windows,并需配合 --group")
 
     try:
         if a.list or a.search:
@@ -101,7 +120,10 @@ def main() -> None:
         if a.rename:
             if not a.rid:
                 sys.exit("❌ --rename 需要配合 --rid 指定改哪个群")
-            _finish(rename_group(a.rid, a.rename), a.json,
+            rename = windows_group.rename_group if sys.platform == "win32" and (
+                rename_group is _DEFAULT_RENAME_GROUP
+            ) else rename_group
+            _finish(rename(a.rid, a.rename), a.json,
                     "✅ 已改名「{name}」(RID={rid},原名「{old_name}」)")
             return
 

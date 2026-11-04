@@ -30,8 +30,11 @@ dev = [
 ]
 windows = [
     "Pillow>=10.0",
+    "pyautogui>=0.9.54",
     "pyperclip>=1.8",
     "pywinauto>=0.6.8",
+    "rapidocr>=3.4,<4",
+    "onnxruntime>=1.23,<2",
     "pywin32>=306; sys_platform == 'win32'",
 ]
 
@@ -81,6 +84,17 @@ check_untyped_defs = true
 module = ["online", "online.*", "export_wxwork", "wecom_paths", "wxwork_crypto"]
 ignore_missing_imports = true
 follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+# Windows UI/OCR libraries are optional and do not ship compatible stubs.
+module = [
+    "pyautogui", "pyperclip", "pywinauto", "pywinauto.*",
+    "win32gui", "win32process", "win32con", "win32clipboard",
+    "rapidocr", "rapidocr.*", "numpy", "numpy.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
+follow_imports_for_stubs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

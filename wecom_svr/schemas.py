@@ -1,7 +1,7 @@
 """请求/响应模型。"""
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from .group import MAX_NAME_LEN
 
@@ -153,24 +153,28 @@ class LocalCreateGroupRequest(BaseModel):
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
-            "members": ["陈涛", "陈挺"],
-            "name": "临时讨论组",
-            "nickname": "小王",
+            "members": ["伴风望海", "陈涛@技术支持部", "葛波"],
+            "name": "三人组",
+            "prepare_only": False,
         }
     })
 
-    members: list[str] = Field(
+    members: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]] = Field(
         ...,
         min_length=2,
-        description="除自己以外的成员,按客户端通讯录搜索(同事/外部联系人/微信都行);"
-                    "自己自动是群主,不用写进来",
+        description="人员名称数组,除自己外至少 2 个不同成员。自己自动计入,也可以写进数组;"
+                    "Windows members[0] 必须是外部联系人,先打开其单聊再按数组顺序选择其余人员;"
+                    "同名人员用 姓名@部门 或 userid:ID 精确指定,不支持逗号分隔字符串",
     )
     name: str = Field(
         "", max_length=MAX_NAME_LEN, description="群名。留空则用客户端按成员自动生成的名字"
     )
     nickname: str = Field(
         "", max_length=MAX_NAME_LEN,
-        description="我在本群内的昵称。留空则不修改(建群完成后设置)",
+        description="我在本群内的昵称。留空则不修改;Windows 暂不支持非空值",
+    )
+    prepare_only: bool = Field(
+        False, strict=True, description="仅 Windows:只预演选人并取消,不提交建群、不改群名",
     )
 
 
